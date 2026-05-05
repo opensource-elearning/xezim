@@ -357,6 +357,8 @@ fn main() {
     let mut threads: usize = 1;
     let mut emit_hypergraph: Option<String> = None;
     let mut load_partition: Option<String> = None;
+    let mut write_profile: Option<String> = None;
+    let mut profile_input: Option<String> = None;
 
     let mut include_dirs: Vec<String> = Vec::new();
     let mut defines: Vec<(String, Option<String>)> = Vec::new();
@@ -599,6 +601,24 @@ fn main() {
             }
             _ if arg.starts_with("--load-partition=") => {
                 load_partition = Some(arg["--load-partition=".len()..].to_string());
+            }
+            "--write-profile" => {
+                i += 1;
+                if i < args.len() {
+                    write_profile = Some(args[i].clone());
+                }
+            }
+            _ if arg.starts_with("--write-profile=") => {
+                write_profile = Some(arg["--write-profile=".len()..].to_string());
+            }
+            "--profile-input" => {
+                i += 1;
+                if i < args.len() {
+                    profile_input = Some(args[i].clone());
+                }
+            }
+            _ if arg.starts_with("--profile-input=") => {
+                profile_input = Some(arg["--profile-input=".len()..].to_string());
             }
             "--dpi-lib" => {
                 i += 1;
@@ -872,6 +892,8 @@ fn main() {
         xtrace_level,
         emit_hypergraph.as_deref(),
         load_partition.as_deref(),
+        write_profile.as_deref(),
+        profile_input.as_deref(),
     ) {
         Ok(sim) => {
             println!("------------------------------");

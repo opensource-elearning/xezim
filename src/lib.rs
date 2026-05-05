@@ -35,6 +35,8 @@ pub fn simulate(source: &str, max_time: u64) -> Result<compiler::Simulator, Stri
         0,
         None,
         None,
+        None,
+        None,
     )
 }
 
@@ -56,6 +58,8 @@ pub fn simulate_multi(
     xtrace_level: u8,
     emit_hypergraph: Option<&str>,
     load_partition: Option<&str>,
+    write_profile: Option<&str>,
+    profile_input: Option<&str>,
 ) -> Result<compiler::Simulator, String> {
     let total_start = std::time::Instant::now();
     let compilation_start = std::time::Instant::now();
@@ -103,12 +107,35 @@ pub fn simulate_multi(
 
     if let Some(path) = emit_hypergraph {
         let t = std::time::Instant::now();
-        match sim.emit_edge_block_hypergraph(path) {
+        // Phase-2 profile-guided emission: --profile-input takes
+        // precedence; falls back to static weights without it.
+        let prof = if let Some(pp) = profile_input {
+            match compiler::simulator::Phase2Profile::load_from_file(pp) {
+                Ok(p) => {
+                    eprintln!(
+                        "[PART] using profile {} ({} blocks, {} signals)",
+                        pp,
+                        p.edge_block_exec_ns.len(),
+                        p.signal_toggle_count.len()
+                    );
+                    Some(p)
+                }
+                Err(e) => {
+                    eprintln!("[PART] failed to load profile {}: {} — falling back to static", pp, e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let result = sim.emit_edge_block_hypergraph_with_profile(path, prof.as_ref());
+        match result {
             Ok((nv, ne)) => eprintln!(
-                "[PART] hypergraph written to {} ({} vertices, {} hyperedges) in {:.1}ms",
+                "[PART] hypergraph written to {} ({} vertices, {} hyperedges, weights={}) in {:.1}ms",
                 path,
                 nv,
                 ne,
+                if prof.is_some() { "profile" } else { "static" },
                 t.elapsed().as_secs_f64() * 1000.0
             ),
             Err(e) => eprintln!("[PART] failed to write hypergraph to {}: {}", path, e),
@@ -134,6 +161,18 @@ pub fn simulate_multi(
         "[PHASE] simulation: {:.1}ms",
         simulation_start.elapsed().as_secs_f64() * 1000.0
     );
+
+    if let Some(path) = write_profile {
+        let t = std::time::Instant::now();
+        match sim.write_phase2_profile(path) {
+            Ok(()) => eprintln!(
+                "[PART] profile written to {} in {:.1}ms (set XEZIM_EDGE_BLOCK_STATS=1 to populate)",
+                path,
+                t.elapsed().as_secs_f64() * 1000.0
+            ),
+            Err(e) => eprintln!("[PART] failed to write profile to {}: {}", path, e),
+        }
+    }
 
     let total_elapsed = total_start.elapsed();
     eprintln!(

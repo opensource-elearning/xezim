@@ -540,6 +540,61 @@ fn resolve_array_elem_id(
     Some(first_id + (idx - lo) as usize)
 }
 
+/// Phase-2 profile snapshot loaded from a `--write-profile` text file.
+/// Sparse: only blocks that fired and signals that toggled appear.
+#[derive(Default, Debug, Clone)]
+pub struct Phase2Profile {
+    /// edge_block_idx → accumulated runtime in ns.
+    pub edge_block_exec_ns: ahash::AHashMap<usize, u64>,
+    /// edge_block_idx → fire count.
+    pub edge_block_exec_count: ahash::AHashMap<usize, u64>,
+    /// signal_id → toggle count.
+    pub signal_toggle_count: ahash::AHashMap<usize, u64>,
+}
+
+impl Phase2Profile {
+    /// Parse the `--write-profile` text format. Tolerates missing
+    /// sections (returns an empty subgroup) so a partial profile from
+    /// an aborted run is still usable.
+    pub fn load_from_file(path: &str) -> Result<Self, String> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("read {}: {}", path, e))?;
+        let mut p = Phase2Profile::default();
+        let mut section = "";
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if line.starts_with('[') && line.ends_with(']') {
+                section = match &line[1..line.len() - 1] {
+                    "edge_block_exec" => "edge_block_exec",
+                    "signal_toggle" => "signal_toggle",
+                    _ => "",
+                };
+                continue;
+            }
+            let mut it = line.split_whitespace();
+            match section {
+                "edge_block_exec" => {
+                    let bi: usize = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                    let ns: u64 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                    let c: u64 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                    p.edge_block_exec_ns.insert(bi, ns);
+                    p.edge_block_exec_count.insert(bi, c);
+                }
+                "signal_toggle" => {
+                    let sid: usize = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                    let t: u64 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                    p.signal_toggle_count.insert(sid, t);
+                }
+                _ => {}
+            }
+        }
+        Ok(p)
+    }
+}
+
 pub struct Simulator {
     pub signals: HashMap<String, Value>,
     /// Fast signal table: indexed by signal_id for O(1) access.
@@ -734,6 +789,18 @@ pub struct Simulator {
     /// path, and used only for optional end-of-run attribution.
     edge_block_exec_counts: Vec<u64>,
     edge_block_stats_enabled: bool,
+    /// Phase-2 profile-guided partitioning: accumulated wall time
+    /// (nanoseconds) spent executing each edge block. Populated
+    /// only when `edge_block_stats_enabled` is set. Drives the
+    /// vertex weight in profile-guided hypergraph emission so
+    /// mt-kahypar balances *real* per-thread work, not insn count.
+    edge_block_exec_ns: Vec<u64>,
+    /// Phase-2 profile-guided partitioning: per-signal toggle count
+    /// for signals in the edge-sensitivity universe. Updated lazily
+    /// in `check_edge_id` whenever a sampled signal changes. Used as
+    /// the hyperedge weight in profile-guided emission — busy
+    /// signals are more expensive to share across cores.
+    signal_toggle_count: Vec<u64>,
     /// Per-edge-block: cached scope hint (parent module name from first
     /// sensitivity signal) so sequential-exec path can skip per-call rsplit.
     edge_block_scope: Vec<Option<String>>,
@@ -1549,6 +1616,8 @@ impl Simulator {
             edge_block_partition: Vec::new(),
             edge_block_partition_count: 0,
             edge_block_exec_counts: Vec::new(),
+            edge_block_exec_ns: Vec::new(),
+            signal_toggle_count: Vec::new(),
             edge_block_stats_enabled: std::env::var("XEZIM_EDGE_BLOCK_STATS").ok().as_deref()
                 == Some("1"),
             edge_block_scope: Vec::new(),
@@ -1688,9 +1757,72 @@ impl Simulator {
     /// The vertex-id space is dense over those blocks, with mapping
     /// `mt_kahypar_vid → original edge_block_idx` written to a sibling
     /// file `<path>.vmap` so the partition file can be inverted back.
+    /// Phase-2 profile snapshot: per-block runtime (ns) and per-signal
+    /// toggle counts collected during a stats-enabled run. Serialized
+    /// as a tiny line-oriented text format (no JSON dep). Symmetric
+    /// with `--write-profile` / `--profile-input`.
+    pub fn write_phase2_profile(&self, path: &str) -> Result<(), String> {
+        use std::io::Write;
+        if !self.edge_block_stats_enabled {
+            return Err(
+                "profile collection requires XEZIM_EDGE_BLOCK_STATS=1 at run time".to_string(),
+            );
+        }
+        let mut out = std::io::BufWriter::new(
+            std::fs::File::create(path).map_err(|e| format!("create {}: {}", path, e))?,
+        );
+        writeln!(out, "# xezim phase2 profile v1").map_err(|e| e.to_string())?;
+        writeln!(
+            out,
+            "# blocks={} signals={}",
+            self.edge_block_exec_ns.len(),
+            self.signal_toggle_count.len()
+        )
+        .map_err(|e| e.to_string())?;
+        writeln!(out, "[edge_block_exec]").map_err(|e| e.to_string())?;
+        for (bi, ns) in self.edge_block_exec_ns.iter().enumerate() {
+            if *ns == 0 {
+                continue;
+            }
+            let count = self
+                .edge_block_exec_counts
+                .get(bi)
+                .copied()
+                .unwrap_or(0);
+            writeln!(out, "{} {} {}", bi, *ns, count).map_err(|e| e.to_string())?;
+        }
+        writeln!(out, "[signal_toggle]").map_err(|e| e.to_string())?;
+        for (sid, t) in self.signal_toggle_count.iter().enumerate() {
+            if *t == 0 {
+                continue;
+            }
+            writeln!(out, "{} {}", sid, *t).map_err(|e| e.to_string())?;
+        }
+        out.flush().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     pub fn emit_edge_block_hypergraph(
         &self,
         path: &str,
+    ) -> Result<(usize, usize), String> {
+        self.emit_edge_block_hypergraph_with_profile(path, None)
+    }
+
+    /// Phase-2 profile-guided variant of `emit_edge_block_hypergraph`.
+    /// When `profile` is `Some`, vertex weights come from measured
+    /// runtime (ns) × fire-count and hyperedge weights from
+    /// signal toggle count × signal width — both are real-workload
+    /// proxies, much better than the static insn-count / width
+    /// estimates the unprofiled path uses.
+    ///
+    /// The profile is the JSON written by a prior run with
+    /// `--write-profile`. Vertices missing from the profile fall
+    /// back to the static estimate so a partial profile still works.
+    pub fn emit_edge_block_hypergraph_with_profile(
+        &self,
+        path: &str,
+        profile: Option<&Phase2Profile>,
     ) -> Result<(usize, usize), String> {
         use std::collections::HashMap;
         use std::io::Write;
@@ -1769,13 +1901,20 @@ impl Simulator {
         writeln!(out, "{} {} 11", edges.len(), blocks.len())
             .map_err(|e| e.to_string())?;
         for (sid, vs) in &edges {
-            // Edge weight = signal width (proxy for the cost of a
-            // cross-core NBA merge — wider signals mean more bytes
-            // moved + more work for the apply-NBA pass).
-            let w = if *sid < self.signal_widths.len() {
+            // Edge weight: profile-guided when available
+            // (toggle_count × signal_width), else static signal width.
+            let static_w = if *sid < self.signal_widths.len() {
                 self.signal_widths[*sid].max(1)
             } else {
                 1
+            };
+            let w = if let Some(p) = profile {
+                let toggles = p.signal_toggle_count.get(sid).copied().unwrap_or(0);
+                // Cap at u32::MAX-1 — mt-kahypar reads weights as i32-ish.
+                let raw = (toggles.saturating_mul(static_w as u64)).max(1);
+                raw.min(u32::MAX as u64 - 1) as u32
+            } else {
+                static_w
             };
             write!(out, "{}", w).map_err(|e| e.to_string())?;
             for v in vs {
@@ -1784,11 +1923,20 @@ impl Simulator {
             writeln!(out).map_err(|e| e.to_string())?;
         }
         for &bi in &blocks {
-            let w = self.compiled_edge_blocks[bi]
-                .as_ref()
-                .map(|cb| cb.instructions.len() as u32)
-                .unwrap_or(1)
-                .max(1);
+            // Vertex weight: profile-guided uses real runtime
+            // (ns scaled to a reasonable u32 range), else insn count.
+            let w = if let Some(p) = profile {
+                let ns = p.edge_block_exec_ns.get(&bi).copied().unwrap_or(0);
+                // Scale ns to microseconds to keep numbers small + meaningful.
+                let us = (ns / 1000).max(1);
+                us.min(u32::MAX as u64 - 1) as u32
+            } else {
+                self.compiled_edge_blocks[bi]
+                    .as_ref()
+                    .map(|cb| cb.instructions.len() as u32)
+                    .unwrap_or(1)
+                    .max(1)
+            };
             writeln!(out, "{}", w).map_err(|e| e.to_string())?;
         }
         out.flush().map_err(|e| e.to_string())?;
@@ -3663,6 +3811,10 @@ impl Simulator {
             self.edge_blocks.len()
         );
         self.edge_block_exec_counts = vec![0; self.compiled_edge_blocks.len()];
+        if self.edge_block_stats_enabled {
+            self.edge_block_exec_ns = vec![0u64; self.compiled_edge_blocks.len()];
+            self.signal_toggle_count = vec![0u64; self.signal_table.len()];
+        }
 
         // JIT pass: attempt native codegen for each compiled block.
         // Unsupported Insns inside a block → None (interpreter runs it).
@@ -7898,6 +8050,13 @@ impl Simulator {
             if !fires_pos && !fires_neg && !fires_any {
                 continue;
             }
+            // Phase-2 toggle counter: any edge means this signal
+            // changed value this delta-cycle. Bumped only when
+            // stats are enabled (XEZIM_EDGE_BLOCK_STATS=1) so the
+            // production hot path stays branch-free.
+            if self.edge_block_stats_enabled && sid < self.signal_toggle_count.len() {
+                self.signal_toggle_count[sid] += 1;
+            }
             if fires_pos {
                 for &block_idx in &fanout.posedge {
                     if block_idx < triggered_bitmap.len() && !triggered_bitmap[block_idx] {
@@ -8077,7 +8236,17 @@ impl Simulator {
             } else {
                 // Too few blocks for threading overhead to pay off
                 for &bi in &parallel_blocks {
+                    let t = if self.edge_block_stats_enabled {
+                        Some(std::time::Instant::now())
+                    } else {
+                        None
+                    };
                     self.exec_bytecode(bi);
+                    if let Some(t) = t {
+                        if let Some(slot) = self.edge_block_exec_ns.get_mut(bi) {
+                            *slot += t.elapsed().as_nanos() as u64;
+                        }
+                    }
                 }
             }
 
@@ -8088,6 +8257,11 @@ impl Simulator {
             for &bi in &sequential_blocks {
                 let needs_hint =
                     bi < self.edge_block_needs_hint.len() && self.edge_block_needs_hint[bi];
+                let t_seq = if self.edge_block_stats_enabled {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
                 if needs_hint {
                     let saved_hint = self.name_resolve_hint.borrow().clone();
                     if let Some(scope) = self.edge_block_scope.get(bi).and_then(|s| s.as_ref()) {
@@ -8099,6 +8273,11 @@ impl Simulator {
                     *self.name_resolve_hint.borrow_mut() = saved_hint;
                 } else {
                     self.exec_bytecode(bi);
+                }
+                if let Some(t) = t_seq {
+                    if let Some(slot) = self.edge_block_exec_ns.get_mut(bi) {
+                        *slot += t.elapsed().as_nanos() as u64;
+                    }
                 }
             }
 

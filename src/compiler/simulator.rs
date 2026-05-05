@@ -74,6 +74,7 @@ enum CombItem {
     ContAssign {
         lhs: Expression,
         rhs: Expression,
+        delay: u64,
     },
     /// Fast path: direct signal-to-signal copy (assign b = a) with pre-resolved IDs.
     DirectCopy {
@@ -4617,31 +4618,36 @@ impl Simulator {
             .into_iter()
             .chain(pending_ca.into_iter().map(|p| p.materialize()))
         {
+            let explicit_delay = ca.delay;
             reads.clear();
             writes.clear();
             Self::collect_expr_reads(&ca.rhs, &self.module, &mut reads);
             Self::collect_lhs_writes(&ca.lhs, &self.module, &mut writes);
             // Detect identity assigns: assign dst = src (simple signal-to-signal copy)
-            let direct_copy = if let (ExprKind::Ident(lhs_hier), ExprKind::Ident(rhs_hier)) =
-                (&ca.lhs.kind, &ca.rhs.kind)
-            {
-                let dst_name = Self::resolve_hier_name_static(lhs_hier, &self.module);
-                let src_name = Self::resolve_hier_name_static(rhs_hier, &self.module);
-                if let (Some(&dst_id), Some(&src_id)) = (
-                    self.signal_name_to_id.get(dst_name.as_str()),
-                    self.signal_name_to_id.get(src_name.as_str()),
-                ) {
-                    let width = self.signal_widths[dst_id];
-                    if width == self.signal_widths[src_id] {
-                        let delay = self.sdf_delays.get(dst_id).copied().unwrap_or(0);
-                        if width <= 64 && delay == 0 {
-                            Some(CombItem::FastDirectCopy { dst_id, src_id })
+            let direct_copy = if explicit_delay == 0 {
+                if let (ExprKind::Ident(lhs_hier), ExprKind::Ident(rhs_hier)) =
+                    (&ca.lhs.kind, &ca.rhs.kind)
+                {
+                    let dst_name = Self::resolve_hier_name_static(lhs_hier, &self.module);
+                    let src_name = Self::resolve_hier_name_static(rhs_hier, &self.module);
+                    if let (Some(&dst_id), Some(&src_id)) = (
+                        self.signal_name_to_id.get(dst_name.as_str()),
+                        self.signal_name_to_id.get(src_name.as_str()),
+                    ) {
+                        let width = self.signal_widths[dst_id];
+                        if width == self.signal_widths[src_id] {
+                            let delay = self.sdf_delays.get(dst_id).copied().unwrap_or(0);
+                            if width <= 64 && delay == 0 {
+                                Some(CombItem::FastDirectCopy { dst_id, src_id })
+                            } else {
+                                Some(CombItem::DirectCopy {
+                                    dst_id,
+                                    src_id,
+                                    width,
+                                })
+                            }
                         } else {
-                            Some(CombItem::DirectCopy {
-                                dst_id,
-                                src_id,
-                                width,
-                            })
+                            None
                         }
                     } else {
                         None
@@ -4684,8 +4690,18 @@ impl Simulator {
             // Try fused-gate fast path first: recognizes yosys patterns like
             // `assign d[0] = a & b` or `assign d[0] = ~(a & b)` — executes
             // without VM dispatch, just bit reads + 4-state combinator + set_bit.
-            let fused = self.try_build_fused_gate(&ca.lhs, &ca.rhs, scope_hint.as_deref());
-            let item = if let Some(op) = fused {
+            let fused = if explicit_delay == 0 {
+                self.try_build_fused_gate(&ca.lhs, &ca.rhs, scope_hint.as_deref())
+            } else {
+                None
+            };
+            let item = if explicit_delay > 0 {
+                CombItem::ContAssign {
+                    lhs: ca.lhs,
+                    rhs: ca.rhs,
+                    delay: explicit_delay,
+                }
+            } else if let Some(op) = fused {
                 CombItem::FusedGate { op }
             } else if let Some(dc) = direct_copy {
                 dc
@@ -4735,6 +4751,7 @@ impl Simulator {
                         CombItem::ContAssign {
                             lhs: ca.lhs,
                             rhs: ca.rhs,
+                            delay: 0,
                         }
                     }
                 }
@@ -4785,6 +4802,7 @@ impl Simulator {
                         CombItem::ContAssign {
                             lhs: ca.lhs,
                             rhs: ca.rhs,
+                            delay: 0,
                         }
                     }
                 }
@@ -4792,6 +4810,7 @@ impl Simulator {
                 CombItem::ContAssign {
                     lhs: ca.lhs,
                     rhs: ca.rhs,
+                    delay: 0,
                 }
             };
 
@@ -7377,6 +7396,11 @@ impl Simulator {
     /// Schedule a delayed signal update (inertial delay model).
     fn schedule_delayed(&mut self, id: usize, val: Value) {
         let delay = self.sdf_delays.get(id).copied().unwrap_or(0);
+        self.schedule_delayed_with_delay(id, val, delay);
+    }
+
+    /// Schedule a delayed signal update with an explicit delay (inertial delay model).
+    fn schedule_delayed_with_delay(&mut self, id: usize, val: Value, delay: u64) {
         let target_time = self.time + delay;
         // Inertial delay: remove any pending update for this signal
         self.delayed_updates.retain(|(_, sid, _)| *sid != id);
@@ -8043,7 +8067,7 @@ impl Simulator {
                         }
                         self.prof_settle_dc_count += 1;
                     }
-                    CombItem::CompiledContAssign { compiled } => {
+                    CombItem::CompiledContAssign { compiled, .. } => {
                         if self.vm_regs.len() < compiled.num_regs as usize {
                             self.vm_regs
                                 .resize(compiled.num_regs as usize, Value::zero(1));
@@ -8057,7 +8081,7 @@ impl Simulator {
                         self.exec_insns(insns);
                         self.prof_settle_dc_count += 1;
                     }
-                    CombItem::ContAssign { lhs, rhs } => {
+                    CombItem::ContAssign { lhs, rhs, delay: explicit_delay } => {
                         let scope_hint = entries[eidx].scope_hint.clone();
                         let t_entry = std::time::Instant::now();
                         let saved_hint = self.name_resolve_hint.borrow().clone();
@@ -8077,14 +8101,18 @@ impl Simulator {
                         }
                         let w = self.infer_lhs_width(lhs);
                         let val = self.eval_expr_ctx(rhs, w).resize(w);
-                        // Check if the LHS target has an SDF delay
-                        let delay = lhs_id
+                        // Check if this continuous assignment or the LHS target has a delay.
+                        let delay = if *explicit_delay > 0 {
+                            *explicit_delay
+                        } else {
+                            lhs_id
                             .and_then(|id| self.sdf_delays.get(id).copied())
-                            .unwrap_or(0);
-                        if delay > 0 && self.time > 0 {
+                            .unwrap_or(0)
+                        };
+                        if delay > 0 {
                             if let Some(id) = lhs_id {
                                 if self.signal_table[id] != val {
-                                    self.schedule_delayed(id, val);
+                                    self.schedule_delayed_with_delay(id, val, delay);
                                 }
                             }
                         } else {

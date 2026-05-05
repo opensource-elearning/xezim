@@ -720,6 +720,16 @@ pub struct Simulator {
     jit_module_llvm: Option<super::jit_llvm::LlvmJitModule>,
     /// True for blocks eligible for parallel execution (no StmtFallback).
     edge_block_parallel: Vec<bool>,
+    /// Per-edge-block partition / core assignment. Indexed by edge_block
+    /// idx; value is the partition (worker thread) that owns the block.
+    /// Empty when no partition has been loaded — falls back to the legacy
+    /// chunk-by-range scheduling. Loaded from a partition file emitted by
+    /// mt-kahypar (or any compatible hMETIS partitioner).
+    pub(crate) edge_block_partition: Vec<u32>,
+    /// Number of distinct partitions (k) when `edge_block_partition` is
+    /// populated. Drives how many worker threads the parallel-edge
+    /// dispatcher spawns.
+    pub(crate) edge_block_partition_count: u32,
     /// Per-edge-block execution counts. Cheap enough to maintain on the hot
     /// path, and used only for optional end-of-run attribution.
     edge_block_exec_counts: Vec<u64>,
@@ -824,6 +834,12 @@ pub struct Simulator {
     prof_vcd: u64,
     prof_edge_detect: u64,
     prof_edge_exec: u64,
+    /// Phase-1 multicore observability: counts how many delta-cycles
+    /// the parallel dispatcher took the partition-aware path vs the
+    /// legacy chunk-by-range path. Both are bumped on every parallel
+    /// dispatch; sum tells you total dispatcher cycles.
+    prof_par_dispatch_partition: u64,
+    prof_par_dispatch_legacy: u64,
     prof_edge_waiters: u64,
     prof_edge_cg: u64,
     prof_waiter_iters: u64,
@@ -1530,6 +1546,8 @@ impl Simulator {
             jit_module: None,
             jit_module_llvm: None,
             edge_block_parallel: Vec::new(),
+            edge_block_partition: Vec::new(),
+            edge_block_partition_count: 0,
             edge_block_exec_counts: Vec::new(),
             edge_block_stats_enabled: std::env::var("XEZIM_EDGE_BLOCK_STATS").ok().as_deref()
                 == Some("1"),
@@ -1589,6 +1607,8 @@ impl Simulator {
             prof_vcd: 0,
             prof_edge_detect: 0,
             prof_edge_exec: 0,
+            prof_par_dispatch_partition: 0,
+            prof_par_dispatch_legacy: 0,
             prof_edge_waiters: 0,
             prof_edge_cg: 0,
             prof_waiter_iters: 0,
@@ -1654,6 +1674,218 @@ impl Simulator {
     /// VCD/AITRACE writer thread; `n == 1` keeps the dump path inline.
     pub fn set_threads(&mut self, n: usize) {
         self.threads = n.max(1);
+    }
+
+    /// Phase-1 multicore exploration: dump the edge-block dependency
+    /// graph as an hMETIS hypergraph (vertex = parallel-eligible edge
+    /// block, hyperedge = signal connecting all blocks that read or
+    /// NBA-write it). Vertex weight = bytecode-instruction count
+    /// (static cost estimate). Hyperedge weight = signal width.
+    ///
+    /// Only blocks marked `edge_block_parallel[i] = true` participate;
+    /// non-pure blocks (StmtFallback / blocking writes) cannot
+    /// safely cross-core anyway and stay on the sequential path.
+    /// The vertex-id space is dense over those blocks, with mapping
+    /// `mt_kahypar_vid → original edge_block_idx` written to a sibling
+    /// file `<path>.vmap` so the partition file can be inverted back.
+    pub fn emit_edge_block_hypergraph(
+        &self,
+        path: &str,
+    ) -> Result<(usize, usize), String> {
+        use std::collections::HashMap;
+        use std::io::Write;
+
+        // Step 1: collect the parallel-eligible block ids in a stable
+        // order. The hMETIS vertex id is `1 + position in this vec`
+        // (hMETIS uses 1-based indexing).
+        let mut blocks: Vec<usize> = Vec::new();
+        for (idx, &is_parallel) in self.edge_block_parallel.iter().enumerate() {
+            if is_parallel {
+                if self
+                    .compiled_edge_blocks
+                    .get(idx)
+                    .and_then(|cb| cb.as_ref())
+                    .is_some()
+                {
+                    blocks.push(idx);
+                }
+            }
+        }
+        if blocks.is_empty() {
+            return Err("no parallel-eligible edge blocks to partition".to_string());
+        }
+        let vid_of: HashMap<usize, usize> = blocks
+            .iter()
+            .enumerate()
+            .map(|(i, &bi)| (bi, i + 1))
+            .collect();
+
+        // Step 2: walk each block's bytecode and collect the signal
+        // ids it reads (LoadSignal*) and writes (NbaAssign*). For
+        // a pure block, NBA writes are the only outgoing edge type.
+        // Map signal_id -> set of (vid) that touch it.
+        let mut sig_to_vids: HashMap<usize, Vec<usize>> = HashMap::new();
+        for &bi in &blocks {
+            let cb = self.compiled_edge_blocks[bi].as_ref().unwrap();
+            // Use a small stack-allocated dedup set per block to keep
+            // the inner loop tight; ~8 distinct sigs is typical.
+            let mut seen: Vec<usize> = Vec::with_capacity(16);
+            for insn in cb.instructions.iter() {
+                let sid = match insn {
+                    super::bytecode::Insn::LoadSignal(_, sid)
+                    | super::bytecode::Insn::LoadSignalSigned(_, sid) => *sid,
+                    super::bytecode::Insn::NbaAssign(sid, _, _)
+                    | super::bytecode::Insn::NbaAssignRange(sid, _, _, _) => *sid,
+                    _ => continue,
+                };
+                if !seen.contains(&sid) {
+                    seen.push(sid);
+                }
+            }
+            let vid = vid_of[&bi];
+            for sid in seen {
+                sig_to_vids.entry(sid).or_default().push(vid);
+            }
+        }
+
+        // Step 3: drop singleton-edges (only one block touches the
+        // signal — they contribute zero to the cut and just bloat the
+        // file). Sort the remaining hyperedges by smallest first vid
+        // for deterministic output.
+        let mut edges: Vec<(usize, Vec<usize>)> = sig_to_vids
+            .into_iter()
+            .filter(|(_, vs)| vs.len() >= 2)
+            .collect();
+        edges.sort_by_key(|(sid, _)| *sid);
+
+        // Step 4: emit hMETIS format.
+        // Header: "<num_edges> <num_vertices> <fmt>"
+        //   fmt = 11 → both edge weights AND vertex weights present.
+        // Each edge line: "<weight> v1 v2 ... vk"
+        // Each vertex line (after edges): "<weight>"
+        let mut out = std::io::BufWriter::new(
+            std::fs::File::create(path).map_err(|e| format!("create {}: {}", path, e))?,
+        );
+        writeln!(out, "{} {} 11", edges.len(), blocks.len())
+            .map_err(|e| e.to_string())?;
+        for (sid, vs) in &edges {
+            // Edge weight = signal width (proxy for the cost of a
+            // cross-core NBA merge — wider signals mean more bytes
+            // moved + more work for the apply-NBA pass).
+            let w = if *sid < self.signal_widths.len() {
+                self.signal_widths[*sid].max(1)
+            } else {
+                1
+            };
+            write!(out, "{}", w).map_err(|e| e.to_string())?;
+            for v in vs {
+                write!(out, " {}", v).map_err(|e| e.to_string())?;
+            }
+            writeln!(out).map_err(|e| e.to_string())?;
+        }
+        for &bi in &blocks {
+            let w = self.compiled_edge_blocks[bi]
+                .as_ref()
+                .map(|cb| cb.instructions.len() as u32)
+                .unwrap_or(1)
+                .max(1);
+            writeln!(out, "{}", w).map_err(|e| e.to_string())?;
+        }
+        out.flush().map_err(|e| e.to_string())?;
+        drop(out);
+
+        // Step 5: emit a sibling vmap file so consumers can invert
+        // the dense vid → original edge_block_idx mapping.
+        let vmap_path = format!("{}.vmap", path);
+        let mut vmap = std::io::BufWriter::new(
+            std::fs::File::create(&vmap_path)
+                .map_err(|e| format!("create {}: {}", vmap_path, e))?,
+        );
+        writeln!(vmap, "# vid edge_block_idx insn_count").map_err(|e| e.to_string())?;
+        for (i, &bi) in blocks.iter().enumerate() {
+            let n_insns = self.compiled_edge_blocks[bi]
+                .as_ref()
+                .map(|cb| cb.instructions.len())
+                .unwrap_or(0);
+            writeln!(vmap, "{} {} {}", i + 1, bi, n_insns).map_err(|e| e.to_string())?;
+        }
+        vmap.flush().map_err(|e| e.to_string())?;
+
+        Ok((blocks.len(), edges.len()))
+    }
+
+    /// Load a partition file in mt-kahypar's standard format: one
+    /// line per vertex, each line is the partition id (0..k-1).
+    /// The vertex order matches the hypergraph emitted by
+    /// `emit_edge_block_hypergraph`. Pairs the partition with the
+    /// `.vmap` sibling so we can route back to original block ids.
+    ///
+    /// On success populates `edge_block_partition` (indexed by
+    /// edge_block_idx) and returns `(num_assignments, num_partitions)`.
+    pub fn load_partition_file(&mut self, path: &str) -> Result<(usize, u32), String> {
+        let part_text = std::fs::read_to_string(path)
+            .map_err(|e| format!("read {}: {}", path, e))?;
+        let parts: Vec<u32> = part_text
+            .lines()
+            .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+            .map(|l| l.trim().parse::<u32>().unwrap_or(0))
+            .collect();
+
+        // Try to read the .vmap (preferred — anchors vid → block_idx
+        // even if the simulator state has shifted). Fall back to
+        // assuming the partition file's i-th line maps to the i-th
+        // parallel-eligible block in current order.
+        let vmap_path = path.trim_end_matches(".part")
+            .trim_end_matches(".partition");
+        let vmap_path = format!(
+            "{}.vmap",
+            vmap_path.trim_end_matches(&format!(".part.{}", parts.len()).as_str())
+        );
+        let vmap = std::fs::read_to_string(&vmap_path).ok();
+
+        // Default-sized to the full edge_blocks Vec so the dispatcher
+        // can index by the original block id.
+        let n_blocks = self.edge_blocks.len();
+        self.edge_block_partition = vec![0u32; n_blocks];
+        let mut assigned = 0usize;
+
+        if let Some(vmap) = vmap {
+            // vmap line format: "vid block_idx insn_count" (1-based vid).
+            for line in vmap.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                let mut it = line.split_whitespace();
+                let vid: usize = match it.next().and_then(|s| s.parse().ok()) {
+                    Some(v) => v,
+                    None => continue,
+                };
+                let bi: usize = match it.next().and_then(|s| s.parse().ok()) {
+                    Some(v) => v,
+                    None => continue,
+                };
+                if vid == 0 || vid - 1 >= parts.len() || bi >= n_blocks {
+                    continue;
+                }
+                self.edge_block_partition[bi] = parts[vid - 1];
+                assigned += 1;
+            }
+        } else {
+            // Fall back: i-th parallel block gets the i-th part id.
+            let mut pidx = 0usize;
+            for (bi, &is_p) in self.edge_block_parallel.iter().enumerate() {
+                if !is_p { continue; }
+                if pidx < parts.len() {
+                    self.edge_block_partition[bi] = parts[pidx];
+                    assigned += 1;
+                    pidx += 1;
+                }
+            }
+        }
+        let k = parts.iter().copied().max().map(|m| m + 1).unwrap_or(0);
+        self.edge_block_partition_count = k;
+        Ok((assigned, k))
     }
 
     #[inline]
@@ -6526,6 +6758,14 @@ impl Simulator {
             self.prof_insns_executed,
             if self.prof_insns_executed > 0 { self.prof_edge_exec as f64 / self.prof_insns_executed as f64 } else { 0.0 },
             self.prof_fallback_insns);
+        if self.prof_par_dispatch_partition + self.prof_par_dispatch_legacy > 0 {
+            eprintln!(
+                "[PROF] par_dispatch partition={} legacy={} (partition k={})",
+                self.prof_par_dispatch_partition,
+                self.prof_par_dispatch_legacy,
+                self.edge_block_partition_count
+            );
+        }
         let mut reasons: Vec<(&'static str, u64, u64)> = self
             .prof_fallback_by_reason
             .iter()
@@ -7731,6 +7971,7 @@ impl Simulator {
                 // sending non-Sync CompiledBlock (contains StmtFallback with
                 // Cell fields) across threads. We only access parallel-eligible
                 // blocks which are guaranteed to have no StmtFallback insns.
+                #[derive(Clone, Copy)]
                 struct BlockSlice {
                     ptr: *const super::bytecode::Insn,
                     len: usize,
@@ -7754,15 +7995,45 @@ impl Simulator {
                     }
                 }
 
-                let num_threads = std::thread::available_parallelism()
-                    .map(|n| n.get().min(block_slices.len()).min(8))
-                    .unwrap_or(2);
-                let chunk_size = (block_slices.len() + num_threads - 1) / num_threads;
+                // Phase-1 partition-aware grouping: if a partition file
+                // has been loaded (via --load-partition), bucket blocks
+                // by their partition id so each thread processes one
+                // partition worth of work. Falls back to the legacy
+                // chunk-by-range when no partition is present.
+                let mut chunks: Vec<Vec<(usize, BlockSlice)>>;
+                if self.edge_block_partition_count > 0
+                    && !self.edge_block_partition.is_empty()
+                {
+                    self.prof_par_dispatch_partition += 1;
+                    let k = self.edge_block_partition_count as usize;
+                    chunks = (0..k).map(|_| Vec::new()).collect();
+                    for (bi, bs) in block_slices.into_iter() {
+                        let p = self
+                            .edge_block_partition
+                            .get(bi)
+                            .copied()
+                            .unwrap_or(0) as usize;
+                        let p = p.min(k - 1);
+                        chunks[p].push((bi, bs));
+                    }
+                    chunks.retain(|c| !c.is_empty());
+                } else {
+                    self.prof_par_dispatch_legacy += 1;
+                    let num_threads = std::thread::available_parallelism()
+                        .map(|n| n.get().min(block_slices.len()).min(8))
+                        .unwrap_or(2);
+                    let chunk_size = (block_slices.len() + num_threads - 1) / num_threads;
+                    chunks = block_slices
+                        .chunks(chunk_size)
+                        .map(|c| c.to_vec())
+                        .collect();
+                }
 
                 let mut all_nba: Vec<Vec<NbaFast>> = Vec::new();
                 std::thread::scope(|s| {
                     let mut handles = Vec::new();
-                    for chunk in block_slices.chunks(chunk_size) {
+                    for chunk in chunks.iter() {
+                        let chunk = chunk.as_slice();
                         let handle = s.spawn(move || {
                             let mut thread_nba: Vec<NbaFast> = Vec::new();
                             let max_regs =

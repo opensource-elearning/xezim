@@ -355,6 +355,8 @@ fn main() {
     let mut dpi_libs: Vec<String> = Vec::new();
     let mut plusargs: Vec<String> = Vec::new();
     let mut threads: usize = 1;
+    let mut emit_hypergraph: Option<String> = None;
+    let mut load_partition: Option<String> = None;
 
     let mut include_dirs: Vec<String> = Vec::new();
     let mut defines: Vec<(String, Option<String>)> = Vec::new();
@@ -579,6 +581,24 @@ fn main() {
             }
             _ if arg.starts_with("--threads=") => {
                 threads = arg["--threads=".len()..].parse().unwrap_or(1).max(1);
+            }
+            "--emit-hypergraph" => {
+                i += 1;
+                if i < args.len() {
+                    emit_hypergraph = Some(args[i].clone());
+                }
+            }
+            _ if arg.starts_with("--emit-hypergraph=") => {
+                emit_hypergraph = Some(arg["--emit-hypergraph=".len()..].to_string());
+            }
+            "--load-partition" => {
+                i += 1;
+                if i < args.len() {
+                    load_partition = Some(args[i].clone());
+                }
+            }
+            _ if arg.starts_with("--load-partition=") => {
+                load_partition = Some(arg["--load-partition=".len()..].to_string());
             }
             "--dpi-lib" => {
                 i += 1;
@@ -850,6 +870,8 @@ fn main() {
         threads,
         xtrace_file.as_deref(),
         xtrace_level,
+        emit_hypergraph.as_deref(),
+        load_partition.as_deref(),
     ) {
         Ok(sim) => {
             println!("------------------------------");

@@ -32,6 +32,8 @@ fn sim_ok_plusargs(src: &str, plusargs: &[&str]) -> xezim::compiler::Simulator {
         1,
         None,
         0,
+        None,
+        None,
     ) {
         Ok(sim) => sim,
         Err(e) => panic!("Simulation failed: {}", e),

@@ -33,6 +33,8 @@ pub fn simulate(source: &str, max_time: u64) -> Result<compiler::Simulator, Stri
         1,
         None,
         0,
+        None,
+        None,
     )
 }
 
@@ -52,6 +54,8 @@ pub fn simulate_multi(
     threads: usize,
     xtrace_file: Option<&str>,
     xtrace_level: u8,
+    emit_hypergraph: Option<&str>,
+    load_partition: Option<&str>,
 ) -> Result<compiler::Simulator, String> {
     let total_start = std::time::Instant::now();
     let compilation_start = std::time::Instant::now();
@@ -96,6 +100,33 @@ pub fn simulate_multi(
         "[PHASE] compilation: {:.1}ms",
         compilation_start.elapsed().as_secs_f64() * 1000.0
     );
+
+    if let Some(path) = emit_hypergraph {
+        let t = std::time::Instant::now();
+        match sim.emit_edge_block_hypergraph(path) {
+            Ok((nv, ne)) => eprintln!(
+                "[PART] hypergraph written to {} ({} vertices, {} hyperedges) in {:.1}ms",
+                path,
+                nv,
+                ne,
+                t.elapsed().as_secs_f64() * 1000.0
+            ),
+            Err(e) => eprintln!("[PART] failed to write hypergraph to {}: {}", path, e),
+        }
+    }
+    if let Some(path) = load_partition {
+        let t = std::time::Instant::now();
+        match sim.load_partition_file(path) {
+            Ok((n, parts)) => eprintln!(
+                "[PART] loaded partition from {} ({} assignments, k={}) in {:.1}ms",
+                path,
+                n,
+                parts,
+                t.elapsed().as_secs_f64() * 1000.0
+            ),
+            Err(e) => eprintln!("[PART] failed to load partition from {}: {}", path, e),
+        }
+    }
 
     let simulation_start = std::time::Instant::now();
     sim.simulate();

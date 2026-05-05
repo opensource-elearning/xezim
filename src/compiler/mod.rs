@@ -6,6 +6,7 @@
 
 pub mod bytecode;
 pub mod jit;
+pub mod jit_llvm;
 pub mod simulator;
 
 pub use simulator::Simulator;

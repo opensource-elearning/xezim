@@ -183,6 +183,15 @@ mod stub {
         pub fn try_compile(&mut self, _insns: &[Insn], _num_regs: u32) -> Option<JitFn> {
             None
         }
+        pub fn try_compile_with_xz(
+            &mut self,
+            _insns: &[Insn],
+            _num_regs: u32,
+            _xz_ptr: u64,
+            _xz_len: u32,
+        ) -> Option<JitFn> {
+            None
+        }
     }
 }
 
@@ -280,7 +289,41 @@ mod enabled {
                     }
                 }
             }
-            self.codegen_block(insns, num_regs, &input_ids).ok()
+            self.codegen_block(insns, num_regs, &input_ids, 0, 0).ok()
+        }
+
+        /// Like `try_compile`, but bakes the absolute address of the
+        /// simulator's `signal_has_xz` byte array into the prelude so
+        /// the X/Z input check is an inline load+OR instead of a C-call
+        /// to `xezim_jit_inputs_have_xz`. `xz_ptr` must remain valid
+        /// for the simulator's lifetime (true for `Vec<u8>` that's
+        /// pre-sized once and never resized).
+        pub fn try_compile_with_xz(
+            &mut self,
+            insns: &[Insn],
+            num_regs: u32,
+            xz_ptr: u64,
+            xz_len: u32,
+        ) -> Option<JitFn> {
+            for insn in insns {
+                if !is_supported(insn) {
+                    return None;
+                }
+            }
+            let mut input_ids: Vec<u32> = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            for insn in insns {
+                let id_opt = match insn {
+                    Insn::LoadSignal(_, sid) | Insn::LoadSignalSigned(_, sid) => Some(*sid as u32),
+                    _ => None,
+                };
+                if let Some(sid) = id_opt {
+                    if seen.insert(sid) {
+                        input_ids.push(sid);
+                    }
+                }
+            }
+            self.codegen_block(insns, num_regs, &input_ids, xz_ptr, xz_len).ok()
         }
 
         fn codegen_block(
@@ -288,6 +331,8 @@ mod enabled {
             insns: &[Insn],
             num_regs: u32,
             input_ids: &[u32],
+            xz_ptr: u64,
+            xz_len: u32,
         ) -> Result<JitFn, ()> {
             let pointer_type = self.module.target_config().pointer_type();
 
@@ -305,12 +350,24 @@ mod enabled {
 
             let nba_sig = store_sig.clone();
 
-            // nba_range: (sim, id, hi, lo, val_bits) — 5 args.
+            // nba_bit_dyn bridge ABI: (sim, id: u32, idx: u64, val_bits: u64).
+            // The dynamic bit/range schedulers take the bit-pos as u64
+            // (matches Rust fn sig). Earlier we re-used `nba_sig` here,
+            // which had the 4th arg typed i32, causing a cranelift verifier
+            // failure on every block containing NbaAssignBitDyn.
+            let mut nba_bit_sig = self.module.make_signature();
+            nba_bit_sig.params.push(AbiParam::new(pointer_type));
+            nba_bit_sig.params.push(AbiParam::new(types::I32));
+            nba_bit_sig.params.push(AbiParam::new(types::I64));
+            nba_bit_sig.params.push(AbiParam::new(types::I64));
+
+            // nba_range / blk_range bridge ABI:
+            // (sim, id: u32, hi: u64, lo: u64, val_bits: u64).
             let mut nba_range_sig = self.module.make_signature();
             nba_range_sig.params.push(AbiParam::new(pointer_type));
             nba_range_sig.params.push(AbiParam::new(types::I32));
-            nba_range_sig.params.push(AbiParam::new(types::I32));
-            nba_range_sig.params.push(AbiParam::new(types::I32));
+            nba_range_sig.params.push(AbiParam::new(types::I64));
+            nba_range_sig.params.push(AbiParam::new(types::I64));
             nba_range_sig.params.push(AbiParam::new(types::I64));
 
             // Path B: xz_check (sim, ids_ptr, n_ids) -> u32 (1 if any X/Z, else 0).
@@ -342,7 +399,7 @@ mod enabled {
                 .map_err(|_| ())?;
             let nba_bit_id: FuncId = self
                 .module
-                .declare_function("xezim_jit_schedule_nba_bit_dyn", Linkage::Import, &nba_sig)
+                .declare_function("xezim_jit_schedule_nba_bit_dyn", Linkage::Import, &nba_bit_sig)
                 .map_err(|_| ())?;
             let blk_range_id: FuncId = self
                 .module
@@ -445,9 +502,39 @@ mod enabled {
                 .module
                 .declare_func_in_func(xz_check_id, &mut builder.func);
 
-            if input_ids.is_empty() {
+            // EXPERIMENT: skip the X/Z prelude entirely to measure how
+            // much it costs vs the JIT body itself. This is UNSOUND for
+            // signals that are X/Z at runtime — only safe to test on
+            // workloads where signals are determinate after reset.
+            if std::env::var("XEZIM_JIT_SKIP_XZ").is_ok() {
+                let _ = (xz_check_ref, fallback_block, &input_ids);
+                builder.ins().jump(entry_block, &[prelude_sim_ptr]);
+            } else if input_ids.is_empty() {
                 // No reads — no X/Z risk. Fall straight through.
                 builder.ins().jump(entry_block, &[prelude_sim_ptr]);
+            } else if xz_ptr != 0 {
+                // Inline prelude: load `signal_has_xz[id]` (a u8) for
+                // each input id and OR them. Branches to fallback if
+                // any byte is non-zero. Avoids the C-call to
+                // `xezim_jit_inputs_have_xz` per block dispatch.
+                let xz_base = builder.ins().iconst(pointer_type, xz_ptr as i64);
+                let mut acc = builder.ins().iconst(types::I8, 0);
+                for &id in input_ids.iter() {
+                    if id >= xz_len {
+                        // Skip out-of-range ids (keeps inline prelude
+                        // safe even if signal_has_xz hasn't been
+                        // resized). Matches the bridge fn's `continue`.
+                        continue;
+                    }
+                    let byte = builder.ins().load(
+                        types::I8,
+                        MemFlags::trusted(),
+                        xz_base,
+                        id as i32,
+                    );
+                    acc = builder.ins().bor(acc, byte);
+                }
+                builder.ins().brif(acc, fallback_block, &[], entry_block, &[prelude_sim_ptr]);
             } else {
                 // Materialise input_ids as a fixed stack-slot u32 array,
                 // then call xezim_jit_inputs_have_xz(sim, ptr, n).
@@ -780,8 +867,8 @@ mod enabled {
                     .ins()
                     .stack_load(types::I64, regs[*val_reg as usize], 0);
                 let id = builder.ins().iconst(types::I32, *sig_id as i64);
-                let hi_v = builder.ins().iconst(types::I32, *hi as i64);
-                let lo_v = builder.ins().iconst(types::I32, *lo as i64);
+                let hi_v = builder.ins().iconst(types::I64, *hi as i64);
+                let lo_v = builder.ins().iconst(types::I64, *lo as i64);
                 builder
                     .ins()
                     .call(nba_range_ref, &[sim_ptr, id, hi_v, lo_v, v]);

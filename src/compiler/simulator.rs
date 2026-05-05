@@ -66,6 +66,24 @@ macro_rules! sim_dbg_eprintln {
     };
 }
 
+/// Write `signal_table[id]` and update the parallel `signal_has_xz`
+/// byte that the JIT inline X/Z prelude reads. Must be used in place
+/// of bare `write_sig!(self, id, val);` so the JIT bitmap stays
+/// consistent. Both fields are simple `Vec`s on `Self`, so the macro
+/// expands to a single pair of indexed writes — the borrow checker
+/// sees disjoint field borrows just like the bare assignment did.
+macro_rules! write_sig {
+    ($self:ident, $id:expr, $val:expr) => {{
+        let __wsig_id = $id;
+        let __wsig_val = $val;
+        if __wsig_id < $self.signal_has_xz.len() {
+            $self.signal_has_xz[__wsig_id] =
+                if __wsig_val.raw_bits().1 != 0 { 1u8 } else { 0u8 };
+        }
+        $self.signal_table[__wsig_id] = __wsig_val;
+    }};
+}
+
 /// A combinatorial item (continuous assign or always @*/always_comb block)
 /// with pre-computed sensitivity set for efficient evaluation.
 #[derive(Clone)]
@@ -526,6 +544,14 @@ pub struct Simulator {
     pub signals: HashMap<String, Value>,
     /// Fast signal table: indexed by signal_id for O(1) access.
     signal_table: Vec<Value>,
+    /// Parallel array: 1 byte per signal_id, non-zero iff that signal
+    /// currently has any X/Z bits. Maintained by `write_sig!` and a few
+    /// in-place mutators. Used by the JIT's inline X/Z prelude (avoids
+    /// a C-bridge call per block dispatch). Sized once in `compile()`
+    /// to match `signal_table.len()` and never resized — the address of
+    /// `signal_has_xz.as_ptr()` is JIT-baked at compile time and must
+    /// stay valid for the simulator's lifetime.
+    pub(crate) signal_has_xz: Vec<u8>,
     /// Map signal name → signal_id for fast lookup. `Arc<str>` keys are
     /// shared with `id_to_name` so each signal name lives on the heap
     /// once instead of twice (saves ~25 MB on c910-scale). `Arc<str>:
@@ -687,6 +713,11 @@ pub struct Simulator {
     /// all compiled function pointers. Kept on Simulator so the mmapped
     /// code pages stay mapped for the life of the simulation.
     jit_module: Option<super::jit::JitModule>,
+    /// Same role as `jit_module`, but for the LLVM backend. Owned
+    /// here to keep the JIT-compiled code's memory alive for the
+    /// simulator's lifetime. Always `None` when the `jit-llvm`
+    /// feature is disabled (the type is a stub).
+    jit_module_llvm: Option<super::jit_llvm::LlvmJitModule>,
     /// True for blocks eligible for parallel execution (no StmtFallback).
     edge_block_parallel: Vec<bool>,
     /// Per-edge-block execution counts. Cheap enough to maintain on the hot
@@ -1415,6 +1446,14 @@ impl Simulator {
         module.signals = HashMap::new();
         let drop_ms = phase_drop.elapsed().as_secs_f64() * 1000.0;
 
+        // Pre-compute X/Z bitmap for the JIT inline prelude. Default
+        // `Value::new(w)` returns an all-X reg, so this starts mostly 1s
+        // and gets cleared as `write_sig!` is called during init/settle.
+        let signal_has_xz_init: Vec<u8> = signal_table
+            .iter()
+            .map(|v| if v.raw_bits().1 != 0 { 1u8 } else { 0u8 })
+            .collect();
+
         let mut sim = Self {
             prev_val,
             prev_xz,
@@ -1426,6 +1465,7 @@ impl Simulator {
             widths,
             signed_signals,
             real_signals,
+            signal_has_xz: signal_has_xz_init,
             signal_table,
             signal_name_to_id,
             array_elem_ids: HashMap::new(),
@@ -1488,6 +1528,7 @@ impl Simulator {
             compiled_edge_blocks: Vec::new(),
             jit_fns: Vec::new(),
             jit_module: None,
+            jit_module_llvm: None,
             edge_block_parallel: Vec::new(),
             edge_block_exec_counts: Vec::new(),
             edge_block_stats_enabled: std::env::var("XEZIM_EDGE_BLOCK_STATS").ok().as_deref()
@@ -1969,7 +2010,7 @@ impl Simulator {
                             let mut resized = val.resize(width);
                             resized.is_signed = self.signal_signed[id];
                             if self.signal_table[id] != resized {
-                                self.signal_table[id] = resized;
+                                write_sig!(self, id, resized);
                                 self.table_modified = true;
                                 let has_dependents = id + 1 < self.comb_dep_offsets.len()
                                     && self.comb_dep_offsets[id] != self.comb_dep_offsets[id + 1];
@@ -2378,7 +2419,7 @@ impl Simulator {
                         val.is_signed = self.signal_signed[id];
                         if self.signal_table[id] != val {
                             self.mark_dirty_id(id);
-                            self.signal_table[id] = val;
+                            write_sig!(self, id, val);
                             self.table_modified = true;
                         }
                         k += 1;
@@ -2400,7 +2441,7 @@ impl Simulator {
                         let changed = self.signal_table[id] != val;
                         if changed {
                             self.mark_dirty_id(id);
-                            self.signal_table[id] = val;
+                            write_sig!(self, id, val);
                             self.table_modified = true;
                         }
                     } else {
@@ -3113,7 +3154,7 @@ impl Simulator {
         let width = self.signal_widths[sid];
         let seed = seed_val.resize(width);
         if self.signal_table[sid] != seed {
-            self.signal_table[sid] = seed;
+            write_sig!(self, sid, seed);
             self.mark_dirty_id(sid);
             self.table_modified = true;
         }
@@ -3205,7 +3246,7 @@ impl Simulator {
                 } else {
                     Value::from_u64(1, self.signal_widths[cg.signal_id])
                 };
-                self.signal_table[cg.signal_id] = new_val;
+                write_sig!(self, cg.signal_id, new_val);
                 if !self.dirty_signals[cg.signal_id] {
                     self.dirty_signals[cg.signal_id] = true;
                     self.dirty_list.push(cg.signal_id);
@@ -3400,26 +3441,75 @@ impl Simulator {
             .unwrap_or(false);
         self.jit_fns = vec![None; self.compiled_edge_blocks.len()];
         if enable_jit {
-            if self.jit_module.is_none() {
-                self.jit_module = super::jit::JitModule::new();
-            }
-            if let Some(jm) = self.jit_module.as_mut() {
-                let mut jit_count = 0usize;
-                for (idx, cb_opt) in self.compiled_edge_blocks.iter().enumerate() {
-                    if let Some(cb) = cb_opt {
-                        if let Some(f) = jm.try_compile(&cb.instructions, cb.num_regs as u32) {
-                            self.jit_fns[idx] = Some(f);
-                            jit_count += 1;
+            // Pick backend via XEZIM_JIT_BACKEND={cranelift,llvm}.
+            // Default = cranelift (faster JIT-compile; matches prior
+            // behavior). LLVM produces tighter machine code but pays
+            // a heavy compile-time cost.
+            let backend = std::env::var("XEZIM_JIT_BACKEND")
+                .unwrap_or_else(|_| "cranelift".to_string());
+            let xz_ptr = self.signal_has_xz.as_ptr() as u64;
+            let xz_len = self.signal_has_xz.len() as u32;
+            let jit_compile_start = std::time::Instant::now();
+            let mut jit_count = 0usize;
+            match backend.as_str() {
+                "llvm" => {
+                    let mut llvm = super::jit_llvm::LlvmJitModule::new();
+                    if llvm.is_none() {
+                        eprintln!("[JIT] LLVM init failed; interpreter only");
+                    }
+                    if let Some(jm) = llvm.as_mut() {
+                        for (idx, cb_opt) in self.compiled_edge_blocks.iter().enumerate() {
+                            if let Some(cb) = cb_opt {
+                                if let Some(f) = jm.try_compile_with_xz(
+                                    &cb.instructions,
+                                    cb.num_regs as u32,
+                                    xz_ptr,
+                                    xz_len,
+                                ) {
+                                    self.jit_fns[idx] = Some(f);
+                                    jit_count += 1;
+                                }
+                            }
                         }
                     }
+                    // Hold the LLVM JIT module for the simulator's
+                    // lifetime so the JIT'd function pointers stay valid.
+                    self.jit_module_llvm = llvm;
+                    eprintln!(
+                        "[JIT] backend=llvm compiled {}/{} edge blocks in {:.1}s",
+                        jit_count,
+                        self.compiled_edge_blocks.len(),
+                        jit_compile_start.elapsed().as_secs_f64(),
+                    );
                 }
-                eprintln!(
-                    "[JIT] compiled {}/{} edge blocks",
-                    jit_count,
-                    self.compiled_edge_blocks.len()
-                );
-            } else {
-                eprintln!("[JIT] cranelift init failed; interpreter only");
+                _ => {
+                    if self.jit_module.is_none() {
+                        self.jit_module = super::jit::JitModule::new();
+                    }
+                    if let Some(jm) = self.jit_module.as_mut() {
+                        for (idx, cb_opt) in self.compiled_edge_blocks.iter().enumerate() {
+                            if let Some(cb) = cb_opt {
+                                if let Some(f) = jm.try_compile_with_xz(
+                                    &cb.instructions,
+                                    cb.num_regs as u32,
+                                    xz_ptr,
+                                    xz_len,
+                                ) {
+                                    self.jit_fns[idx] = Some(f);
+                                    jit_count += 1;
+                                }
+                            }
+                        }
+                        eprintln!(
+                            "[JIT] backend=cranelift compiled {}/{} edge blocks in {:.1}s",
+                            jit_count,
+                            self.compiled_edge_blocks.len(),
+                            jit_compile_start.elapsed().as_secs_f64(),
+                        );
+                    } else {
+                        eprintln!("[JIT] cranelift init failed; interpreter only");
+                    }
+                }
             }
         }
         // Classify blocks for parallel execution: blocks with StmtFallback or
@@ -4277,7 +4367,7 @@ impl Simulator {
                                 self.dirty_list.push(id);
                             }
                             self.dirty_any = true;
-                            self.signal_table[id] = val;
+                            write_sig!(self, id, val);
                             self.table_modified = true;
                         }
                     }
@@ -4321,7 +4411,7 @@ impl Simulator {
                         let mut v = val.resize_for_assign(sig_w);
                         v.is_signed = self.signal_signed[id];
                         if self.signal_table[id] != v {
-                            self.signal_table[id] = v;
+                            write_sig!(self, id, v);
                             if !self.dirty_signals[id] {
                                 self.dirty_signals[id] = true;
                                 self.dirty_list.push(id);
@@ -4385,7 +4475,7 @@ impl Simulator {
                         let mut v = val.resize_for_assign(sig_w);
                         v.is_signed = self.signal_signed[id];
                         if self.signal_table[id] != v {
-                            self.signal_table[id] = v;
+                            write_sig!(self, id, v);
                             if !self.dirty_signals[id] {
                                 self.dirty_signals[id] = true;
                                 self.dirty_list.push(id);
@@ -4467,7 +4557,7 @@ impl Simulator {
                         let mut val = self.vm_regs[*val_reg as usize].resize_for_assign(*width);
                         val.is_signed = self.signal_signed[eid];
                         if self.signal_table[eid] != val {
-                            self.signal_table[eid] = val;
+                            write_sig!(self, eid, val);
                             if !self.dirty_signals[eid] {
                                 self.dirty_signals[eid] = true;
                                 self.dirty_list.push(eid);
@@ -4537,7 +4627,7 @@ impl Simulator {
                             let mut v = val.resize_for_assign(sig_w);
                             v.is_signed = self.signal_signed[eid];
                             if self.signal_table[eid] != v {
-                                self.signal_table[eid] = v;
+                                write_sig!(self, eid, v);
                                 if !self.dirty_signals[eid] {
                                     self.dirty_signals[eid] = true;
                                     self.dirty_list.push(eid);
@@ -7345,7 +7435,7 @@ impl Simulator {
                     self.dirty_list.push(id);
                 }
                 self.dirty_any = true;
-                self.signal_table[id] = val;
+                write_sig!(self, id, val);
                 self.table_modified = true;
             }
         }
@@ -7376,7 +7466,7 @@ impl Simulator {
             if self.delayed_updates[i].0 <= self.time {
                 let (_, id, val) = self.delayed_updates.swap_remove(i);
                 if self.signal_table[id] != val {
-                    self.signal_table[id] = val;
+                    write_sig!(self, id, val);
                     self.mark_dirty_id(id);
                     self.table_modified = true;
                     applied = true;
@@ -8036,7 +8126,7 @@ impl Simulator {
                                 if delay > 0 && self.time > 0 {
                                     self.schedule_delayed(*dst_id, resized);
                                 } else {
-                                    self.signal_table[*dst_id] = resized;
+                                    write_sig!(self, *dst_id, resized);
                                     self.table_modified = true;
                                     if self.activity_mon {
                                         if self.signal_toggle_counts.len()
@@ -8134,7 +8224,7 @@ impl Simulator {
                                 resized.is_signed = self.signal_signed[id];
                                 if self.signal_table[id] != resized {
                                     self.mark_dirty_id(id);
-                                    self.signal_table[id] = resized;
+                                    write_sig!(self, id, resized);
                                     self.table_modified = true;
                                 }
                             } else {
@@ -8419,7 +8509,7 @@ impl Simulator {
                         let changed = self.signal_table[id] != resized;
                         if changed {
                             self.mark_dirty_id(id);
-                            self.signal_table[id] = resized;
+                            write_sig!(self, id, resized);
                             self.table_modified = true;
                         }
                         return changed;
@@ -8446,7 +8536,7 @@ impl Simulator {
                     let changed = self.signal_table[id] != resized;
                     if changed {
                         self.mark_dirty_id(id);
-                        self.signal_table[id] = resized;
+                        write_sig!(self, id, resized);
                         self.table_modified = true;
                     }
                     return changed;
@@ -8536,7 +8626,7 @@ impl Simulator {
                                             self.dirty_list.push(id);
                                         }
                                         self.dirty_any = true;
-                                        self.signal_table[id] = resized;
+                                        write_sig!(self, id, resized);
                                         self.table_modified = true;
                                     }
                                     return changed;
@@ -8573,7 +8663,7 @@ impl Simulator {
                                         self.dirty_list.push(id);
                                     }
                                     self.dirty_any = true;
-                                    self.signal_table[id] = resized;
+                                    write_sig!(self, id, resized);
                                     self.table_modified = true;
                                 }
                                 return changed;
@@ -8616,7 +8706,7 @@ impl Simulator {
                                         self.dirty_list.push(id);
                                     }
                                     self.dirty_any = true;
-                                    self.signal_table[id] = resized;
+                                    write_sig!(self, id, resized);
                                     self.table_modified = true;
                                 }
                                 return changed;
@@ -8633,7 +8723,7 @@ impl Simulator {
                                     self.dirty_list.push(id);
                                 }
                                 self.dirty_any = true;
-                                self.signal_table[id] = resized;
+                                write_sig!(self, id, resized);
                                 self.table_modified = true;
                             }
                             return changed;
@@ -8750,7 +8840,7 @@ impl Simulator {
                         let changed = self.signal_table[id] != resized;
                         if changed {
                             self.mark_dirty_id(id);
-                            self.signal_table[id] = resized;
+                            write_sig!(self, id, resized);
                             self.table_modified = true;
                         }
                         return changed;
@@ -12262,7 +12352,7 @@ impl Simulator {
     fn sync_signal_to_table(&mut self, name: &str) {
         if let Some(&id) = self.signal_name_to_id.get(name) {
             if let Some(val) = self.signals.get(name) {
-                self.signal_table[id] = val.clone();
+                write_sig!(self, id, val.clone());
             }
         }
     }
@@ -12475,7 +12565,7 @@ impl Simulator {
         new_val.is_signed = self.signal_signed[id];
         if self.signal_table[id] != new_val {
             self.mark_dirty_id(id);
-            self.signal_table[id] = new_val;
+            write_sig!(self, id, new_val);
             self.table_modified = true;
         }
     }
@@ -12602,7 +12692,7 @@ impl Simulator {
             resized.is_signed = self.signal_signed[id];
             let changed = self.signal_table[id] != resized;
             if changed {
-                self.signal_table[id] = resized;
+                write_sig!(self, id, resized);
                 self.table_modified = true;
                 // Avoid a second signal_name_to_id lookup via mark_dirty(name)
                 // — we already resolved id above.
@@ -12620,7 +12710,7 @@ impl Simulator {
             resized.is_signed = self.signal_signed[id];
             let changed = self.signal_table[id] != resized;
             if changed {
-                self.signal_table[id] = resized;
+                write_sig!(self, id, resized);
                 self.table_modified = true;
                 self.mark_dirty_id(id);
             }
@@ -12824,7 +12914,7 @@ impl Simulator {
     pub fn set_signal(&mut self, name: &str, val: Value) {
         if let Some(&id) = self.signal_name_to_id.get(name) {
             let w = self.signal_widths[id];
-            self.signal_table[id] = val.resize(w);
+            write_sig!(self, id, val.resize(w));
             self.table_modified = true;
             self.mark_dirty_id(id);
             return;
@@ -13753,7 +13843,7 @@ impl Simulator {
                     self.dirty_list.push(id);
                 }
                 self.dirty_any = true;
-                self.signal_table[id] = resized;
+                write_sig!(self, id, resized);
                 self.table_modified = true;
             }
             return;
@@ -13768,7 +13858,7 @@ impl Simulator {
                     self.dirty_list.push(id);
                 }
                 self.dirty_any = true;
-                self.signal_table[id] = resized;
+                write_sig!(self, id, resized);
                 self.table_modified = true;
             }
             return;

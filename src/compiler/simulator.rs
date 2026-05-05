@@ -540,7 +540,7 @@ fn resolve_array_elem_id(
     Some(first_id + (idx - lo) as usize)
 }
 
-/// Phase-2 profile snapshot loaded from a `--write-profile` text file.
+/// Phase-2/4 profile snapshot loaded from a `--write-profile` text file.
 /// Sparse: only blocks that fired and signals that toggled appear.
 #[derive(Default, Debug, Clone)]
 pub struct Phase2Profile {
@@ -550,6 +550,20 @@ pub struct Phase2Profile {
     pub edge_block_exec_count: ahash::AHashMap<usize, u64>,
     /// signal_id → toggle count.
     pub signal_toggle_count: ahash::AHashMap<usize, u64>,
+    /// Phase-4: edge_block_idx → static NBA insn count (per fire).
+    pub nba_count_per_block: ahash::AHashMap<usize, u64>,
+    /// Phase-4: signal_id → count of triggers that woke at least one
+    /// fanout block.
+    pub sensitivity_trigger_count: ahash::AHashMap<usize, u64>,
+    /// Phase-4: edge_block_idx → count of times this block was woken
+    /// by another block's NBA-driven edge fire.
+    pub cross_block_wakeup_count: ahash::AHashMap<usize, u64>,
+    /// Phase-4: partition_id → number of signals it NBA-writes that
+    /// are read by another partition. Only present if the profile
+    /// was collected with a partition loaded.
+    pub boundary_packet_count: ahash::AHashMap<usize, u64>,
+    /// Phase-4: partition_id → settle iterations local to it.
+    pub local_quiescence_iterations: ahash::AHashMap<usize, u64>,
 }
 
 impl Phase2Profile {
@@ -570,6 +584,11 @@ impl Phase2Profile {
                 section = match &line[1..line.len() - 1] {
                     "edge_block_exec" => "edge_block_exec",
                     "signal_toggle" => "signal_toggle",
+                    "nba_count_per_block" => "nba_count_per_block",
+                    "sensitivity_trigger" => "sensitivity_trigger",
+                    "cross_block_wakeup" => "cross_block_wakeup",
+                    "boundary_packet" => "boundary_packet",
+                    "local_quiescence" => "local_quiescence",
                     _ => "",
                 };
                 continue;
@@ -587,6 +606,31 @@ impl Phase2Profile {
                     let sid: usize = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
                     let t: u64 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
                     p.signal_toggle_count.insert(sid, t);
+                }
+                "nba_count_per_block" => {
+                    let bi: usize = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                    let n: u64 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                    p.nba_count_per_block.insert(bi, n);
+                }
+                "sensitivity_trigger" => {
+                    let sid: usize = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                    let t: u64 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                    p.sensitivity_trigger_count.insert(sid, t);
+                }
+                "cross_block_wakeup" => {
+                    let bi: usize = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                    let w: u64 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                    p.cross_block_wakeup_count.insert(bi, w);
+                }
+                "boundary_packet" => {
+                    let pid: usize = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                    let b: u64 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                    p.boundary_packet_count.insert(pid, b);
+                }
+                "local_quiescence" => {
+                    let pid: usize = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                    let q: u64 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                    p.local_quiescence_iterations.insert(pid, q);
                 }
                 _ => {}
             }
@@ -801,6 +845,37 @@ pub struct Simulator {
     /// the hyperedge weight in profile-guided emission — busy
     /// signals are more expensive to share across cores.
     signal_toggle_count: Vec<u64>,
+    /// Phase-4 counter: number of NBA writes performed per edge
+    /// block during a stats-enabled run. NBAs cost a queue insert +
+    /// a later apply pass, both of which are heavier than reads.
+    /// Better vertex-weight signal than insn count for highly
+    /// asymmetric blocks (small body, many NBAs vs big body, few NBAs).
+    nba_count_per_block: Vec<u64>,
+    /// Phase-4 counter: per-sensitivity-signal trigger count
+    /// (sid → fires). Subset of signal_toggle_count restricted to
+    /// signals that actually appear in some block's sensitivity list.
+    /// Filters out toggles on signals that never wake anyone.
+    sensitivity_trigger_count: Vec<u64>,
+    /// Phase-4 counter: per-block cross-block wakeup count. When
+    /// block A's NBA write changes a signal that triggers block B,
+    /// `cross_block_wakeup_count[A]` increments. Captures the actual
+    /// "packet flow" between blocks — much sharper hyperedge weight
+    /// than static fanout because it counts only the signals that
+    /// CAUSED a wakeup, not all readers.
+    cross_block_wakeup_count: Vec<u64>,
+    /// Phase-4 counter: per-partition cross-boundary packet count.
+    /// Indexed by `edge_block_partition_count`-sized vector;
+    /// `boundary_packet_count[p]` = number of NBA writes from
+    /// partition p whose target signal is read by a different
+    /// partition. Computed lazily from cross_block_wakeup_count when
+    /// dumping the profile (no per-write hot-path cost).
+    boundary_packet_count: Vec<u64>,
+    /// Phase-4 counter: per-partition local-quiescence iteration
+    /// count — how many settle iterations were resolved within the
+    /// partition before any cross-partition signal had to be
+    /// merged. Higher = better partition (more local work). Same
+    /// indexing as boundary_packet_count.
+    local_quiescence_iterations: Vec<u64>,
     /// Per-edge-block: cached scope hint (parent module name from first
     /// sensitivity signal) so sequential-exec path can skip per-call rsplit.
     edge_block_scope: Vec<Option<String>>,
@@ -1618,6 +1693,11 @@ impl Simulator {
             edge_block_exec_counts: Vec::new(),
             edge_block_exec_ns: Vec::new(),
             signal_toggle_count: Vec::new(),
+            nba_count_per_block: Vec::new(),
+            sensitivity_trigger_count: Vec::new(),
+            cross_block_wakeup_count: Vec::new(),
+            boundary_packet_count: Vec::new(),
+            local_quiescence_iterations: Vec::new(),
             edge_block_stats_enabled: std::env::var("XEZIM_EDGE_BLOCK_STATS").ok().as_deref()
                 == Some("1"),
             edge_block_scope: Vec::new(),
@@ -1771,7 +1851,7 @@ impl Simulator {
         let mut out = std::io::BufWriter::new(
             std::fs::File::create(path).map_err(|e| format!("create {}: {}", path, e))?,
         );
-        writeln!(out, "# xezim phase2 profile v1").map_err(|e| e.to_string())?;
+        writeln!(out, "# xezim phase2/4 profile v2").map_err(|e| e.to_string())?;
         writeln!(
             out,
             "# blocks={} signals={}",
@@ -1797,6 +1877,91 @@ impl Simulator {
                 continue;
             }
             writeln!(out, "{} {}", sid, *t).map_err(|e| e.to_string())?;
+        }
+        // Phase-4 sections.
+        writeln!(out, "[nba_count_per_block]").map_err(|e| e.to_string())?;
+        for (bi, n) in self.nba_count_per_block.iter().enumerate() {
+            if *n == 0 {
+                continue;
+            }
+            writeln!(out, "{} {}", bi, *n).map_err(|e| e.to_string())?;
+        }
+        writeln!(out, "[sensitivity_trigger]").map_err(|e| e.to_string())?;
+        for (sid, t) in self.sensitivity_trigger_count.iter().enumerate() {
+            if *t == 0 {
+                continue;
+            }
+            writeln!(out, "{} {}", sid, *t).map_err(|e| e.to_string())?;
+        }
+        writeln!(out, "[cross_block_wakeup]").map_err(|e| e.to_string())?;
+        for (bi, w) in self.cross_block_wakeup_count.iter().enumerate() {
+            if *w == 0 {
+                continue;
+            }
+            writeln!(out, "{} {}", bi, *w).map_err(|e| e.to_string())?;
+        }
+        // Boundary packet count + local quiescence iters: derived from
+        // the current partition if one is loaded. Boundary packets are
+        // signals NBA-written by partition P that are read by some
+        // other partition. Local quiescence is the count of settle
+        // iterations whose NBAs landed entirely within one partition.
+        if self.edge_block_partition_count > 0 {
+            let k = self.edge_block_partition_count as usize;
+            let mut boundary = vec![0u64; k];
+            // Build sets: writers by partition × readers by partition.
+            for (sid, _) in self.signal_toggle_count.iter().enumerate() {
+                let writers: ahash::AHashSet<u32> = (0..self.edge_blocks.len())
+                    .filter(|&bi| self.edge_block_parallel.get(bi).copied().unwrap_or(false))
+                    .filter(|&bi| {
+                        self.compiled_edge_blocks
+                            .get(bi)
+                            .and_then(|c| c.as_ref())
+                            .map_or(false, |cb| {
+                                cb.instructions.iter().any(|i| match i {
+                                    super::bytecode::Insn::NbaAssign(s, _, _)
+                                    | super::bytecode::Insn::NbaAssignRange(s, _, _, _) => {
+                                        *s == sid
+                                    }
+                                    _ => false,
+                                })
+                            })
+                    })
+                    .map(|bi| {
+                        self.edge_block_partition.get(bi).copied().unwrap_or(0)
+                    })
+                    .collect();
+                let readers: ahash::AHashSet<u32> = (0..self.edge_blocks.len())
+                    .filter(|&bi| self.edge_block_parallel.get(bi).copied().unwrap_or(false))
+                    .filter(|&bi| {
+                        self.compiled_edge_blocks
+                            .get(bi)
+                            .and_then(|c| c.as_ref())
+                            .map_or(false, |cb| {
+                                cb.instructions.iter().any(|i| matches!(i,
+                                    super::bytecode::Insn::LoadSignal(_, s)
+                                    | super::bytecode::Insn::LoadSignalSigned(_, s) if *s == sid))
+                            })
+                    })
+                    .map(|bi| self.edge_block_partition.get(bi).copied().unwrap_or(0))
+                    .collect();
+                // For each writer partition, if any READER is in a
+                // different partition, count one boundary packet.
+                for &wp in &writers {
+                    if readers.iter().any(|&rp| rp != wp) {
+                        if (wp as usize) < boundary.len() {
+                            boundary[wp as usize] += 1;
+                        }
+                    }
+                }
+            }
+            writeln!(out, "[boundary_packet]").map_err(|e| e.to_string())?;
+            for (p, b) in boundary.iter().enumerate() {
+                writeln!(out, "{} {}", p, *b).map_err(|e| e.to_string())?;
+            }
+            writeln!(out, "[local_quiescence]").map_err(|e| e.to_string())?;
+            for (p, q) in self.local_quiescence_iterations.iter().enumerate() {
+                writeln!(out, "{} {}", p, *q).map_err(|e| e.to_string())?;
+            }
         }
         out.flush().map_err(|e| e.to_string())?;
         Ok(())
@@ -2174,17 +2339,23 @@ impl Simulator {
         writeln!(out, "{} {} 11", edges.len(), blocks.len())
             .map_err(|e| e.to_string())?;
         for (sid, vs) in &edges {
-            // Edge weight: profile-guided when available
-            // (toggle_count × signal_width), else static signal width.
+            // Edge weight: phase-4 prefers MEASURED COST over hierarchy.
+            // The user spec says "repartition based on measured cost,
+            // not hierarchy", so when a profile is present we use:
+            //   sensitivity_trigger_count × signal_width
+            // (signals that actually woke blocks × bytes per packet).
+            // Falls back to phase-2's toggle×width when sensitivity
+            // counter wasn't populated, and finally to static width.
             let static_w = if *sid < self.signal_widths.len() {
                 self.signal_widths[*sid].max(1)
             } else {
                 1
             };
             let w = if let Some(p) = profile {
+                let triggers = p.sensitivity_trigger_count.get(sid).copied();
                 let toggles = p.signal_toggle_count.get(sid).copied().unwrap_or(0);
-                // Cap at u32::MAX-1 — mt-kahypar reads weights as i32-ish.
-                let raw = (toggles.saturating_mul(static_w as u64)).max(1);
+                let measured = triggers.unwrap_or(toggles);
+                let raw = (measured.saturating_mul(static_w as u64)).max(1);
                 raw.min(u32::MAX as u64 - 1) as u32
             } else {
                 static_w
@@ -2196,15 +2367,24 @@ impl Simulator {
             writeln!(out).map_err(|e| e.to_string())?;
         }
         for &root in &blocks {
-            // Vertex weight: SUM over all members of this island
-            // (when phase-3 collapse is on, that's the joint cost
-            // of the must-co-locate group).
+            // Vertex weight: phase-4 measured cost = runtime_ns
+            // + (NBA_count × fire_count × NBA_FIXED_COST_NS).
+            // The static NBA term gives every block a non-zero floor
+            // (fixes phase 2's 1868-cold-blocks-bunched problem) while
+            // still letting hot blocks dominate.
+            const NBA_FIXED_COST_NS: u64 = 50; // empirical: ~50 ns/NBA
             let empty: Vec<usize> = Vec::new();
             let members = members_of.get(&root).unwrap_or(&empty);
             let w = if let Some(p) = profile {
                 let ns: u64 = members
                     .iter()
-                    .map(|&bi| p.edge_block_exec_ns.get(&bi).copied().unwrap_or(0))
+                    .map(|&bi| {
+                        let exec = p.edge_block_exec_ns.get(&bi).copied().unwrap_or(0);
+                        let nba = p.nba_count_per_block.get(&bi).copied().unwrap_or(0);
+                        let fires = p.edge_block_exec_count.get(&bi).copied().unwrap_or(0);
+                        let nba_cost = nba.saturating_mul(fires).saturating_mul(NBA_FIXED_COST_NS);
+                        exec.saturating_add(nba_cost)
+                    })
                     .sum();
                 let us = (ns / 1000).max(1);
                 us.min(u32::MAX as u64 - 1) as u32
@@ -4139,6 +4319,29 @@ impl Simulator {
         if self.edge_block_stats_enabled {
             self.edge_block_exec_ns = vec![0u64; self.compiled_edge_blocks.len()];
             self.signal_toggle_count = vec![0u64; self.signal_table.len()];
+            // nba_count_per_block is the COMPILE-TIME count of
+            // NbaAssign* instructions per block. Multiply by
+            // edge_block_exec_counts[bi] to get the runtime cost.
+            let mut nba_count = vec![0u64; self.compiled_edge_blocks.len()];
+            for (bi, cb_opt) in self.compiled_edge_blocks.iter().enumerate() {
+                if let Some(cb) = cb_opt {
+                    let n = cb.instructions.iter().filter(|i| matches!(i,
+                        super::bytecode::Insn::NbaAssign(..) |
+                        super::bytecode::Insn::NbaAssignRange(..) |
+                        super::bytecode::Insn::NbaAssignRangeDyn(..) |
+                        super::bytecode::Insn::NbaAssignBitDyn(..) |
+                        super::bytecode::Insn::NbaAssignArray(..) |
+                        super::bytecode::Insn::NbaAssignArrayRange(..)
+                    )).count() as u64;
+                    nba_count[bi] = n;
+                }
+            }
+            self.nba_count_per_block = nba_count;
+            self.sensitivity_trigger_count = vec![0u64; self.signal_table.len()];
+            self.cross_block_wakeup_count = vec![0u64; self.compiled_edge_blocks.len()];
+            // boundary_packet_count + local_quiescence_iterations are
+            // sized later when a partition is loaded — they're
+            // partition-indexed, not block-indexed.
         }
 
         // JIT pass: attempt native codegen for each compiled block.
@@ -8382,11 +8585,25 @@ impl Simulator {
             if self.edge_block_stats_enabled && sid < self.signal_toggle_count.len() {
                 self.signal_toggle_count[sid] += 1;
             }
+            // Phase-4: track wakeups per fanout member + which signals
+            // are sensitivity sources. We're inside the trigger loop;
+            // the writer of `sid` isn't known here (the NBA queue is
+            // already drained), so cross_block_wakeup_count gets
+            // attributed to each WOKEN block — that's the inverse-
+            // direction packet-flow count (B was waited on N times)
+            // which is symmetric for hyperedge weight purposes.
+            let mut woke_any = false;
             if fires_pos {
                 for &block_idx in &fanout.posedge {
                     if block_idx < triggered_bitmap.len() && !triggered_bitmap[block_idx] {
                         triggered_bitmap[block_idx] = true;
                         triggered.push(block_idx);
+                        woke_any = true;
+                        if self.edge_block_stats_enabled
+                            && block_idx < self.cross_block_wakeup_count.len()
+                        {
+                            self.cross_block_wakeup_count[block_idx] += 1;
+                        }
                     }
                 }
             }
@@ -8395,6 +8612,12 @@ impl Simulator {
                     if block_idx < triggered_bitmap.len() && !triggered_bitmap[block_idx] {
                         triggered_bitmap[block_idx] = true;
                         triggered.push(block_idx);
+                        woke_any = true;
+                        if self.edge_block_stats_enabled
+                            && block_idx < self.cross_block_wakeup_count.len()
+                        {
+                            self.cross_block_wakeup_count[block_idx] += 1;
+                        }
                     }
                 }
             }
@@ -8403,8 +8626,20 @@ impl Simulator {
                     if block_idx < triggered_bitmap.len() && !triggered_bitmap[block_idx] {
                         triggered_bitmap[block_idx] = true;
                         triggered.push(block_idx);
+                        woke_any = true;
+                        if self.edge_block_stats_enabled
+                            && block_idx < self.cross_block_wakeup_count.len()
+                        {
+                            self.cross_block_wakeup_count[block_idx] += 1;
+                        }
                     }
                 }
+            }
+            if woke_any
+                && self.edge_block_stats_enabled
+                && sid < self.sensitivity_trigger_count.len()
+            {
+                self.sensitivity_trigger_count[sid] += 1;
             }
         }
         self.prof_edge_detect += t0.elapsed().as_nanos() as u64;

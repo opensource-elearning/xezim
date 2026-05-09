@@ -1795,8 +1795,24 @@ impl<'a> BytecodeCompiler<'a> {
             ExprKind::Number(n) => {
                 self.eval_number_static(n).map(|v| v.width).unwrap_or(32)
             }
-            ExprKind::Binary { left, right, .. } => {
-                self.expr_max_width(left).max(self.expr_max_width(right))
+            ExprKind::Binary { op, left, right } => {
+                // Relational, equality, and logical operators always
+                // produce a 1-bit result regardless of operand width.
+                // Returning operand width here pollutes the ctx_width
+                // passed into a sibling bitwise operand of `&&`/`||`,
+                // causing it to be resized up and XNOR-then-NOT to
+                // produce ~0 in the upper bits — manifests as
+                // `(a ^~ b) && (c < d)` returning 1 instead of 0 when
+                // a^~b should be 0. (c910 BJU branch_blt_taken bug.)
+                if matches!(op,
+                    BinaryOp::Eq | BinaryOp::Neq | BinaryOp::CaseEq
+                    | BinaryOp::CaseNeq
+                    | BinaryOp::Lt | BinaryOp::Leq | BinaryOp::Gt | BinaryOp::Geq
+                    | BinaryOp::LogAnd | BinaryOp::LogOr) {
+                    1
+                } else {
+                    self.expr_max_width(left).max(self.expr_max_width(right))
+                }
             }
             ExprKind::Unary { operand, .. } => self.expr_max_width(operand),
             ExprKind::Paren(inner) => self.expr_max_width(inner),

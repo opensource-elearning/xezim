@@ -1814,14 +1814,34 @@ impl<'a> BytecodeCompiler<'a> {
                     self.expr_max_width(left).max(self.expr_max_width(right))
                 }
             }
-            ExprKind::Unary { operand, .. } => self.expr_max_width(operand),
+            ExprKind::Unary { op, operand } => {
+                // Reduction operators (&a, |a, ^a, ~&a, ~|a, ~^a) and logical
+                // NOT (!a) always produce 1 bit regardless of operand width.
+                // Returning operand width here pollutes ctx_width on a
+                // sibling bitwise op via &&/|| (same bug class as the
+                // relational/logical Binary fix above).
+                if matches!(op,
+                    UnaryOp::BitAnd | UnaryOp::BitNand
+                    | UnaryOp::BitOr  | UnaryOp::BitNor
+                    | UnaryOp::BitXor | UnaryOp::BitXnor
+                    | UnaryOp::LogNot) {
+                    1
+                } else {
+                    self.expr_max_width(operand)
+                }
+            }
             ExprKind::Paren(inner) => self.expr_max_width(inner),
             ExprKind::Call { args, .. } => {
                 args.iter().map(|a| self.expr_max_width(a)).max().unwrap_or(0)
             }
-            ExprKind::Conditional { then_expr, else_expr, condition, .. } => {
-                self.expr_max_width(condition)
-                    .max(self.expr_max_width(then_expr))
+            ExprKind::Conditional { then_expr, else_expr, .. } => {
+                // Verilog: result of `cond ? then : else` is max(then, else).
+                // The condition is self-determined to its own width and
+                // reduced to a boolean — it does NOT contribute to the
+                // result width. Including condition.width here would
+                // pollute ctx_width when the condition is wide
+                // (e.g. `wide_var ? a : b`).
+                self.expr_max_width(then_expr)
                     .max(self.expr_max_width(else_expr))
             }
             ExprKind::Concatenation(parts) => {

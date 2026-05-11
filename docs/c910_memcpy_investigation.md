@@ -255,6 +255,24 @@ failure point. Neither is achievable in remaining session time.
 Full TEST PASSED for c910 memcpy remains an open issue tracked
 in `MEMORY.md` (project_c910_memcpy_divuw_dispatch.md).
 
+## Round 31 (2026-05-10) — NBA active-region leak fix (separate bug)
+
+Implemented `drain_active_processes_at_current_time` per IEEE 1800-2017
+§4.4.5 in simulator.rs check_edges. Fixes the bug where
+`initial begin forever @(posedge clk) ...` waiter continuations
+ran in the next event_loop iteration AFTER the cascade's apply_nba
+committed — leaking NBA updates into the current cycle's active
+region. (Commit `d92a551`.)
+
+Min repro `tests/nba_leak_waiter_active_region.rs` documents the
+correct vs buggy semantics. Test passes with fix; all other tests
+unchanged (131/132 pass; the one pre-existing failure is unrelated).
+
+**Outcome for c910 memcpy**: still TEST FAILED at sim 1,000,195
+(watchdog) with the fix applied. The NBA-leak bug was a real bug
+in xezim, but it's NOT the root cause of the c910 memcpy hang. The
+hang has a different root cause that this fix does not address.
+
 The 22+ rounds of IFU/IBUF investigation below were chasing two
 separate red herrings: the "PC 0x712 missing" retire-log artifact
 (round 22) and the precode/IBUF cone-of-influence work (rounds

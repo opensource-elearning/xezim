@@ -195,3 +195,65 @@ retires separately, the inst at 0x710 must be 16-bit).
 - `84332c7` tests: case-stmt default arm for c910 IFU/IB shape
 - `86343f0` tests: synthetic c910 dep_reg_entry + param-arith RangeSelect
 - xezim-core `75b2adf` value: document `to_u64` silently truncates wide values
+
+## Round 23 (2026-05-10) — IFU code audit, no new fix candidate
+
+Read both `ct_ifu_precode.v` (320 lines) and the IBUF pop case-tree
+sections in `ct_ifu_ibuf.v` end-to-end. Confirmed nothing exotic in
+either:
+
+- precode logic is straightforward `==` and `&&`/`!` reductions; the
+  expr_max_width relational fix (f127254/01ca2b1) already covers this
+  pattern. No remaining width-inference hazard found.
+- IBUF entry-output mux uses a standard 32-way one-hot `case` keyed by
+  `ibuf_retire_pointer[31:0]` — no `casez` here, just plain `case`.
+  CaseEq compilation already verified by `case_default_arm` synth test.
+- IBUF dispatch arm picker at lines 7920-8362 uses `casez({h0..h4
+  _32_start})` with `?` wildcards. xezim's casez compilation has been
+  verified (CasezEq op in bytecode.rs:606, Value::casez_eq treats Z bits
+  as don't-care; `?` lex-maps to LogicBit::Z at value.rs:25).
+
+Audited Value comparison helpers in xezim-core/src/value.rs:
+- `is_equal` / `case_eq` / `less_than` / etc. use `to_u64().unwrap_or(0)`
+  on no-X paths (value.rs:930, 999) — same wide-truncation hazard as
+  add/sub/mul before commit 710a793, but only matters for width > 64.
+  Case selector here is 32-bit, so not the immediate culprit.
+
+Audited expr_max_width and compile_expr alignment:
+- Unary self-determined operand_ctx=0 fix is present (bytecode.rs:915).
+- Conditional handler correctly self-determines condition (bytecode.rs:1019).
+- expr_max_width::Index still returns 1 unconditionally (line 1877).
+  `infer_lhs_width::Index` correctly distinguishes unpacked-array element
+  width vs bit-select width=1 (lines 1668-1681). Memory notes that
+  "fixing expr_max_width::Index to return element width regresses cmark"
+  — that fix exposed a downstream truncation that wasn't paired-fixed.
+  This remains a known but uncorrected divergence between the two
+  inference functions.
+
+**Why no fix this round**: After full code audit of the IFU/IBUF
+critical path and the bytecode width-inference helpers, no single
+change has high probability of fixing memcpy without regressing
+cmark/hello. The 22-min test cycle and heisenbug-shifted symptoms
+preclude speculative one-shot fixes.
+
+**Required for next round** (must iterate, not one-shot):
+
+1. **Add a single targeted probe** in xezim's tb.v that captures
+   `pre_code[31:0]` for the precode of the cacheline containing PC
+   0x710 (icache way that holds 0x710). Compare against Questa VCD
+   ground truth — if precode is wrong, the bug is in xezim's compile of
+   precode's boolean expressions; if precode is correct, the bug is in
+   ibuf entry-write or pop-mux. Run with `--max-time 50000`.
+
+2. If precode matches Questa: probe `entry_inst_data_N` for the entry
+   that receives PC 0x712 (depends on `ibuf_create_pointer` state at
+   that cycle). If entry write loses the halfword, the bug is in
+   `ct_ifu_ibuf_entry.v` clock-gated register update — examine xezim's
+   handling of `gated_clk_cell` and the entry_data_create_x conditional
+   `<=` chain. If entry write is correct but pop-mux output is wrong,
+   the bug is in the case-tree selection.
+
+3. Once the bug is localized to a specific signal mismatch with Questa,
+   write a synthetic test reproducing only that pattern, then iterate
+   on the compiler/simulator fix until both the synthetic and full
+   c910 memcpy pass.

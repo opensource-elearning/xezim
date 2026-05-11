@@ -180,6 +180,49 @@ Possible specific causes:
 working write and the 123rd hanging write. The diff identifies the
 specific transaction-shape change.
 
+## Round 30 (2026-05-10) — fix attempts that didn't work
+
+Fix attempts tried this round, all failing to unstick the 123rd
+transaction:
+
+1. **XEZIM_CASCADE_LIMIT=128** (vs default 8) — REGRESSED to only
+   25 wvalid events (vs 124 normally), last at sim 47695. Higher
+   cascade limit produces fewer events. Counter-intuitive but
+   measured. Disqualifies "settle iter exhaustion" as the root cause.
+2. **XEZIM_X_LITERAL_TO_ZERO=1 + INIT_ZERO=1** — Same failure point
+   at sim 58335. X-literal coercion doesn't help.
+3. **axi_slave128.v `always @(...)` → `always @(*)`** — Same failure
+   point at sim 58335. Sensitivity-list completeness isn't the issue.
+
+Reverted the axi_slave128.v change. The bvalid trace also shows:
+- `biu_pad_bready` is constant 1 after init (master always ready)
+- Slave's `pad_biu_bvalid` simply doesn't pulse for the 123rd write
+
+The slave's FSM transition WRITE → WRITE_RESP requires
+`write_over && wvalid_s0 && wready`. wready = (cur_state == WRITE).
+For single-beat writes, write_over fires when write_step == awlen.
+The previous 122 writes succeed with this exact condition, so the
+slave logic is structurally sound.
+
+**The only thing different about the 123rd**: the awaddr per
+Questa is 0xd000 (the final memcpy destination word). After this,
+post-loop code writes to a different region starting at 0x1b40. The
+transition between these two phases is where xezim's CPU/BIU/slave
+chain mishandles something.
+
+**Conclusion**: this bug is deeper than session-scope debug can
+resolve without either (a) reference-simulator side-by-side
+comparison with deeper signals (`biu_pad_awlen`, `awburst`,
+`mem_addr` etc.) or (b) a methodical xezim simulator-internal
+audit of the AXI/burst event-island convergence. Both require
+more investment than a single conversation can support.
+
+Status at end of session: `XEZIM_INIT_ZERO=1` is the partial-fix
+configuration; ships with the early-failure prevention but not
+the late-stall fix. The 22+ rounds of IFU/IBUF cone-of-influence
+work confirmed the IFU is correct; the bug is in the AXI/BIU
+write subsystem at the vector-to-scalar phase transition.
+
 The 22+ rounds of IFU/IBUF investigation below were chasing two
 separate red herrings: the "PC 0x712 missing" retire-log artifact
 (round 22) and the precode/IBUF cone-of-influence work (rounds

@@ -238,12 +238,14 @@ preclude speculative one-shot fixes.
 
 **Required for next round** (must iterate, not one-shot):
 
-1. **Add a single targeted probe** in xezim's tb.v that captures
+1. ~~**Add a single targeted probe** in xezim's tb.v that captures
    `pre_code[31:0]` for the precode of the cacheline containing PC
-   0x710 (icache way that holds 0x710). Compare against Questa VCD
-   ground truth — if precode is wrong, the bug is in xezim's compile of
-   precode's boolean expressions; if precode is correct, the bug is in
-   ibuf entry-write or pop-mux. Run with `--max-time 50000`.
+   0x710~~ **RULED OUT** via cone-of-influence synth test
+   `tests/ifu_precode_c910_pc710.rs` (commit 9e14b02). xezim's bytecode
+   compile of `ct_ifu_precode.v`'s boolean evaluation produces the
+   correct pre_code for the 0x710 cacheline inst_data for both
+   candidate byte-orderings. Hypothesis #1 (precode mis-compile)
+   eliminated without needing the full 22-min run.
 
 2. If precode matches Questa: probe `entry_inst_data_N` for the entry
    that receives PC 0x712 (depends on `ibuf_create_pointer` state at

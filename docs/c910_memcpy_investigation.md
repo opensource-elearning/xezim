@@ -273,6 +273,34 @@ unchanged (131/132 pass; the one pre-existing failure is unrelated).
 in xezim, but it's NOT the root cause of the c910 memcpy hang. The
 hang has a different root cause that this fix does not address.
 
+## Round 32 (2026-05-10) — iverilog VCD comparison
+
+Ran iverilog (`/tmp/c910_iv_axi.vvp`) on the same c910 memcpy
+testbench. Result:
+- **TEST PASSED** at sim 1,019,650 (= 101,965 ns at 100ps timescale)
+- `Memory copy for 1024 bytes cost 402 CPU cycles!` printed
+- 286 `biu_pad_wvalid` events from sim 45395-101245ns
+
+Compared with xezim (XEZIM_INIT_ZERO=1, with the NBA-leak fix):
+- xezim: 9-25 `biu_pad_wvalid` events depending on tb.v probe state
+- Last event at sim 45995-58335 (varies with probe set — heisenbug)
+
+The first ~9 events match iverilog exactly, then xezim diverges.
+The exact divergence cycle is heisenbug-sensitive: removing/adding
+unrelated $display tracers in tb.v shifts when xezim stalls. This
+is documented in round 30 — xezim's bytecode compile has scheduling
+sensitivity to probe sets.
+
+iverilog's reference run cleanly executes the full 1024-byte memcpy
+and writes the success sentinel before sim 102K. xezim never reaches
+sentinel write — stalls in the AXI write subsystem somewhere between
+sim 45-58K depending on probe state.
+
+The c910 memcpy bug remains unfixed. The shipping configuration is
+`XEZIM_INIT_ZERO=1` plus the NBA-leak fix (commit `d92a551`) which
+together get xezim through more of the test than vanilla but still
+hit the AXI handshake stall well before completion.
+
 The 22+ rounds of IFU/IBUF investigation below were chasing two
 separate red herrings: the "PC 0x712 missing" retire-log artifact
 (round 22) and the precode/IBUF cone-of-influence work (rounds

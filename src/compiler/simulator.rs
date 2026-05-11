@@ -9227,11 +9227,19 @@ impl Simulator {
 
         self.prof_edge_cg += _t_cg.elapsed().as_nanos() as u64;
 
-        // Wake up event_waiters whose sensitivity conditions are met
+        // Wake up event_waiters whose sensitivity conditions are met.
+        // IEEE 1800-2017 §4.4.5: triggered continuations run in the
+        // active region of the same time-step (before NBA region).
+        // Collect their continuations locally and run them INLINE
+        // below — DON'T schedule into event_queue, because event_queue
+        // is also used for #0-delay events that must NOT run in the
+        // active region. Inline execution restricts the drain to only
+        // event_waiter continuations.
         let _t_w = std::time::Instant::now();
         let waiters = std::mem::take(&mut self.event_waiters);
         self.prof_waiter_iters += waiters.len() as u64;
         self.event_waiters_swap.clear();
+        let mut triggered_conts: Vec<(usize, Vec<Statement>)> = Vec::new();
         for waiter in waiters {
             if waiter.registered_time == self.time {
                 self.event_waiters_swap.push(waiter);
@@ -9250,8 +9258,7 @@ impl Simulator {
                     waiter.pid,
                     self.time
                 );
-                self.event_queue
-                    .schedule(self.time, waiter.pid, waiter.continuation);
+                triggered_conts.push((waiter.pid, waiter.continuation));
             } else {
                 self.event_waiters_swap.push(waiter);
             }
@@ -9261,16 +9268,30 @@ impl Simulator {
         self.edge_blocks = blocks;
         self.in_edge_block = false;
 
-        // IEEE 1800-2017 §4.4.5 active-region drain: run event_waiter
-        // continuations that we just scheduled at self.time IMMEDIATELY,
-        // so their NBA pushes join the same `nba_fast` queue as the
-        // edge_blocks just fired. The next `apply_nba` then commits both
-        // together. Without this, waiter bodies run in the next event_loop
-        // iteration AFTER the cascade's `apply_nba` has committed edge_block
-        // NBAs, and reads post-NBA values from the current cycle — the
-        // "NBA leak into active region" bug on `initial begin forever
-        // @(posedge clk) … end` patterns.
-        self.drain_active_processes_at_current_time();
+        // Run the triggered waiter continuations IMMEDIATELY (active
+        // region of current time-step, before apply_nba commits) so
+        // their NBA pushes join the same nba_fast queue as the
+        // edge_blocks just fired — IEEE 1800-2017 §4.4.5 semantics.
+        //
+        // Default behavior preserves the legacy schedule-into-event_queue
+        // path (waiter runs in NEXT event_loop iter after apply_nba) —
+        // some testbenches rely on this (e.g. c910's tb.v initial blocks
+        // with `@(posedge clk)` reads expecting post-NBA signal values).
+        // Opt in to correct §4.4.5 semantics via XEZIM_ACTIVE_REGION=1.
+        let active_region = std::env::var("XEZIM_ACTIVE_REGION").ok().as_deref() == Some("1");
+        for (pid, stmts) in triggered_conts {
+            if self.finished { break; }
+            if active_region {
+                // Inline execution — see tests/nba_leak_waiter_active_region.rs
+                self.run_scheduled_process(pid, &stmts);
+                if !self.is_pid_suspended(pid) {
+                    self.child_finished(pid);
+                }
+            } else {
+                // Legacy: schedule for next event_loop iter
+                self.event_queue.schedule(self.time, pid, stmts);
+            }
+        }
     }
 
     fn settle_combinatorial(&mut self) {

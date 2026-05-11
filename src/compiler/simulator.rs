@@ -16,7 +16,7 @@ use crate::ast::stmt::*;
 use crate::ast::types::{DataType, IntegerAtomType, PortDirection};
 #[allow(unused_imports)]
 use crate::{log_eprintln as eprintln, log_println as println};
-use ahash::{AHashMap as HashMap, AHashSet as HashSet};
+use xezim_core::hasher::{HashMap, HashSet};
 use libffi::middle::{Arg, Cif, CodePtr, Type};
 use libloading::Library;
 use rand::SeedableRng;
@@ -1173,16 +1173,16 @@ impl Simulator {
         let mut existing: HashSet<String> = module.signals.keys().cloned().collect();
         existing.extend(module.parameters.keys().cloned());
 
-        let mut to_create: HashSet<String> = HashSet::new();
+        let mut to_create: HashSet<String> = HashSet::default();
         for ca in &module.continuous_assigns {
             let lhs_raw = ident_raw(&ca.lhs);
             let rhs_raw = ident_raw(&ca.rhs);
             let lhs_leaf = ident_leaf(&ca.lhs);
             let rhs_leaf = ident_leaf(&ca.rhs);
 
-            let mut leaves = HashSet::new();
-            let mut reads = HashSet::new();
-            let mut writes = HashSet::new();
+            let mut leaves = HashSet::default();
+            let mut reads = HashSet::default();
+            let mut writes = HashSet::default();
             Self::collect_expr_reads(&ca.rhs, module, &mut reads);
             collect_lhs_leaves(&ca.lhs, &mut writes);
             for name in reads.iter().chain(writes.iter()) {
@@ -1260,10 +1260,10 @@ impl Simulator {
         // targets). Eliminating the bulk-populate saves ~150–250 MB on
         // c910-scale designs (585K signals × 2 stores × name + Value
         // duplication).
-        let signals: HashMap<String, Value> = HashMap::new();
-        let widths: HashMap<String, u32> = HashMap::new();
-        let signed_signals: HashSet<String> = HashSet::new();
-        let real_signals: HashSet<String> = HashSet::new();
+        let signals: HashMap<String, Value> = HashMap::default();
+        let widths: HashMap<String, u32> = HashMap::default();
+        let signed_signals: HashSet<String> = HashSet::default();
+        let real_signals: HashSet<String> = HashSet::default();
 
         let phase_materialize = std::time::Instant::now();
         Self::materialize_implicit_contassign_nets(&mut module);
@@ -1289,14 +1289,14 @@ impl Simulator {
         let names_ms = phase_names.elapsed().as_secs_f64() * 1000.0;
 
         let n = names.len();
-        let mut signal_name_to_id: HashMap<Arc<str>, usize> = HashMap::with_capacity(n);
-        let mut leaf_name_to_ids: HashMap<Arc<str>, Vec<usize>> = HashMap::new();
+        let mut signal_name_to_id: HashMap<Arc<str>, usize> = HashMap::with_capacity_and_hasher(n, Default::default());
+        let mut leaf_name_to_ids: HashMap<Arc<str>, Vec<usize>> = HashMap::default();
         let mut id_to_name: Vec<Arc<str>> = Vec::with_capacity(n);
         let mut signal_table: Vec<Value> = Vec::with_capacity(n);
         let mut signal_widths_vec: Vec<u32> = Vec::with_capacity(n);
         let mut signal_signed_vec: Vec<bool> = Vec::with_capacity(n);
         let mut signal_real_vec: Vec<bool> = Vec::with_capacity(n);
-        let mut signal_type_names: HashMap<usize, String> = HashMap::new();
+        let mut signal_type_names: HashMap<usize, String> = HashMap::default();
         let phase_static = std::time::Instant::now();
         // Drain `names` so each String moves into the Arc allocation
         // and is freed promptly, instead of being kept alongside the
@@ -1499,7 +1499,7 @@ impl Simulator {
         // working unchanged. The compact resolver is a *fast path*, not a
         // replacement for the per-element entries.
         let mut array_first_id: HashMap<Arc<str>, (usize, i64, i64)> =
-            HashMap::with_capacity(module.arrays.len());
+            HashMap::with_capacity_and_hasher(module.arrays.len(), Default::default());
         let phase_arrays_1d = std::time::Instant::now();
         let _ = (
             "[ARR] arrays={} arrays_2d={} arrays_nd={} signals_pre={} names_pre={}",
@@ -1622,7 +1622,7 @@ impl Simulator {
         let phase_prev = std::time::Instant::now();
         let prev_val: Vec<u64> = vec![0u64; named_count];
         let mut prev_xz: Vec<u64> = vec![0u64; named_count];
-        let mut prev_wide: HashMap<usize, Value> = HashMap::new();
+        let mut prev_wide: HashMap<usize, Value> = HashMap::default();
         for id in 0..named_count {
             let w = signal_widths_vec[id];
             let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
@@ -1640,7 +1640,7 @@ impl Simulator {
         // because `resolve_type_width` still resolves dimension
         // expressions against it at runtime (per step-2's caller fix).
         let phase_drop = std::time::Instant::now();
-        module.signals = HashMap::new();
+        module.signals = HashMap::default();
         let drop_ms = phase_drop.elapsed().as_secs_f64() * 1000.0;
 
         // Pre-compute X/Z bitmap for the JIT inline prelude. Default
@@ -1655,7 +1655,7 @@ impl Simulator {
             prev_val,
             prev_xz,
             prev_wide,
-            edge_signal_names: HashSet::new(),
+            edge_signal_names: HashSet::default(),
             edge_signal_ids: Vec::new(),
             edge_blocks_by_sig: Vec::new(),
             signals,
@@ -1665,7 +1665,7 @@ impl Simulator {
             signal_has_xz: signal_has_xz_init,
             signal_table,
             signal_name_to_id,
-            array_elem_ids: HashMap::new(),
+            array_elem_ids: HashMap::default(),
             array_first_id,
             leaf_name_to_ids,
             id_to_name,
@@ -1679,9 +1679,9 @@ impl Simulator {
             finished: false,
             compiled: false,
             monitor: None,
-            monitor_prev: HashMap::new(),
+            monitor_prev: HashMap::default(),
             pending_strobes: Vec::new(),
-            active_union_tag: HashMap::new(),
+            active_union_tag: HashMap::default(),
             max_time,
             settle_limit: 100,
             cascade_limit: std::env::var("XEZIM_CASCADE_LIMIT")
@@ -1696,20 +1696,20 @@ impl Simulator {
             delayed_updates: Vec::new(),
             module,
             dpi_libraries: Vec::new(),
-            dpi_bindings: HashMap::new(),
-            dpi_unsupported: HashSet::new(),
-            dpi_unresolved: HashSet::new(),
+            dpi_bindings: HashMap::default(),
+            dpi_unsupported: HashSet::default(),
+            dpi_unresolved: HashSet::default(),
             heap: vec![None], // index 0 is null
-            mailboxes: HashMap::new(),
-            semaphores: HashMap::new(),
+            mailboxes: HashMap::default(),
+            semaphores: HashMap::default(),
             cg_heap: vec![None],
             this_stack: vec![],
             local_stack: vec![],
             class_context_stack: vec![],
             cg_this: None,
             join_waiters: Vec::new(),
-            process_parents: HashMap::new(),
-            process_contexts: HashMap::new(),
+            process_parents: HashMap::default(),
+            process_contexts: HashMap::default(),
             return_value: None,
             rng: rand::rngs::StdRng::from_entropy(),
             settling: false,
@@ -1720,7 +1720,7 @@ impl Simulator {
             edge_sequential_work: Vec::new(),
             nba_queue: Vec::new(),
             nba_fast: Vec::new(),
-            nba_fast_index: HashMap::new(),
+            nba_fast_index: HashMap::default(),
             edge_blocks: Vec::new(),
             compiled_edge_blocks: Vec::new(),
             jit_fns: Vec::new(),
@@ -1756,10 +1756,10 @@ impl Simulator {
             event_waiters_swap: Vec::new(),
             vcd_file: None,
             vcd_writer: None,
-            vcd_id_map: HashMap::new(),
+            vcd_id_map: HashMap::default(),
             vcd_enabled: false,
             vcd_last_time: u64::MAX,
-            vcd_prev_signals: HashMap::new(),
+            vcd_prev_signals: HashMap::default(),
             vcd_filter_scopes: Vec::new(),
             vcd_filtered_ids: Vec::new(),
             threads: 1,
@@ -1768,8 +1768,8 @@ impl Simulator {
             xtrace_file: None,
             xtrace_level: 0,
             xtrace_writer: None,
-            xtrace_id_map: HashMap::new(),
-            xtrace_prev_signals: HashMap::new(),
+            xtrace_id_map: HashMap::default(),
+            xtrace_prev_signals: HashMap::default(),
             xtrace_last_time: 0,
             xtrace_prev_settle_iters: 0,
             xtrace_prev_edges_fired: 0,
@@ -1807,7 +1807,7 @@ impl Simulator {
             prof_edges_fired: 0,
             prof_insns_executed: 0,
             prof_fallback_insns: 0,
-            prof_fallback_by_reason: HashMap::new(),
+            prof_fallback_by_reason: HashMap::default(),
             prof_settle_dc_ns: 0,
             prof_settle_ca_ns: 0,
             prof_settle_ab_ns: 0,
@@ -1829,9 +1829,9 @@ impl Simulator {
             signal_toggle_counts: Vec::new(),
             activity_mon: false,
             plusargs: Vec::new(),
-            file_handles: HashMap::new(),
-            ungetc_buf: HashMap::new(),
-            static_task_init: HashSet::new(),
+            file_handles: HashMap::default(),
+            ungetc_buf: HashMap::default(),
+            static_task_init: HashSet::default(),
             current_static_task: None,
             next_file_handle: 3,
             name_resolve_hint: RefCell::new(None),
@@ -2323,7 +2323,7 @@ impl Simulator {
         // Map every eligible block to its super-vertex's vid via root.
         let block_vid = |bi: usize| -> Option<usize> { vid_of.get(&island_of[bi]).copied() };
         // Members per island (for vmap output and weight summing).
-        let mut members_of: HashMap<usize, Vec<usize>> = HashMap::new();
+        let mut members_of: HashMap<usize, Vec<usize>> = HashMap::default();
         for &bi in &all_eligible {
             members_of.entry(island_of[bi]).or_default().push(bi);
         }
@@ -2333,7 +2333,7 @@ impl Simulator {
         // super-vertex_vid) pair so the hyperedge captures the
         // COMBINED read/write set of the island. Dedup so each vid
         // appears at most once per signal.
-        let mut sig_to_vids: HashMap<usize, Vec<usize>> = HashMap::new();
+        let mut sig_to_vids: HashMap<usize, Vec<usize>> = HashMap::default();
         for &bi in &all_eligible {
             let vid = match block_vid(bi) {
                 Some(v) => v,
@@ -3843,7 +3843,7 @@ impl Simulator {
         // only a few thousand edge-sensitive ones, the dense layout wasted
         // ~14 MB on empty Vec stubs. Walk blocks once into a temp HashMap,
         // then materialize in edge_signal_ids order.
-        let mut by_sid: HashMap<usize, EdgeFanout> = HashMap::new();
+        let mut by_sid: HashMap<usize, EdgeFanout> = HashMap::default();
         for (block_idx, block) in self.edge_blocks.iter().enumerate() {
             for sid in &block.resolved_sensitivities {
                 let fanout = by_sid.entry(sid.signal_id).or_default();
@@ -3981,7 +3981,7 @@ impl Simulator {
             .unwrap_or(8);
         let n_blocks = self.edge_blocks.len();
         self.edge_block_partition = vec![0u32; n_blocks];
-        let mut clock_to_part: HashMap<usize, u32> = HashMap::new();
+        let mut clock_to_part: HashMap<usize, u32> = HashMap::default();
         let mut next_part: u32 = 0;
         let mut max_used: u32 = 0;
         for (bi, block) in self.edge_blocks.iter().enumerate() {
@@ -5762,9 +5762,9 @@ impl Simulator {
         // Hoisted out of the loop to reuse capacity across iterations.
         // Avoids ~2 × N HashMap allocs/drops where N = cont_assign count
         // (63K on c906, 501K on c910). Clear() preserves the bucket array.
-        let mut reads: HashSet<String> = HashSet::new();
-        let mut writes: HashSet<String> = HashSet::new();
-        let mut ca_compile_fail: HashMap<&'static str, usize> = HashMap::new();
+        let mut reads: HashSet<String> = HashSet::default();
+        let mut writes: HashSet<String> = HashSet::default();
+        let mut ca_compile_fail: HashMap<&'static str, usize> = HashMap::default();
         let mut ca_compile_fail_samples = 0usize;
         for ca in cas
             .into_iter()
@@ -6157,7 +6157,7 @@ impl Simulator {
             // entry (most are pure inputs / clock / RAM cells).
             // 36 M × 24 B Vec<usize> headers = 864 MB transient on c910;
             // HashMap drops to a few hundred MB at most.
-            let mut writers_by_sig: HashMap<usize, Vec<usize>> = HashMap::new();
+            let mut writers_by_sig: HashMap<usize, Vec<usize>> = HashMap::default();
             for (idx, entry) in entries.iter().enumerate() {
                 for &sig_id in &entry.write_signal_ids {
                     if sig_id < num_signals {
@@ -6617,7 +6617,7 @@ impl Simulator {
 
         let lhs_leaf = lhs_leaf_opt?;
         let suffix = format!(".{}", lhs_leaf);
-        let mut leaves = HashSet::new();
+        let mut leaves = HashSet::default();
         Self::collect_leaf_idents(lhs, &mut leaves);
         Self::collect_leaf_idents(rhs, &mut leaves);
         if leaves.is_empty() {
@@ -6662,7 +6662,7 @@ impl Simulator {
         writes: &HashSet<String>,
         reads: &HashSet<String>,
     ) -> Option<String> {
-        let mut leaves = HashSet::new();
+        let mut leaves = HashSet::default();
         let mut anchor: Option<String> = None;
         for name in writes {
             if !name.contains('.') && !name.contains('[') {
@@ -7878,8 +7878,8 @@ impl Simulator {
 
         // Aggregate comb entry triggers by block
         if !self.activity_counts.is_empty() {
-            let mut block_triggers: HashMap<String, u64> = HashMap::new();
-            let mut block_entry_count: HashMap<String, usize> = HashMap::new();
+            let mut block_triggers: HashMap<String, u64> = HashMap::default();
+            let mut block_entry_count: HashMap<String, usize> = HashMap::default();
             for (eidx, &count) in self.activity_counts.iter().enumerate() {
                 if count == 0 {
                     continue;
@@ -7938,9 +7938,9 @@ impl Simulator {
 
         // Aggregate signal toggles by block, exclude clocks
         {
-            let mut block_toggles: HashMap<String, u64> = HashMap::new();
-            let mut block_sig_count: HashMap<String, usize> = HashMap::new();
-            let mut block_top_signal: HashMap<String, (String, u64)> = HashMap::new();
+            let mut block_toggles: HashMap<String, u64> = HashMap::default();
+            let mut block_sig_count: HashMap<String, usize> = HashMap::default();
+            let mut block_top_signal: HashMap<String, (String, u64)> = HashMap::default();
             for (id, &count) in self.signal_toggle_counts.iter().enumerate() {
                 if count == 0 {
                     continue;
@@ -8313,7 +8313,7 @@ impl Simulator {
                 ..
             } = &stmt.kind
             {
-                let mut child_pids = HashSet::new();
+                let mut child_pids = HashSet::default();
                 for s in sub_stmts {
                     let pid_child = self.next_pid;
                     self.next_pid += 1;
@@ -8337,7 +8337,7 @@ impl Simulator {
                         child_pids,
                         join_type: *join_type,
                         continuation: cont,
-                        finished_children: HashSet::new(),
+                        finished_children: HashSet::default(),
                     });
                     return;
                 }
@@ -8364,7 +8364,7 @@ impl Simulator {
                         child_pids: children,
                         join_type: JoinType::Join,
                         continuation: cont,
-                        finished_children: HashSet::new(),
+                        finished_children: HashSet::default(),
                     });
                     return;
                 }
@@ -11993,7 +11993,7 @@ impl Simulator {
                                             arr_name, i
                                         )) {
                                             // Bind "item" and "item.index" in local stack
-                                            let mut locals = HashMap::new();
+                                            let mut locals = HashMap::default();
                                             locals.insert("item".to_string(), v.clone());
                                             locals.insert(
                                                 "item.index".to_string(),
@@ -12174,7 +12174,7 @@ impl Simulator {
                                     let handle = self.heap.len();
                                     self.heap.push(Some(ClassInstance {
                                         class_name: tname.clone(),
-                                        properties: HashMap::new(),
+                                        properties: HashMap::default(),
                                     }));
                                     let initial_count = args
                                         .first()
@@ -12186,7 +12186,7 @@ impl Simulator {
                                     let handle = self.heap.len();
                                     self.heap.push(Some(ClassInstance {
                                         class_name: tname.clone(),
-                                        properties: HashMap::new(),
+                                        properties: HashMap::default(),
                                     }));
                                     self.mailboxes
                                         .insert(handle, std::collections::VecDeque::new());
@@ -12773,7 +12773,7 @@ impl Simulator {
                 }
                 match join_type {
                     JoinType::Join => {
-                        let mut child_set = HashSet::new();
+                        let mut child_set = HashSet::default();
                         for &cp in &pids {
                             child_set.insert(cp);
                         }
@@ -12782,7 +12782,7 @@ impl Simulator {
                             child_pids: child_set,
                             join_type: *join_type,
                             continuation: Vec::new(),
-                            finished_children: HashSet::new(),
+                            finished_children: HashSet::default(),
                         });
                         self.break_flag = true; // Suspend current execution
                     }
@@ -14492,7 +14492,7 @@ impl Simulator {
         }
 
         // Assign VCD identifier codes
-        let mut id_map = HashMap::new();
+        let mut id_map = HashMap::default();
         for (idx, name) in sig_names.iter().enumerate() {
             id_map.insert(name.clone(), Self::vcd_id_code(idx));
         }
@@ -14806,7 +14806,7 @@ impl Simulator {
         // e.g. "uut.cpu.pc" → module /testbench/uut/cpu, signal pc
         let top_name = &self.module.name;
         let mut modules: Vec<(String, String)> = Vec::new(); // (module_id, path)
-        let mut module_map: HashMap<String, String> = HashMap::new(); // path → module_id
+        let mut module_map: HashMap<String, String> = HashMap::default(); // path → module_id
                                                                       // Always add top module
         let top_path = format!("/{}", top_name);
         modules.push(("m0".to_string(), top_path.clone()));
@@ -14830,7 +14830,7 @@ impl Simulator {
         }
 
         // Assign signal IDs and build signal records
-        let mut id_map = HashMap::new();
+        let mut id_map = HashMap::default();
         let mut signal_records: Vec<String> = Vec::new();
         for (idx, name) in sig_names.iter().enumerate() {
             let sid = format!("s{}", idx);
@@ -15113,7 +15113,7 @@ impl Simulator {
         // are discovered from dotted signal names.
         let top_name = &self.module.name;
         let mut modules: Vec<(String, String)> = Vec::new();
-        let mut module_map: HashMap<String, String> = HashMap::new();
+        let mut module_map: HashMap<String, String> = HashMap::default();
         let top_path = format!("/{}", top_name);
         modules.push(("m0".to_string(), top_path.clone()));
         module_map.insert(top_path.clone(), "m0".to_string());
@@ -15134,7 +15134,7 @@ impl Simulator {
         }
 
         // Assign signal IDs (s0, s1, ...) and build S records.
-        let mut id_map: HashMap<String, String> = HashMap::new();
+        let mut id_map: HashMap<String, String> = HashMap::default();
         let mut signal_records: Vec<String> = Vec::new();
         for (idx, name) in sig_names.iter().enumerate() {
             let sid = format!("s{}", idx);
@@ -16316,7 +16316,7 @@ impl Simulator {
 
     fn exec_let_call(&mut self, ld: &LetDeclaration, args: &[Expression]) -> Value {
         use crate::ast::module::PortList;
-        let mut locals = HashMap::new();
+        let mut locals = HashMap::default();
         let mut arg_idx = 0usize;
         match &ld.ports {
             PortList::Ansi(ports) => {
@@ -16352,7 +16352,7 @@ impl Simulator {
     /// Execute a module-level function call with arguments.
     fn exec_function_call(&mut self, fd: &FunctionDeclaration, args: &[Expression]) -> Value {
         // Set up local scope with parameters
-        let mut locals = HashMap::new();
+        let mut locals = HashMap::default();
         for (i, port) in fd.ports.iter().enumerate() {
             let val = if i < args.len() {
                 self.eval_expr(&args[i])
@@ -16395,7 +16395,7 @@ impl Simulator {
     fn exec_task_call(&mut self, td: &TaskDeclaration, args: &[Expression]) {
         use crate::ast::types::PortDirection;
         // Evaluate input args and collect output/ref arg expressions
-        let mut locals = HashMap::new();
+        let mut locals = HashMap::default();
         let mut output_bindings: Vec<(String, Expression)> = Vec::new();
         let mut assoc_params: Vec<(String, String)> = Vec::new(); // (param_name, caller_array_name)
         let mut array_params: Vec<String> = Vec::new(); // param names with unpacked Range dim
@@ -16555,8 +16555,8 @@ impl Simulator {
         let handle = self.cg_heap.len();
         let instance = CovergroupInstance {
             cg_name: cg_def.name.name.clone(),
-            point_hits: HashMap::new(),
-            cross_hits: HashMap::new(),
+            point_hits: HashMap::default(),
+            cross_hits: HashMap::default(),
         };
         self.cg_heap.push(Some(instance));
 
@@ -16723,7 +16723,7 @@ impl Simulator {
         let handle = self.heap.len();
         let mut instance = ClassInstance {
             class_name: class_def.name.clone(),
-            properties: HashMap::new(),
+            properties: HashMap::default(),
         };
         let mut classes_to_init = vec![class_def.clone()];
         let mut cur = class_def.extends.clone();
@@ -16875,7 +16875,7 @@ impl Simulator {
             if let Some(class_def) = self.module.classes.get(&cname).cloned() {
                 if let Some(method) = class_def.methods.get(method_name) {
                     if let crate::ast::decl::ClassMethodKind::Task(t) = &method.kind {
-                        let mut locals = HashMap::new();
+                        let mut locals = HashMap::default();
                         for (i, port) in t.ports.iter().enumerate() {
                             let val = if i < args.len() {
                                 self.eval_expr(&args[i])
@@ -16941,11 +16941,11 @@ impl Simulator {
 
         self.this_stack.push(Some(handle));
         for _trial in 0..1000 {
-            let mut solved_props: HashMap<String, Value> = HashMap::new();
-            let mut backup = HashMap::new();
+            let mut solved_props: HashMap<String, Value> = HashMap::default();
+            let mut backup = HashMap::default();
 
             // First pass: identify simple range constraints for each property
-            let mut prop_allowed_ranges: HashMap<String, Vec<(u64, u64)>> = HashMap::new();
+            let mut prop_allowed_ranges: HashMap<String, Vec<(u64, u64)>> = HashMap::default();
             for con in &constraints {
                 for item in &con.items {
                     let (inside_expr, inside_ranges): (
@@ -17008,7 +17008,7 @@ impl Simulator {
             }
 
             // Second pass: identify equality "assignments"
-            let mut assignments: HashMap<String, Expression> = HashMap::new();
+            let mut assignments: HashMap<String, Expression> = HashMap::default();
             for con in &constraints {
                 for item in &con.items {
                     if let ConstraintItem::Expr(expr) = item {
@@ -17032,7 +17032,7 @@ impl Simulator {
             }
 
             // Local copy of properties for solving
-            let mut current_props = HashMap::new();
+            let mut current_props = HashMap::default();
             if let Some(Some(inst)) = self.heap.get(handle) {
                 for (name, val) in &inst.properties {
                     current_props.insert(name.clone(), val.clone());
@@ -17052,7 +17052,7 @@ impl Simulator {
 
                     // If it has an assignment, check if we can solve it
                     if let Some(expr) = assignments.get(name) {
-                        let mut idents = HashSet::new();
+                        let mut idents = HashSet::default();
                         self.collect_expr_idents(expr, &mut idents);
                         let ready = idents.iter().all(|id| {
                             !rand_props.iter().any(|(n, _)| n == id)
@@ -17313,7 +17313,7 @@ impl Simulator {
         while let Some(cname) = cur_class {
             if let Some(class_def) = self.module.classes.get(&cname).cloned() {
                 if let Some(method) = class_def.methods.get(method_name) {
-                    let mut locals = HashMap::new();
+                    let mut locals = HashMap::default();
                     let (ports, body) = match &method.kind {
                         ClassMethodKind::Function(f) => (&f.ports, &f.items),
                         ClassMethodKind::Task(t) => (&t.ports, &t.items),

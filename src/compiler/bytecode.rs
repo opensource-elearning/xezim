@@ -7,7 +7,7 @@ use crate::ast::decl::TaskDeclaration;
 use crate::ast::expr::*;
 use crate::ast::stmt::*;
 use std::sync::Arc;
-use ahash::AHashMap as HashMap;
+use xezim_core::hasher::HashMap;
 
 const MAX_INLINE_DEPTH: usize = 8;
 
@@ -216,7 +216,7 @@ impl<'a> BytecodeCompiler<'a> {
             bail_reason: None,
             allow_ast_fallback: false,
             scope_hint: None,
-            for_loop_var_ids: std::collections::HashMap::new(),
+            for_loop_var_ids: std::collections::HashMap::default(),
             tasks: None,
             inlining_stack: Vec::new(),
             tasks_inlined: 0,

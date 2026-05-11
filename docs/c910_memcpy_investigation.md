@@ -247,15 +247,54 @@ preclude speculative one-shot fixes.
    candidate byte-orderings. Hypothesis #1 (precode mis-compile)
    eliminated without needing the full 22-min run.
 
-2. If precode matches Questa: probe `entry_inst_data_N` for the entry
-   that receives PC 0x712 (depends on `ibuf_create_pointer` state at
-   that cycle). If entry write loses the halfword, the bug is in
-   `ct_ifu_ibuf_entry.v` clock-gated register update — examine xezim's
-   handling of `gated_clk_cell` and the entry_data_create_x conditional
-   `<=` chain. If entry write is correct but pop-mux output is wrong,
-   the bug is in the case-tree selection.
+2. ~~If precode matches Questa: probe `entry_inst_data_N`~~ **RULED OUT**
+   via `tests/ifu_ibuf_entry_pop_c910.rs` (commit 166aaef) and
+   `tests/ifu_ibuf_32_instances_c910.rs` (commit 6aab719). xezim correctly
+   compiles the per-entry write-enable replicate-AND + 32-way one-hot
+   pop mux in both single-module and 32-instance-sub-module structural
+   forms. Hypothesis #2 eliminated.
 
-3. Once the bug is localized to a specific signal mismatch with Questa,
-   write a synthetic test reproducing only that pattern, then iterate
-   on the compiler/simulator fix until both the synthetic and full
-   c910 memcpy pass.
+3. ~~If pop-mux output is wrong: bug is in case-tree selection.~~ Also
+   **RULED OUT** via `tests/ifu_ibuf_casez_dispatch_c910.rs`
+   (commit 62d769c). The 5-bit `casez({h0..h4_32_start})` dispatch tree
+   produces correct half_num arm selection for all 32 input combos.
+   Hypothesis #3 eliminated.
+
+## Round 24 (2026-05-10) — All four IBUF isolated patterns work
+
+Round-23's three hypotheses plus the structural 32-instance pattern
+all verified correct in xezim's bytecode compile via cone-of-influence
+synth tests:
+
+- `tests/ifu_precode_c910_pc710.rs` — precode boolean eval ✓
+- `tests/ifu_ibuf_entry_pop_c910.rs` — per-entry write + one-hot pop ✓
+- `tests/ifu_ibuf_casez_dispatch_c910.rs` — 5-bit casez dispatch tree ✓
+- `tests/ifu_ibuf_32_instances_c910.rs` — 32 cross-module instances ✓
+
+The c910 memcpy still fails at sim 1M watchdog. So the bug must be:
+
+(a) **An interaction across patterns** — some combination of the four
+    that none of the isolated tests exercise (e.g., simultaneous writes
+    to two entries while pop-mux reads a third, or casez-dispatch
+    selection feeding into the pop-mux entry selection simultaneously
+    with an entry-write).
+
+(b) **In the IFU pipeline above the IBUF** — icache fetch
+    (`ct_ifu_icache.v`), LBUF (`ct_ifu_lbuf.v`), or IBDP
+    (`ct_ifu_ibdp.v`) delivering wrong inst_data or half_vld bits to
+    the IBUF input. The IBDP halfword-vld-num logic was probed in a
+    prior session (`case_default_arm` synth test passed) but the
+    surrounding pipeline (precode → ibdp → ibuf) hasn't been exercised
+    as a whole.
+
+(c) **A scheduling/NBA-ordering bug** specific to the c910's exact
+    block layout — possibly triggered only when both a write and a
+    read of the same cross-instance signal occur in the same tick
+    across different always-blocks compiled to different
+    `CompiledBlock`s with different partition assignments.
+
+**Concrete next step**: combine all four patterns into ONE synth test
+where the dispatch-tree output gates the pop-mux selection AND a
+simultaneous entry-write fires for an adjacent entry. If that passes
+too, the bug is likely above the IBUF (option b) or in NBA scheduling
+(option c). Then the full-test cycle becomes unavoidable.

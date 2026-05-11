@@ -756,3 +756,64 @@ where the dispatch-tree output gates the pop-mux selection AND a
 simultaneous entry-write fires for an adjacent entry. If that passes
 too, the bug is likely above the IBUF (option b) or in NBA scheduling
 (option c). Then the full-test cycle becomes unavoidable.
+
+## Round 34 (2026-05-10) — DEFINITIVE bug location: `cur_bresp_buf_bvalid` FF
+
+VCD signal diff between xezim and iverilog proves:
+
+**`pad_biu_bvalid` (raw AXI slave response)**: 4/4 pulses match
+exactly through sim 47695 — including the 4th rising edge. Both
+sims correctly see the slave's bvalid.
+
+**`cur_bresp_buf_bvalid` (registered in BIU write channel)**:
+iverilog captures 4 pulses (at 47065, 47275, 47485, **47705**);
+**xezim only captures 3** (last at 47485). The 4th pad_biu_bvalid
+pulse at sim 47695 is NOT registered into the BIU response buffer
+in xezim.
+
+Downstream cascade:
+- `cur_bresp_buf_bvalid` never goes high for the 4th transaction
+- `biu_lsu_b_vld = cur_bresp_buf_bvalid && !back_full` stays 0
+- `rb_r_so_id_hit` (SO-FIFO pop trigger via the read channel paired
+  with this write) doesn't get the matching event
+- SO FIFO accumulates entries; `rb_wmb_so_pending=1` blocks new
+  `wmb_biu_aw_dp_req`
+- CPU pipeline stalls completely
+
+**Exact bug location** at `ct_biu_write_channel.v:972-980`:
+```verilog
+always @(posedge bcpuclk or negedge cpurst_b)
+begin
+  if(~cpurst_b)
+    cur_bresp_buf_bvalid <= 1'b0;
+  else if(pad_biu_bvalid && !back_full)
+    cur_bresp_buf_bvalid <= 1'b1;
+  else if(!back_full)
+    cur_bresp_buf_bvalid <= 1'b0;
+end
+```
+
+`bcpuclk` is gated from `coreclk` via passthrough `gated_clk_cell`.
+`back_full = back_valid && back_pending`. Both back_valid/back_pending
+are FFs clocked on `coreclk`, with `pad_biu_back_ready=1'b1` tied
+high in ct_biu_top.v:1188 forcing them to clear each cycle.
+
+**Likely root cause**: NBA ordering race between
+`cur_bresp_buf_bvalid` FF (clocked on `bcpuclk`) and
+`back_valid`/`back_pending` FFs (clocked on `coreclk`). Both clocks
+are effectively the same (gated_clk_cell is a passthrough), but
+xezim's bytecode-compile may treat them as distinct clock domains
+in NBA scheduling, creating a race where `back_full` reads as 1
+during the same posedge that `pad_biu_bvalid` first arrives —
+blocking the capture for that one specific cycle.
+
+This matches the heisenbug pattern (different probe sets shift
+when the race resolves which way).
+
+**Specific fix options**:
+1. Recognize gated_clk_cell passthrough at compile time and unify
+   the clock nets (xezim simulator-level fix)
+2. Audit NBA scheduling order between FFs that share an effective
+   clock domain but distinct named clock nets
+3. Force `XEZIM_NO_PARALLEL=1` plus other knobs to serialize NBA
+   evaluation (likely won't help — already in legacy mode)

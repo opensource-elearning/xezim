@@ -260,6 +260,59 @@ preclude speculative one-shot fixes.
    produces correct half_num arm selection for all 32 input combos.
    Hypothesis #3 eliminated.
 
+## Round 25 (2026-05-10) — RETIRE-STREAM REORIENT: loop iterates forever
+
+**Major reorient via live retire tracer (added to tb.v, not under
+xezim git).** The "PC 0x712 missing" diagnosis was a **logging
+artifact**, NOT the actual bug:
+
+- The 32-bit inst at PC 0x710 = `0x5847d70b` (T-Head custom-0 opcode
+  0x0b, rd=x14, funct3=5) occupies bytes 0x710-0x713. PC 0x712 is the
+  upper halfword of that inst.
+- Questa's retire log emits BOTH PC 0x710 AND PC 0x712 for the same
+  32-bit inst (lower + upper halfword PC). xezim only emits PC 0x710.
+- This is a retire-log presentation difference, not a missed execution.
+
+**The actual bug**: the memcpy loop body `0x710 → 0x714 → 0x716`
+iterates forever in xezim. Retire trace from sim 46000 to 50000 shows
+continuous loop iteration with no halt; the watchdog eventually
+fires at sim 1M because no sentinel-write event ever occurs (the
+TEST PASSED check at tb.v:553 requires writing `64'h444333222` to
+the success address).
+
+Loop body decoded:
+- PC 0x710: T-Head custom-0 inst (likely vector memcpy primitive), rd=x14
+- PC 0x714: c.addiw x14, 1 (RVC: x14 += 1)
+- PC 0x716: bne ?, ?, -6 (32-bit branch back to 0x710 if condition true)
+
+Inst.pat @000001C4 = `0bd74758 0527e39d d7feeff0 7ff79567`. Per
+tb.v's big-endian byte distribution into 16 byte-banks:
+- byte 0x710 = 0x0b, byte 0x711 = 0xd7, byte 0x712 = 0x47, byte 0x713 = 0x58
+- inst at 0x710 (little-endian within halfword): 0x5847d70b → custom-0, rd=x14
+- inst at 0x714: 0x2705 (c.addiw x14, 1) — increments x14
+- inst at 0x716: 0xfed79de3 (BNE) — branches back to 0x710
+
+**New hypothesis**: xezim's execution of the custom-0 vector inst at
+PC 0x710 has a wrong semantic that either fails to terminate the
+loop, fails to actually copy memory, or sets x14 incorrectly so the
+BNE comparison never goes false. cmark/hello don't exercise this
+specific custom-0 funct3=5 inst.
+
+**Next concrete step**: probe x14 (architectural register, not PRF
+preg) at t=41145 (loop start) and at t=49995 (still iterating). If
+x14 monotonically increases as expected, the bug is in the BNE
+comparison source register OR the vector inst's memory side effect
+(not producing the data the BNE compares against). If x14 stays at
+a small value despite the c.addiw retiring, the bug is in xezim's
+retired-but-not-effective-on-x14 forwarding for the custom-0 inst's
+rd write.
+
+The five committed cone-of-influence synth tests
+(ifu_precode_c910_pc710, ifu_ibuf_entry_pop_c910,
+ifu_ibuf_casez_dispatch_c910, ifu_ibuf_32_instances_c910,
+ifu_ibuf_create_ptr_rotate) remain useful as regression guards but
+they were investigating the wrong layer — IFU is not the bug location.
+
 ## Round 24 (2026-05-10) — All four IBUF isolated patterns work
 
 Round-23's three hypotheses plus the structural 32-instance pattern

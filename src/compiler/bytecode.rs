@@ -964,6 +964,7 @@ impl<'a> BytecodeCompiler<'a> {
                 let is_self_determined = matches!(op,
                     BinaryOp::Eq | BinaryOp::Neq
                     | BinaryOp::CaseEq | BinaryOp::CaseNeq
+                    | BinaryOp::WildcardEq | BinaryOp::WildcardNeq
                     | BinaryOp::Lt | BinaryOp::Leq | BinaryOp::Gt | BinaryOp::Geq
                     | BinaryOp::LogAnd | BinaryOp::LogOr
                     | BinaryOp::LogImplies | BinaryOp::LogEquiv);
@@ -1839,7 +1840,7 @@ impl<'a> BytecodeCompiler<'a> {
                 // a^~b should be 0. (c910 BJU branch_blt_taken bug.)
                 if matches!(op,
                     BinaryOp::Eq | BinaryOp::Neq | BinaryOp::CaseEq
-                    | BinaryOp::CaseNeq
+                    | BinaryOp::CaseNeq | BinaryOp::WildcardEq | BinaryOp::WildcardNeq
                     | BinaryOp::Lt | BinaryOp::Leq | BinaryOp::Gt | BinaryOp::Geq
                     | BinaryOp::LogAnd | BinaryOp::LogOr
                     | BinaryOp::LogImplies | BinaryOp::LogEquiv) {

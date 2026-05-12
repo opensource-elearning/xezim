@@ -10684,6 +10684,8 @@ impl Simulator {
                     BinaryOp::Neq => wl.is_not_equal(&wr),
                     BinaryOp::CaseEq => wl.case_eq(&wr),
                     BinaryOp::CaseNeq => wl.case_eq(&wr).logic_not(),
+                    BinaryOp::WildcardEq => wl.wildcard_eq(&wr),
+                    BinaryOp::WildcardNeq => wl.wildcard_ne(&wr),
                     BinaryOp::Lt => wl.less_than(&wr),
                     BinaryOp::Leq => wl.leq(&wr),
                     BinaryOp::Gt => wl.greater_than(&wr),

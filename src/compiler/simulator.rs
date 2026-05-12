@@ -182,6 +182,42 @@ struct CombEntry {
     /// True when dependency extraction could not resolve all read signals.
     /// Such entries are conservatively re-evaluated each settle pass.
     has_unresolved_reads: bool,
+    /// True for a plain `always @(sensitivity_list)` block whose body can
+    /// reach `$finish` / `$stop`. xezim routes level-only `always @(...)`
+    /// blocks through the comb-settle path, which fires them at time 0
+    /// with their (typically X) initial values — but per IEEE 1800
+    /// §9.2.2.1 such a block actually suspends at its event control and
+    /// only runs when a sensitivity input changes. Firing it at time 0
+    /// is usually harmless (the block computes garbage that gets
+    /// recomputed later), but if the body hits `$finish` the whole
+    /// simulation aborts before the testbench has initialised its
+    /// stimulus. So: don't seed these from the time-0 dirty set; let the
+    /// first real sensitivity transition trigger them.
+    defer_at_time0: bool,
+}
+
+/// Does `stmt` (transitively, through nested blocks/branches/loops/timing
+/// controls) contain a `$finish` or `$stop` system-task call?
+fn stmt_has_finish_or_stop(stmt: &Statement) -> bool {
+    use xezim_core::ast::stmt::StatementKind as SK;
+    match &stmt.kind {
+        SK::Expr(e) => matches!(&e.kind, ExprKind::SystemCall { name, .. }
+            if name == "$finish" || name == "$stop"),
+        SK::If { then_stmt, else_stmt, .. } => {
+            stmt_has_finish_or_stop(then_stmt)
+                || else_stmt.as_ref().map_or(false, |s| stmt_has_finish_or_stop(s))
+        }
+        SK::Case { items, .. } => items.iter().any(|i| stmt_has_finish_or_stop(&i.stmt)),
+        SK::For { body, .. } | SK::Foreach { body, .. } | SK::While { body, .. }
+        | SK::DoWhile { body, .. } | SK::Repeat { body, .. } | SK::Forever { body }
+        | SK::Wait { stmt: body, .. } | SK::TimingControl { stmt: body, .. } => {
+            stmt_has_finish_or_stop(body)
+        }
+        SK::SeqBlock { stmts, .. } | SK::ParBlock { stmts, .. } => {
+            stmts.iter().any(stmt_has_finish_or_stop)
+        }
+        _ => false,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -6046,6 +6082,7 @@ impl Simulator {
                 read_signal_ids: rids,
                 write_signal_ids: wids,
                 has_unresolved_reads,
+                defer_at_time0: false,
             });
         }
 
@@ -6141,6 +6178,7 @@ impl Simulator {
                     read_signal_ids: rids,
                     write_signal_ids: wids,
                     has_unresolved_reads,
+                    defer_at_time0: !is_always_comb && stmt_has_finish_or_stop(&ab.stmt),
                 });
             }
         }
@@ -9333,6 +9371,11 @@ impl Simulator {
             self.settle_triggered[eidx] = false;
         }
         self.settle_triggered_list.clear();
+        // First time-0 settle pass: don't fire `always @(list)` blocks that
+        // can reach `$finish`/`$stop` — they should suspend at their event
+        // control until a sensitivity input actually transitions, not run
+        // with uninitialised inputs (see CombEntry::defer_at_time0).
+        let skip_deferred_at_t0 = self.time == 0 && !self.comb_time0_fired;
         let seed_dirty_len = self.dirty_list.len();
         for seed_idx in 0..seed_dirty_len {
             let id = self.dirty_list[seed_idx];
@@ -9343,6 +9386,9 @@ impl Simulator {
                     let hi = dep_offsets[id + 1] as usize;
                     for &eidx_u32 in &dep_entries[lo..hi] {
                         let eidx = eidx_u32 as usize;
+                        if skip_deferred_at_t0 && entries[eidx].defer_at_time0 {
+                            continue;
+                        }
                         if !self.settle_triggered[eidx] {
                             self.settle_triggered[eidx] = true;
                             self.settle_triggered_list.push(eidx);

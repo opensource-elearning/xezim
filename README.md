@@ -33,6 +33,9 @@ Current capabilities include:
 * Combinational logic simulation
 * Sequential simulation infrastructure
 * Test execution framework
+* Waveform / trace dumps — VCD (`$dumpfile`/`$dumpvars`), XTrace v1.0 (`--xtrace`,
+  optional zstd compression + scope filtering), and AITRACE-T (`--aitrace`); see
+  [`docs/TRACING.md`](docs/TRACING.md)
 
 ---
 
@@ -131,6 +134,12 @@ Common options:
 | `--sdf <file>` `--sdf-{min,typ,max}` | Annotate standard delays |
 | `--sim_debug` | Print `[DEBUG]` / `[OPT]` diagnostics |
 | `--log <file>` | Redirect stdout/stderr to a log file |
+| `--xtrace <file>` | Emit an XTrace v1.0 dump (`.zst`/`.zstd` ⇒ zstd-compressed) |
+| `--xtrace-scope <hier>` | Restrict the XTrace dump to signals under `<hier>` (repeatable) |
+| `--aitrace` | Make `$dumpfile`/`$dumpvars` emit AITRACE-T text instead of VCD |
+
+> Waveform / trace dumps (VCD via `$dumpfile`/`$dumpvars`, XTrace via `--xtrace`,
+> AITRACE via `--aitrace`) are documented in **[`docs/TRACING.md`](docs/TRACING.md)**.
 
 Example — run the picorv32 testbench against a gate-level netlist:
 

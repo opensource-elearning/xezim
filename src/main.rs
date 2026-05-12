@@ -78,9 +78,10 @@ fn print_usage() {
     eprintln!("                   n>=2 offloads VCD/AITRACE dumping and stdout");
     eprintln!("                   writes to background threads.");
     eprintln!("  --xtrace <file>  Emit XTrace v1.0 dump to <file>");
-    eprintln!("  --xtrace-level <0|1>  XTrace compliance level:");
-    eprintln!("                   0 = dictionary + signal deltas (VCD-equivalent)");
-    eprintln!("                   1 = level 0 + per-cycle simulator telemetry events");
+    eprintln!("                   (minimal profile: dictionary + signal deltas).");
+    eprintln!("                   A '.zst'/'.zstd' suffix zstd-compresses the stream.");
+    eprintln!("  --xtrace-scope <hier>  Restrict the XTrace dump to signals under <hier>");
+    eprintln!("                   (exact name or '<hier>.' prefix). Repeatable.");
     eprintln!("Compatibility:");
     eprintln!("  -Ifoo, -DNAME=V  Accepted");
     eprintln!("  +incdir+dir1+dir2 / +define+FOO=1+BAR Accepted");
@@ -350,7 +351,7 @@ fn main() {
     let mut sdf_select: Option<xezim::compiler::sdf::DelaySelect> = None;
     let mut aitrace = false;
     let mut xtrace_file: Option<String> = None;
-    let mut xtrace_level: u8 = 0;
+    let mut xtrace_scopes: Vec<String> = Vec::new();
     let mut sim_debug = false;
     let mut dpi_libs: Vec<String> = Vec::new();
     let mut plusargs: Vec<String> = Vec::new();
@@ -564,14 +565,14 @@ fn main() {
             _ if arg.starts_with("--xtrace=") => {
                 xtrace_file = Some(arg["--xtrace=".len()..].to_string());
             }
-            "--xtrace-level" => {
+            "--xtrace-scope" => {
                 i += 1;
                 if i < args.len() {
-                    xtrace_level = args[i].parse().unwrap_or(0).min(1);
+                    xtrace_scopes.push(args[i].clone());
                 }
             }
-            _ if arg.starts_with("--xtrace-level=") => {
-                xtrace_level = arg["--xtrace-level=".len()..].parse().unwrap_or(0).min(1);
+            _ if arg.starts_with("--xtrace-scope=") => {
+                xtrace_scopes.push(arg["--xtrace-scope=".len()..].to_string());
             }
             "--sim_debug" => {
                 sim_debug = true;
@@ -678,7 +679,7 @@ fn main() {
                         sim.activity_mon = activity_mon;
                         sim.aitrace_mode = aitrace;
                         sim.xtrace_file = xtrace_file.clone();
-                        sim.xtrace_level = xtrace_level;
+                        sim.xtrace_scopes = xtrace_scopes.clone();
                         sim.set_plusargs(&plusargs);
                         sim.set_threads(threads);
                         let compilation_start = std::time::Instant::now();
@@ -893,7 +894,7 @@ fn main() {
         &plusargs,
         threads,
         xtrace_file.as_deref(),
-        xtrace_level,
+        &xtrace_scopes,
         emit_hypergraph.as_deref(),
         load_partition.as_deref(),
         write_profile.as_deref(),

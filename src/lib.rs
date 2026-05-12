@@ -33,7 +33,7 @@ pub fn simulate(source: &str, max_time: u64) -> Result<compiler::Simulator, Stri
         &[],
         1,
         None,
-        0,
+        &[],
         None,
         None,
         None,
@@ -57,7 +57,7 @@ pub fn simulate_multi(
     plusargs: &[String],
     threads: usize,
     xtrace_file: Option<&str>,
-    xtrace_level: u8,
+    xtrace_scopes: &[String],
     emit_hypergraph: Option<&str>,
     load_partition: Option<&str>,
     write_profile: Option<&str>,
@@ -88,7 +88,7 @@ pub fn simulate_multi(
     sim.activity_mon = activity_mon;
     sim.aitrace_mode = aitrace;
     sim.xtrace_file = xtrace_file.map(|s| s.to_string());
-    sim.xtrace_level = xtrace_level;
+    sim.xtrace_scopes = xtrace_scopes.to_vec();
     sim.set_plusargs(plusargs);
     sim.set_threads(threads);
 

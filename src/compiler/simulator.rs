@@ -953,17 +953,20 @@ pub struct Simulator {
     /// VCD dump state
     vcd_file: Option<String>,
     vcd_writer: Option<super::vcd_sink::VcdSink>,
-    vcd_id_map: HashMap<String, String>,
+    /// Per-traced-signal table: (signal_table index, output id code). Built
+    /// once at dump start; the per-cycle loop walks just this vector instead
+    /// of iterating the full id_to_name (36M entries on c910) and hashing
+    /// every name. Shared by the VCD and AITRACE paths.
+    vcd_trace: Vec<(usize, String)>,
     vcd_enabled: bool,
     vcd_last_time: u64,
-    vcd_prev_signals: HashMap<String, Value>,
+    /// Previous emitted value per entry in `vcd_trace` (parallel vector).
+    /// A plain Vec<Value> — no duplicated name strings, no hashing.
+    vcd_prev_signals: Vec<Value>,
     /// Optional scope/signal-name filters captured from `$dumpvars(level, sig...)`.
     /// When non-empty, only signals whose hierarchical name starts with one of
     /// these strings (or matches exactly) are emitted to the VCD.
     vcd_filter_scopes: Vec<String>,
-    /// Pre-resolved id -> name mapping for filtered VCD signals.
-    /// Avoids iterating the full id_to_name (36M entries on c910) every cycle.
-    vcd_filtered_ids: Vec<usize>,
     /// Worker-thread count. >=2 routes VCD/AITRACE dumps through a
     /// background writer thread (see vcd_sink::VcdSink).
     threads: usize,
@@ -973,20 +976,19 @@ pub struct Simulator {
     /// AITRACE mode: when true, $dumpfile/$dumpvars emit AITRACE-T instead of VCD
     pub aitrace_mode: bool,
     /// XTrace dump state. Independent from VCD/AITRACE — can run alongside.
-    /// Set `xtrace_file` to enable; `xtrace_level` selects compliance:
-    ///   0 = level-0 (dictionary + signal deltas, VCD-equivalent payload)
-    ///   1 = level-1 (level-0 + per-cycle simulator telemetry as X events)
+    /// Set `xtrace_file` to enable. Emits the XTrace v1.0 "minimal" profile:
+    /// dictionary + per-cycle signal deltas (VCD-equivalent payload). When the
+    /// filename ends in `.zst`/`.zstd` the byte stream is zstd-compressed.
     pub xtrace_file: Option<String>,
-    pub xtrace_level: u8,
+    /// Optional hierarchical scope filters for XTrace. When non-empty, only
+    /// signals matching one of these (exact, or `<scope>.` prefix) are dumped.
+    pub xtrace_scopes: Vec<String>,
     xtrace_writer: Option<super::vcd_sink::VcdSink>,
-    xtrace_id_map: HashMap<String, String>,
-    xtrace_prev_signals: HashMap<String, Value>,
+    /// Per-traced-signal table: (signal_table index, XTrace `sN` id).
+    xtrace_trace: Vec<(usize, String)>,
+    /// Previous emitted value per entry in `xtrace_trace` (parallel vector).
+    xtrace_prev_signals: Vec<Value>,
     xtrace_last_time: u64,
-    /// Snapshots of PROF counters at the previous xtrace_write_changes call,
-    /// used to emit per-cycle deltas as level-1 telemetry events.
-    xtrace_prev_settle_iters: u64,
-    xtrace_prev_edges_fired: u64,
-    xtrace_prev_insns: u64,
     /// Pre-computed combinatorial entries with sensitivity sets.
     comb_entries: Vec<CombEntry>,
     /// Precomputed indices of comb_entries with has_unresolved_reads=true.
@@ -1792,24 +1794,20 @@ impl Simulator {
             event_waiters_swap: Vec::new(),
             vcd_file: None,
             vcd_writer: None,
-            vcd_id_map: HashMap::default(),
+            vcd_trace: Vec::new(),
             vcd_enabled: false,
             vcd_last_time: u64::MAX,
-            vcd_prev_signals: HashMap::default(),
+            vcd_prev_signals: Vec::new(),
             vcd_filter_scopes: Vec::new(),
-            vcd_filtered_ids: Vec::new(),
             threads: 1,
             stdout_sink: None,
             aitrace_mode: false,
             xtrace_file: None,
-            xtrace_level: 0,
+            xtrace_scopes: Vec::new(),
             xtrace_writer: None,
-            xtrace_id_map: HashMap::default(),
-            xtrace_prev_signals: HashMap::default(),
+            xtrace_trace: Vec::new(),
+            xtrace_prev_signals: Vec::new(),
             xtrace_last_time: 0,
-            xtrace_prev_settle_iters: 0,
-            xtrace_prev_edges_fired: 0,
-            xtrace_prev_insns: 0,
             comb_entries: Vec::new(),
             comb_unresolved_idx: Vec::new(),
             comb_time0_idx: Vec::new(),
@@ -14506,10 +14504,12 @@ impl Simulator {
                 return;
             }
         };
-        let mut w: super::vcd_sink::VcdSink = if self.threads >= 2 {
-            super::vcd_sink::VcdSink::threaded(file)
-        } else {
-            super::vcd_sink::VcdSink::inline(file)
+        let mut w = match super::vcd_sink::VcdSink::open_file(file, self.threads >= 2, None) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Warning: cannot create VCD writer for '{}': {}", filename, e);
+                return;
+            }
         };
 
         // Collect and sort signal names for deterministic output.
@@ -14534,22 +14534,6 @@ impl Simulator {
         sig_names.sort();
         eprintln!("[VCD] dumping {} signals (filter_scopes={})",
                   sig_names.len(), self.vcd_filter_scopes.len());
-        // Pre-resolve filtered names to id_to_name indices, so the per-cycle
-        // loop in vcd_write_changes can iterate just these instead of all 36M.
-        if !self.vcd_filter_scopes.is_empty() {
-            let wanted: std::collections::HashSet<&str> =
-                sig_names.iter().map(|s| s.as_str()).collect();
-            self.vcd_filtered_ids = self
-                .id_to_name
-                .iter()
-                .enumerate()
-                .filter_map(|(id, name)| {
-                    if wanted.contains(name.as_ref()) { Some(id) } else { None }
-                })
-                .collect();
-            eprintln!("[VCD] resolved {} signal-ids for fast per-cycle dump",
-                      self.vcd_filtered_ids.len());
-        }
 
         // Assign VCD identifier codes
         let mut id_map = HashMap::default();
@@ -14631,25 +14615,32 @@ impl Simulator {
 
         let _ = writeln!(w, "$enddefinitions $end");
 
+        // Build the compact per-cycle trace table: (signal_table index, code).
+        // Initial values are written below and seeded into vcd_prev_signals so
+        // the first vcd_write_changes only emits actual transitions.
+        let mut trace: Vec<(usize, String)> = Vec::with_capacity(sig_names.len());
+        let mut prev: Vec<Value> = Vec::with_capacity(sig_names.len());
+
         // Write initial values
         let _ = writeln!(w, "$dumpvars");
         for name in &sig_names {
-            let val = self
-                .lookup_signal_value(name)
-                .unwrap_or_else(|| Value::new(1));
-            let id = &id_map[name];
-            Self::vcd_write_value(&mut w, &val, id);
+            let id = match self.signal_name_to_id.get(name.as_str()) {
+                Some(&i) if i < self.signal_table.len() => i,
+                _ => continue,
+            };
+            let val = self.signal_table[id].clone();
+            let code = id_map[name].clone();
+            Self::vcd_write_value(&mut w, &val, &code);
+            prev.push(val);
+            trace.push((id, code));
         }
         let _ = writeln!(w, "$end");
 
-        // Record initial snapshot
-        let vcd_prev = self.signals.clone();
-
-        self.vcd_id_map = id_map;
+        self.vcd_trace = trace;
+        self.vcd_prev_signals = prev;
         self.vcd_writer = Some(w);
         self.vcd_enabled = true;
         self.vcd_last_time = self.time;
-        self.vcd_prev_signals = vcd_prev;
     }
 
     /// Write a single value to VCD
@@ -14707,42 +14698,16 @@ impl Simulator {
             return;
         }
 
-        // Collect changes using signal_table (no HashMap sync needed).
-        // FAST PATH: when filter is active, iterate just the pre-resolved
-        // vcd_filtered_ids instead of all 36M id_to_name entries.
+        // Walk the compact trace table directly: no name hashing, and
+        // vcd_prev_signals is a parallel Vec<Value> (index == position in
+        // vcd_trace), so change detection is a single indexed compare.
         let mut changes: Vec<(String, Value)> = Vec::new();
-        if !self.vcd_filtered_ids.is_empty() {
-            for &id in &self.vcd_filtered_ids {
-                let name = &self.id_to_name[id];
-                let name_str: &str = name.as_ref();
-                if let Some(vcd_id) = self.vcd_id_map.get(name_str) {
-                    let val = &self.signal_table[id];
-                    let changed = match self.vcd_prev_signals.get(name_str) {
-                        Some(prev) => prev != val,
-                        None => true,
-                    };
-                    if changed {
-                        changes.push((vcd_id.clone(), val.clone()));
-                        self.vcd_prev_signals
-                            .insert(name_str.to_string(), val.clone());
-                    }
-                }
-            }
-        } else {
-            for (id, name) in self.id_to_name.iter().enumerate() {
-                let name_str: &str = name.as_ref();
-                if let Some(vcd_id) = self.vcd_id_map.get(name_str) {
-                    let val = &self.signal_table[id];
-                    let changed = match self.vcd_prev_signals.get(name_str) {
-                        Some(prev) => prev != val,
-                        None => true,
-                    };
-                    if changed {
-                        changes.push((vcd_id.clone(), val.clone()));
-                        self.vcd_prev_signals
-                            .insert(name_str.to_string(), val.clone());
-                    }
-                }
+        for idx in 0..self.vcd_trace.len() {
+            let id = self.vcd_trace[idx].0;
+            let val = &self.signal_table[id];
+            if self.vcd_prev_signals[idx] != *val {
+                changes.push((self.vcd_trace[idx].1.clone(), val.clone()));
+                self.vcd_prev_signals[idx] = val.clone();
             }
         }
 
@@ -14852,10 +14817,12 @@ impl Simulator {
                 return;
             }
         };
-        let mut w: super::vcd_sink::VcdSink = if self.threads >= 2 {
-            super::vcd_sink::VcdSink::threaded(file)
-        } else {
-            super::vcd_sink::VcdSink::inline(file)
+        let mut w = match super::vcd_sink::VcdSink::open_file(file, self.threads >= 2, None) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Warning: cannot create AITRACE writer for '{}': {}", filename, e);
+                return;
+            }
         };
 
         // Collect and sort signal names
@@ -14951,14 +14918,21 @@ impl Simulator {
         // Write initial time and snapshot
         let _ = writeln!(w, "T,+0");
 
-        // Write initial snapshot (N,full,...)
-        let mut snap_parts: Vec<String> = Vec::new();
+        // Build the compact per-cycle trace table and seed the initial
+        // snapshot from signal_table.
+        let mut trace: Vec<(usize, String)> = Vec::with_capacity(sig_names.len());
+        let mut prev: Vec<Value> = Vec::with_capacity(sig_names.len());
+        let mut snap_parts: Vec<String> = Vec::with_capacity(sig_names.len());
         for name in &sig_names {
-            let sid = &id_map[name];
-            let val = self
-                .lookup_signal_value(name)
-                .unwrap_or_else(|| Value::new(1));
+            let id = match self.signal_name_to_id.get(name.as_str()) {
+                Some(&i) if i < self.signal_table.len() => i,
+                _ => continue,
+            };
+            let val = self.signal_table[id].clone();
+            let sid = id_map[name].clone();
             snap_parts.push(format!("{}={}", sid, Self::aitrace_format_value(&val)));
+            prev.push(val);
+            trace.push((id, sid));
         }
         // Write snapshot in chunks to avoid excessively long lines
         if snap_parts.len() <= 20 {
@@ -14970,14 +14944,11 @@ impl Simulator {
             }
         }
 
-        // Record initial snapshot for change detection
-        let vcd_prev = self.signals.clone();
-
-        self.vcd_id_map = id_map;
+        self.vcd_trace = trace;
+        self.vcd_prev_signals = prev;
         self.vcd_writer = Some(w);
         self.vcd_enabled = true;
         self.vcd_last_time = self.time;
-        self.vcd_prev_signals = vcd_prev;
     }
 
     fn is_pid_suspended(&self, pid: usize) -> bool {
@@ -15026,19 +14997,14 @@ impl Simulator {
             return;
         }
 
-        // Collect changes
-        let mut changes: Vec<(String, String)> = Vec::new(); // (signal_id, formatted_value)
-        for (id, name) in self.id_to_name.iter().enumerate() {
-            let name_str: &str = name.as_ref();
-            if let Some(sid) = self.vcd_id_map.get(name_str) {
-                let val = &self.signal_table[id];
-                let changed = match self.vcd_prev_signals.get(name_str) {
-                    Some(prev) => prev != val,
-                    None => true,
-                };
-                if changed {
-                    changes.push((sid.clone(), Self::aitrace_format_value(val)));
-                }
+        // (trace index, formatted value) for each signal that changed.
+        let mut changes: Vec<(usize, String)> = Vec::new();
+        for idx in 0..self.vcd_trace.len() {
+            let id = self.vcd_trace[idx].0;
+            let val = &self.signal_table[id];
+            if self.vcd_prev_signals[idx] != *val {
+                changes.push((idx, Self::aitrace_format_value(val)));
+                self.vcd_prev_signals[idx] = val.clone();
             }
         }
 
@@ -15046,34 +15012,27 @@ impl Simulator {
             return;
         }
 
-        let w = self.vcd_writer.as_mut().unwrap();
-
         // Write time delta if needed
         if self.time != self.vcd_last_time {
             let delta = self.time - self.vcd_last_time;
-            let _ = writeln!(w, "T,+{}", delta);
             self.vcd_last_time = self.time;
+            let w = self.vcd_writer.as_mut().unwrap();
+            let _ = writeln!(w, "T,+{}", delta);
         }
 
-        // Use packed format (P) when multiple signals change, single delta (D) for one
+        let w = self.vcd_writer.as_mut().unwrap();
+        // Packed format (P) when multiple signals change, single delta (D) for one.
         if changes.len() == 1 {
-            let (sid, val) = &changes[0];
-            let _ = writeln!(w, "D,{},{}", sid, val);
+            let (idx, val) = &changes[0];
+            let _ = writeln!(w, "D,{},{}", self.vcd_trace[*idx].1, val);
         } else {
-            // Write packed records in chunks of 16
             for chunk in changes.chunks(16) {
-                let parts: Vec<String> = chunk
-                    .iter()
-                    .map(|(sid, val)| format!("{}={}", sid, val))
-                    .collect();
-                let _ = writeln!(w, "P,{}", parts.join(","));
+                let _ = write!(w, "P");
+                for (idx, val) in chunk {
+                    let _ = write!(w, ",{}={}", self.vcd_trace[*idx].1, val);
+                }
+                let _ = writeln!(w);
             }
-        }
-
-        // Update previous snapshot
-        for (id, name) in self.id_to_name.iter().enumerate() {
-            self.vcd_prev_signals
-                .insert(name.to_string(), self.signal_table[id].clone());
         }
     }
 
@@ -15091,13 +15050,9 @@ impl Simulator {
     // XTrace v1.0 dump support (XTrace_Specification_v1_0.txt)
     // ═══════════════════════════════════════════════════════════════
     //
-    // Two compliance levels supported:
-    //   level 0 — dictionary + signal deltas (VCD-equivalent payload).
-    //             Same set of records the existing AITRACE path already
-    //             emits, just under the @xtrace 1.0 header.
-    //   level 1 — level-0 plus per-cycle simulator telemetry as X events.
-    //             Telemetry exposes settle convergence and bytecode-VM
-    //             activity for the just-completed delta interval.
+    // Emits the "minimal" profile: dictionary + per-cycle signal deltas
+    // (the same VCD-equivalent payload the AITRACE path produces, under
+    // the @xtrace 1.0 header).
 
     /// Format a Value per XTrace §13 / §A.6 4-state value semantics.
     /// Fully-known values use 0xHEX; values with X/Z fall back to the
@@ -15159,15 +15114,46 @@ impl Simulator {
                 return;
             }
         };
-        let mut w: super::vcd_sink::VcdSink = if self.threads >= 2 {
-            super::vcd_sink::VcdSink::threaded(file)
+        // Compress the byte stream when the target is a `.zst`/`.zstd` file.
+        let zstd_level = if filename.ends_with(".zst") || filename.ends_with(".zstd") {
+            Some(3)
         } else {
-            super::vcd_sink::VcdSink::inline(file)
+            None
+        };
+        let mut w = match super::vcd_sink::VcdSink::open_file(file, self.threads >= 2, zstd_level) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Warning: cannot create XTrace writer for '{}': {}", filename, e);
+                return;
+            }
         };
 
-        // Sort signal names for deterministic dictionary IDs.
-        let mut sig_names: Vec<String> = self.signals.keys().cloned().collect();
+        // Collect signal names to trace. When `xtrace_scopes` is non-empty,
+        // restrict to signals whose hierarchical name matches one of the
+        // scopes exactly or sits underneath it (prefix + '.'). Sorted for
+        // deterministic dictionary IDs.
+        let mut sig_names: Vec<String> = if self.xtrace_scopes.is_empty() {
+            self.signals.keys().cloned().collect()
+        } else {
+            let filters = self.xtrace_scopes.clone();
+            self.signals
+                .keys()
+                .filter(|name| {
+                    filters.iter().any(|f| {
+                        name.as_str() == f.as_str() || name.starts_with(&format!("{}.", f))
+                    })
+                })
+                .cloned()
+                .collect()
+        };
         sig_names.sort();
+        if !self.xtrace_scopes.is_empty() {
+            eprintln!(
+                "[XTrace] dumping {} signals (scopes={})",
+                sig_names.len(),
+                self.xtrace_scopes.len()
+            );
+        }
 
         // Build module hierarchy (M records). Top module is m0, sub-scopes
         // are discovered from dotted signal names.
@@ -15237,16 +15223,7 @@ impl Simulator {
         let _ = writeln!(w, "@producer xezim {}", env!("CARGO_PKG_VERSION"));
         let _ = writeln!(w, "@timescale 1ns");
         let _ = writeln!(w, "@design {}", top_name);
-        // Profile reflects level: minimal (L0) vs xezim_ai_debug (L1+).
-        let profile = if self.xtrace_level >= 1 {
-            "xezim_ai_debug"
-        } else {
-            "minimal"
-        };
-        let _ = writeln!(w, "@profile {}", profile);
-        if self.xtrace_level >= 1 {
-            let _ = writeln!(w, "@capabilities signal_delta|events");
-        }
+        let _ = writeln!(w, "@profile minimal");
         let _ = writeln!(w);
 
         // Dictionary section.
@@ -15262,13 +15239,21 @@ impl Simulator {
         // Trace section opens with the t=0 full snapshot.
         let _ = writeln!(w, "@section trace");
         let _ = writeln!(w, "T,+0");
+        // Build the compact per-cycle trace table and seed the initial
+        // snapshot from signal_table (the backing store of truth).
+        let mut trace: Vec<(usize, String)> = Vec::with_capacity(sig_names.len());
+        let mut prev: Vec<Value> = Vec::with_capacity(sig_names.len());
         let mut snap_parts: Vec<String> = Vec::with_capacity(sig_names.len());
         for name in &sig_names {
-            let sid = &id_map[name];
-            let val = self
-                .lookup_signal_value(name)
-                .unwrap_or_else(|| Value::new(1));
+            let id = match self.signal_name_to_id.get(name.as_str()) {
+                Some(&i) if i < self.signal_table.len() => i,
+                _ => continue,
+            };
+            let val = self.signal_table[id].clone();
+            let sid = id_map[name].clone();
             snap_parts.push(format!("{}={}", sid, Self::xtrace_format_value(&val)));
+            prev.push(val);
+            trace.push((id, sid));
         }
         // Long N,full lines are split into 16-signal chunks per the
         // emitter pattern in §A.13 to keep parser memory bounded.
@@ -15286,101 +15271,55 @@ impl Simulator {
             }
         }
 
-        let prev = self.signals.clone();
-        self.xtrace_id_map = id_map;
+        self.xtrace_trace = trace;
+        self.xtrace_prev_signals = prev;
         self.xtrace_writer = Some(w);
         self.xtrace_last_time = self.time;
-        self.xtrace_prev_signals = prev;
-        self.xtrace_prev_settle_iters = self.settle_iters;
-        self.xtrace_prev_edges_fired = self.prof_edges_fired;
-        self.xtrace_prev_insns = self.prof_insns_executed;
     }
 
-    /// Per-cycle XTrace emit. Writes a T record (if time advanced), then
-    /// signal deltas as packed (P) or single (D) records, then — when
-    /// xtrace_level >= 1 — an X,sim_telemetry event with the deltas of
-    /// settle_iters, edges_fired, and prof_insns_executed since the
-    /// previous call.
+    /// Per-cycle XTrace emit. Writes a T record (if time advanced) and the
+    /// signal deltas as packed (P) or single (D) records.
     fn xtrace_write_changes(&mut self) {
         if self.xtrace_writer.is_none() {
             return;
         }
 
-        // Collect signal changes by walking signal_table directly (the
-        // backing store of truth). Same pattern as vcd_write_changes /
-        // aitrace_write_changes.
-        let mut changes: Vec<(String, String)> = Vec::new();
-        for (id, name) in self.id_to_name.iter().enumerate() {
-            let name_str: &str = name.as_ref();
-            if let Some(sid) = self.xtrace_id_map.get(name_str) {
-                let val = &self.signal_table[id];
-                let changed = match self.xtrace_prev_signals.get(name_str) {
-                    Some(prev) => prev != val,
-                    None => true,
-                };
-                if changed {
-                    changes.push((sid.clone(), Self::xtrace_format_value(val)));
-                }
+        // Walk the compact trace table directly; xtrace_prev_signals is a
+        // parallel Vec<Value>, so change detection is a single indexed
+        // compare with no name hashing.
+        let mut changes: Vec<(usize, String)> = Vec::new();
+        for idx in 0..self.xtrace_trace.len() {
+            let id = self.xtrace_trace[idx].0;
+            let val = &self.signal_table[id];
+            if self.xtrace_prev_signals[idx] != *val {
+                changes.push((idx, Self::xtrace_format_value(val)));
+                self.xtrace_prev_signals[idx] = val.clone();
             }
         }
 
-        // Snapshot deltas for level-1 telemetry BEFORE the early-return,
-        // so a tick with telemetry but no signal changes still emits.
-        let settle_iters_delta = self
-            .settle_iters
-            .saturating_sub(self.xtrace_prev_settle_iters);
-        let edges_fired_delta = self
-            .prof_edges_fired
-            .saturating_sub(self.xtrace_prev_edges_fired);
-        let insns_delta = self
-            .prof_insns_executed
-            .saturating_sub(self.xtrace_prev_insns);
-        let want_telemetry = self.xtrace_level >= 1
-            && (settle_iters_delta > 0 || edges_fired_delta > 0 || insns_delta > 0);
-
-        if changes.is_empty() && !want_telemetry {
+        if changes.is_empty() {
             return;
         }
 
-        let w = self.xtrace_writer.as_mut().unwrap();
-
         if self.time != self.xtrace_last_time {
             let delta = self.time - self.xtrace_last_time;
-            let _ = writeln!(w, "T,+{}", delta);
             self.xtrace_last_time = self.time;
+            let w = self.xtrace_writer.as_mut().unwrap();
+            let _ = writeln!(w, "T,+{}", delta);
         }
 
+        let w = self.xtrace_writer.as_mut().unwrap();
         if changes.len() == 1 {
-            let (sid, val) = &changes[0];
-            let _ = writeln!(w, "D,{},{}", sid, val);
-        } else if !changes.is_empty() {
+            let (idx, val) = &changes[0];
+            let _ = writeln!(w, "D,{},{}", self.xtrace_trace[*idx].1, val);
+        } else {
             for chunk in changes.chunks(16) {
-                let parts: Vec<String> = chunk
-                    .iter()
-                    .map(|(sid, v)| format!("{}={}", sid, v))
-                    .collect();
-                let _ = writeln!(w, "P,{}", parts.join(","));
+                let _ = write!(w, "P");
+                for (idx, val) in chunk {
+                    let _ = write!(w, ",{}={}", self.xtrace_trace[*idx].1, val);
+                }
+                let _ = writeln!(w);
             }
-        }
-
-        if want_telemetry {
-            // X,sim_telemetry per spec §9.4 — keys describe what advanced
-            // since the previous emit. A consumer can sum them across the
-            // run to recover totals or use them per-tick for hotspot maps.
-            let _ = writeln!(
-                w,
-                "X,sim_telemetry,settle_iters={},edges_fired={},insns={}",
-                settle_iters_delta, edges_fired_delta, insns_delta
-            );
-            self.xtrace_prev_settle_iters = self.settle_iters;
-            self.xtrace_prev_edges_fired = self.prof_edges_fired;
-            self.xtrace_prev_insns = self.prof_insns_executed;
-        }
-
-        // Update prev snapshot for next-cycle delta detection.
-        for (id, name) in self.id_to_name.iter().enumerate() {
-            self.xtrace_prev_signals
-                .insert(name.to_string(), self.signal_table[id].clone());
         }
     }
 

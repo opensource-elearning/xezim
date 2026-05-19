@@ -929,3 +929,284 @@ fn test_sim_param_arith_slice_widths() {
     assert!(m.contains("add=b"), "{}", m);
     assert!(m.contains("mul=ab"), "{}", m);
 }
+
+#[test]
+fn test_sv2023_triple_quoted_string_literal() {
+    sv_parser::set_sv2023(true);
+    // IEEE 1800-2023 §5.9: triple-quoted strings allow embedded `"`
+    // and span without needing newline-continuation. We exercise both.
+    let sim = sim_ok(r#"
+        module test;
+            initial begin
+                $display("""hello "world" end""");
+                $finish;
+            end
+        endmodule
+    "#);
+    let m = &sim.output[0].message;
+    assert!(m.contains("hello \"world\" end"), "{}", m);
+}
+
+#[test]
+fn test_sv2023_ref_static_task_arg() {
+    sv_parser::set_sv2023(true);
+    // IEEE 1800-2023 §13.5.2: `ref static` arg-direction. We accept the
+    // syntax and execute it like `ref`; the test asserts the callee
+    // mutation is visible in the caller.
+    let sim = sim_ok(r#"
+        module test;
+            int x;
+            task automatic bump(ref static int v);
+                v = v + 7;
+            endtask
+            initial begin
+                x = 5;
+                bump(x);
+                $display("x=%0d", x);
+                $finish;
+            end
+        endmodule
+    "#);
+    let m = &sim.output[0].message;
+    assert!(m.contains("x=12"), "{}", m);
+}
+
+#[test]
+fn test_sv2023_global_clock() {
+    sv_parser::set_sv2023(true);
+    // IEEE 1800-2023 §16.16.1.1: $global_clock stub.
+    let sim = sim_ok(r#"
+        module test;
+            initial begin
+                $display("g=%0d", $global_clock);
+                $finish;
+            end
+        endmodule
+    "#);
+    let m = &sim.output[0].message;
+    assert!(m.contains("g=0"), "{}", m);
+}
+
+#[test]
+fn test_sv2023_gclk_sampled_value_fns() {
+    sv_parser::set_sv2023(true);
+    // IEEE 1800-2023 §16.16.1.2 / §16.16.1.3: gclk sampled-value
+    // control functions. Outside an assertion context they return 1'b0.
+    let sim = sim_ok(r#"
+        module test;
+            initial begin
+                $display("r=%0d f=%0d s=%0d c=%0d p=%0d n=%0d",
+                    $rose_gclk(1'b0), $fell_gclk(1'b0),
+                    $steady_gclk(1'b0), $changing_gclk(1'b0),
+                    $past_gclk(1'b0), $future_gclk(1'b0));
+                $finish;
+            end
+        endmodule
+    "#);
+    let m = &sim.output[0].message;
+    assert!(m.contains("r=0 f=0 s=0 c=0 p=0 n=0"), "{}", m);
+}
+
+#[test]
+fn test_sv2023_final_class_method() {
+    sv_parser::set_sv2023(true);
+    // IEEE 1800-2023 §8.20.5: `final` qualifier on a virtual method.
+    let sim = sim_ok(r#"
+        class Base;
+            virtual function :final void hello();
+                $display("hi");
+            endfunction
+        endclass
+        module test;
+            initial begin
+                Base b = new();
+                b.hello();
+                $finish;
+            end
+        endmodule
+    "#);
+    let m = &sim.output[0].message;
+    assert!(m.contains("hi"), "{}", m);
+}
+
+#[test]
+fn test_sv2023_final_method_override_rejected() {
+    sv_parser::set_sv2023(true);
+    // IEEE 1800-2023 §8.20.5 enforcement: a derived class must not
+    // override a `final` method of any ancestor.
+    let res = xezim::simulate(
+        r#"
+        class Base;
+            virtual function :final void hello();
+            endfunction
+        endclass
+        class Sub extends Base;
+            virtual function void hello();
+            endfunction
+        endclass
+        module test;
+            initial begin
+                Sub s = new();
+                $finish;
+            end
+        endmodule
+    "#,
+        100_000,
+    );
+    assert!(res.is_err(), "expected elaboration error, got {:?}", res.map(|_| ()));
+    let msg = res.err().unwrap();
+    assert!(
+        msg.contains("final") && msg.contains("hello"),
+        "unexpected message: {}",
+        msg
+    );
+}
+
+#[test]
+fn test_sv2023_endmodule_label_mismatch_rejected() {
+    sv_parser::set_sv2023(true);
+    // IEEE 1800-2023 §27.2.1: end-labels must match the declared name.
+    let res = xezim::simulate(
+        r#"
+        module foo;
+            initial $finish;
+        endmodule : bar
+    "#,
+        100_000,
+    );
+    assert!(res.is_err(), "expected parse error");
+    let msg = res.err().unwrap();
+    assert!(
+        msg.contains("end-label") && msg.contains("bar") && msg.contains("foo"),
+        "unexpected message: {}",
+        msg
+    );
+}
+
+#[test]
+fn test_sv2023_endmodule_label_match_ok() {
+    sv_parser::set_sv2023(true);
+    // Positive: matched end-label parses cleanly.
+    let sim = sim_ok(r#"
+        module foo;
+            initial begin
+                $display("ok");
+                $finish;
+            end
+        endmodule : foo
+    "#);
+    assert!(sim.output[0].message.contains("ok"));
+}
+
+#[test]
+fn test_sv2023_endfunction_label_mismatch_rejected() {
+    sv_parser::set_sv2023(true);
+    // IEEE 1800-2023 §27.2.1: endfunction label must match.
+    let res = xezim::simulate(
+        r#"
+        module test;
+            function void greet();
+                $display("hi");
+            endfunction : not_greet
+            initial begin
+                greet();
+                $finish;
+            end
+        endmodule
+    "#,
+        100_000,
+    );
+    assert!(res.is_err(), "expected parse error");
+    let msg = res.err().unwrap();
+    assert!(
+        msg.contains("not_greet") && msg.contains("greet"),
+        "unexpected: {}",
+        msg
+    );
+}
+
+#[test]
+fn test_sv2023_unique0_case_multi_match_warns() {
+    sv_parser::set_sv2023(true);
+    // IEEE 1800-2023 §12.5.3: unique0 with >1 matching items is a violation.
+    let sim = sim_ok(r#"
+        module test;
+            logic [3:0] x;
+            initial begin
+                x = 4'b0001;
+                unique0 case (x)
+                    4'b0001: $display("a");
+                    4'b0001: $display("b");
+                endcase
+                $finish;
+            end
+        endmodule
+    "#);
+    let all: Vec<&str> = sim.output.iter().map(|o| o.message.as_str()).collect();
+    assert!(
+        all.iter().any(|m| m.contains("§12.5.3") && m.contains("unique0")),
+        "missing violation: {:?}",
+        all
+    );
+}
+
+#[test]
+fn test_sv2023_unique_case_no_match_warns() {
+    sv_parser::set_sv2023(true);
+    // IEEE 1800-2023 §12.5.3: `unique case` with no matching item and no
+    // default is a violation.
+    let sim = sim_ok(r#"
+        module test;
+            logic [3:0] x;
+            initial begin
+                x = 4'b1111;
+                unique case (x)
+                    4'b0000: $display("a");
+                    4'b0001: $display("b");
+                endcase
+                $finish;
+            end
+        endmodule
+    "#);
+    let all: Vec<&str> = sim.output.iter().map(|o| o.message.as_str()).collect();
+    assert!(
+        all.iter().any(|m| m.contains("no item matched")),
+        "missing violation: {:?}",
+        all
+    );
+}
+
+#[test]
+fn test_sv2023_type_param_extends_constraint() {
+    sv_parser::set_sv2023(true);
+    // IEEE 1800-2023 §6.20.2.1: type parameter with `extends` constraint.
+    let sim = sim_ok(r#"
+        class Base; endclass
+        class Sub extends Base; endclass
+        module test #(type T extends Base = Sub);
+            initial begin
+                $display("ok");
+                $finish;
+            end
+        endmodule
+    "#);
+    let m = &sim.output[0].message;
+    assert!(m.contains("ok"), "{}", m);
+}
+
+#[test]
+fn test_sv2023_inferred_clock_disable() {
+    sv_parser::set_sv2023(true);
+    // IEEE 1800-2023 §16.16: $inferred_clock / $inferred_disable. Outside
+    // a property/sequence context we return 1'b0.
+    let sim = sim_ok(r#"
+        module test;
+            initial begin
+                $display("c=%0d d=%0d", $inferred_clock, $inferred_disable);
+                $finish;
+            end
+        endmodule
+    "#);
+    let m = &sim.output[0].message;
+    assert!(m.contains("c=0 d=0"), "{}", m);
+}

@@ -511,6 +511,9 @@ fn main() {
                 mode = Mode::Simulate;
                 mode_explicit = true;
             }
+            "--sv2023" => {
+                sv_parser::set_sv2023(true);
+            }
             "--dump-tokens" => {
                 dump_tokens = true;
                 if !mode_explicit {

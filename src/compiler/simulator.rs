@@ -944,6 +944,17 @@ pub struct Simulator {
     break_flag: bool,
     continue_flag: bool,
     rs_return_flag: bool,
+    /// SV-2023: target named block for `disable <name>` propagation.
+    disable_target: Option<String>,
+    /// SV-2023: PIDs killed by `disable fork` — skip dispatch on these.
+    killed_pids: HashSet<usize>,
+    /// SV-2023: redirected lvalues for `ref` formal parameters during a call.
+    /// Top-of-stack scope is consulted when assigning to a known formal name.
+    ref_binding_stack: Vec<HashMap<String, Expression>>,
+    /// SV-2023: real-precision time tracker (parallel to integer `time`).
+    real_time: f64,
+    /// SV-2023: blocked mailbox `get`/`peek` proxies keyed by mailbox handle.
+    mailbox_get_waiters: HashMap<usize, std::collections::VecDeque<Expression>>,
     /// Processes waiting for signal edge events (@(posedge clk), etc.)
     event_waiters: Vec<EventWaiter>,
     /// Covergroups waiting for sampling events
@@ -1789,6 +1800,11 @@ impl Simulator {
             break_flag: false,
             continue_flag: false,
             rs_return_flag: false,
+            disable_target: None,
+            killed_pids: HashSet::default(),
+            ref_binding_stack: Vec::new(),
+            real_time: 0.0,
+            mailbox_get_waiters: HashMap::default(),
             event_waiters: Vec::new(),
             cg_event_waiters: Vec::new(),
             event_waiters_swap: Vec::new(),
@@ -10429,6 +10445,76 @@ impl Simulator {
                             return val.clone();
                         }
                     }
+                    // SV-2023: class-handle dereference. If a leading dotted
+                    // prefix names a signal storing a class handle (e.g. a
+                    // parameterized static like `registry#(byte)::singleton`),
+                    // walk into heap[handle].properties for the suffix.
+                    {
+                        let segs: Vec<&str> = hier
+                            .path
+                            .iter()
+                            .map(|s| s.name.name.as_str())
+                            .collect();
+                        for split in (1..segs.len()).rev() {
+                            let dotted = segs[..split].join(".");
+                            let bare = segs[split - 1].to_string();
+                            let mut candidates: Vec<String> = Vec::new();
+                            candidates.push(dotted);
+                            if !candidates.contains(&bare) {
+                                candidates.push(bare);
+                            }
+                            let mut handle_value: Option<Value> = None;
+                            for c in &candidates {
+                                if let Some(v) = self.get_signal_value_by_name(c) {
+                                    handle_value = Some(v);
+                                    break;
+                                }
+                            }
+                            if let Some(v) = handle_value {
+                                let h = v.to_u64().unwrap_or(0) as usize;
+                                if h != 0 && h < self.heap.len() {
+                                    if let Some(inst) =
+                                        self.heap.get(h).and_then(|x| x.as_ref())
+                                    {
+                                        let mut cur_props = &inst.properties;
+                                        let mut found: Option<Value> = None;
+                                        let mut sub_handle: Option<usize> = None;
+                                        let tail = &segs[split..];
+                                        for (i, seg) in tail.iter().enumerate() {
+                                            if let Some(val) = cur_props.get(*seg) {
+                                                if i + 1 == tail.len() {
+                                                    found = Some(val.clone());
+                                                } else {
+                                                    sub_handle = Some(
+                                                        val.to_u64().unwrap_or(0) as usize,
+                                                    );
+                                                }
+                                            } else {
+                                                break;
+                                            }
+                                            if let Some(sh) = sub_handle.take() {
+                                                if sh == 0 || sh >= self.heap.len() {
+                                                    break;
+                                                }
+                                                if let Some(next_inst) = self
+                                                    .heap
+                                                    .get(sh)
+                                                    .and_then(|x| x.as_ref())
+                                                {
+                                                    cur_props = &next_inst.properties;
+                                                } else {
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        if let Some(v) = found {
+                                            return v;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     let obj_name = &hier.path[0].name.name;
                     {
                         let sub = hier.path[1..]
@@ -11150,6 +11236,30 @@ impl Simulator {
                     v
                 }
                 "$time" => Value::from_u64(self.time, 64),
+                "$realtime" => Value::from_f64(self.real_time),
+                "$stime" => Value::from_u64(self.time & 0xFFFF_FFFF, 32),
+                "$inferred_clock" | "$inferred_disable" if sv_parser::is_sv2023() => {
+                    Value::from_u64(0, 1)
+                }
+                "$global_clock" if sv_parser::is_sv2023() => Value::from_u64(0, 1),
+                "$timeunit" if sv_parser::is_sv2023() => {
+                    let mut v =
+                        Value::from_u64(self.module.timeunit_exp as i64 as u64, 32);
+                    v.is_signed = true;
+                    v
+                }
+                "$timeprecision" if sv_parser::is_sv2023() => {
+                    let mut v =
+                        Value::from_u64(self.module.timeprecision_exp as i64 as u64, 32);
+                    v.is_signed = true;
+                    v
+                }
+                "$rose_gclk" | "$fell_gclk" | "$steady_gclk" | "$changing_gclk"
+                | "$past_gclk" | "$future_gclk"
+                    if sv_parser::is_sv2023() =>
+                {
+                    Value::from_u64(0, 1)
+                }
                 "$test$plusargs" => {
                     sim_dbg_eprintln!("[DEBUG] eval $test$plusargs with {} args", args.len());
                     let pat = match args.first().map(|a| &a.kind) {
@@ -11601,6 +11711,35 @@ impl Simulator {
                         }
                     }
                 }
+                // SV-2023: `arr[idx].field` for arrays of packed-struct
+                // elements — slice the indexed value at the field offset.
+                if let ExprKind::Index { expr: base, index } = &expr.kind {
+                    if let ExprKind::Ident(bhier) = &base.kind {
+                        let arr_name = self.resolve_hier_name(bhier);
+                        if let Some(fields) = self
+                            .module
+                            .packed_struct_fields
+                            .get(&arr_name)
+                            .cloned()
+                        {
+                            if let Some((_, off, w)) =
+                                fields.iter().find(|(m, _, _)| m == &member.name).cloned()
+                            {
+                                let idx_val =
+                                    self.eval_expr(index).to_u64().unwrap_or(0);
+                                let elem_name = format!("{}[{}]", arr_name, idx_val);
+                                if let Some(sig) =
+                                    self.get_signal_value_by_name(&elem_name)
+                                {
+                                    return sig.range_select(
+                                        (off + w - 1) as usize,
+                                        off as usize,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
                 if let ExprKind::Ident(hier) = &expr.kind {
                     let name = self.resolve_hier_name(hier);
                     if let Some(fields) = self.module.packed_struct_fields.get(&name).cloned() {
@@ -12020,10 +12159,21 @@ impl Simulator {
                     filter,
                 } = &rvalue.kind
                 {
+                    // Accept both:
+                    //   `arr.find with (...)`               (wexpr = MemberAccess)
+                    //   `arr.find(item[, idx]) with (...)`  (wexpr = Call wrapping MemberAccess)
+                    let (ma_expr, iter_args): (&Expression, &[Expression]) =
+                        match &wexpr.kind {
+                            ExprKind::MemberAccess { .. } => (wexpr.as_ref(), &[][..]),
+                            ExprKind::Call { func, args } => {
+                                (func.as_ref(), args.as_slice())
+                            }
+                            _ => (wexpr.as_ref(), &[][..]),
+                        };
                     if let ExprKind::MemberAccess {
                         expr: arr_expr,
                         member,
-                    } = &wexpr.kind
+                    } = &ma_expr.kind
                     {
                         if let ExprKind::Ident(hier) = &arr_expr.kind {
                             let arr_name = self.resolve_hier_name(hier);
@@ -12040,27 +12190,85 @@ impl Simulator {
                                     | "unique_index"
                                     | "min"
                                     | "max"
+                                    | "map"
                             ) {
+                                let extract_ident = |e: &Expression| -> Option<String> {
+                                    if let ExprKind::Ident(h) = &e.kind {
+                                        if h.path.len() == 1 && h.path[0].selects.is_empty() {
+                                            return Some(h.path[0].name.name.clone());
+                                        }
+                                    }
+                                    None
+                                };
+                                let iter_name = iter_args
+                                    .first()
+                                    .and_then(extract_ident)
+                                    .unwrap_or_else(|| "item".to_string());
+                                let idx_name = iter_args.get(1).and_then(extract_ident);
                                 if let ExprKind::Ident(lhier) = &lvalue.kind {
                                     let lname = self.resolve_hier_name(lhier);
-                                    let cur_size = self.get_queue_size(&arr_name) as usize;
+                                    let mut cur_size =
+                                        self.get_queue_size(&arr_name) as usize;
+                                    if cur_size == 0 {
+                                        let mut k = 0usize;
+                                        while self
+                                            .get_signal_value_by_name(&format!(
+                                                "{}[{}]",
+                                                arr_name, k
+                                            ))
+                                            .is_some()
+                                        {
+                                            k += 1;
+                                        }
+                                        cur_size = k;
+                                    }
+                                    let struct_fields = self
+                                        .module
+                                        .packed_struct_fields
+                                        .get(&arr_name)
+                                        .cloned();
+                                    let has_idx_field = struct_fields
+                                        .as_ref()
+                                        .map_or(false, |fs| {
+                                            fs.iter().any(|(f, _, _)| f == "index")
+                                        });
                                     let mut results = Vec::new();
                                     for i in 0..cur_size {
-                                        if let Some(v) = self.get_signal_value_by_name(&format!(
-                                            "{}[{}]",
-                                            arr_name, i
-                                        )) {
-                                            // Bind "item" and "item.index" in local stack
+                                        if let Some(v) = self.get_signal_value_by_name(
+                                            &format!("{}[{}]", arr_name, i),
+                                        ) {
                                             let mut locals = HashMap::default();
-                                            locals.insert("item".to_string(), v.clone());
-                                            locals.insert(
-                                                "item.index".to_string(),
-                                                Value::from_u64(i as u64, 32),
-                                            );
+                                            locals.insert(iter_name.clone(), v.clone());
+                                            if let Some(fields) = &struct_fields {
+                                                for (fname, off, w) in fields {
+                                                    let slice = v.range_select(
+                                                        (off + w - 1) as usize,
+                                                        *off as usize,
+                                                    );
+                                                    locals.insert(
+                                                        format!("{}.{}", iter_name, fname),
+                                                        slice,
+                                                    );
+                                                }
+                                            }
+                                            if idx_name.is_none() && !has_idx_field {
+                                                locals.insert(
+                                                    format!("{}.index", iter_name),
+                                                    Value::from_u64(i as u64, 32),
+                                                );
+                                            }
+                                            if let Some(idx) = &idx_name {
+                                                locals.insert(
+                                                    idx.clone(),
+                                                    Value::from_u64(i as u64, 32),
+                                                );
+                                            }
                                             self.local_stack.push(locals);
                                             let cond = self.eval_expr(filter);
                                             self.local_stack.pop();
-                                            if cond.is_true() {
+                                            if mname == "map" {
+                                                results.push(cond);
+                                            } else if cond.is_true() {
                                                 if mname.contains("index") {
                                                     results.push(Value::from_u64(i as u64, 32));
                                                 } else {
@@ -12076,7 +12284,6 @@ impl Simulator {
                                         let last = results.pop().unwrap();
                                         results = vec![last];
                                     }
-                                    // Assign results to destination queue
                                     for (i, v) in results.iter().enumerate() {
                                         self.set_signal_value_by_name(
                                             &format!("{}[{}]", lname, i),
@@ -12084,6 +12291,9 @@ impl Simulator {
                                         );
                                     }
                                     self.set_queue_size(&lname, results.len() as u64);
+                                    if self.module.dynamic_arrays.contains(&lname) {
+                                        self.set_queue_size(&lname, results.len() as u64);
+                                    }
                                 }
                                 if !self.in_edge_block {
                                     self.settle_combinatorial();
@@ -12449,6 +12659,9 @@ impl Simulator {
                                 let v = self.eval_expr(item.expr());
                                 self.set_signal_value_by_name(&format!("{}[{}]", lname, idx), v);
                             }
+                            if self.module.dynamic_arrays.contains(&lname) {
+                                self.set_queue_size(&lname, items.len() as u64);
+                            }
                             if !self.in_edge_block {
                                 self.settle_combinatorial();
                             }
@@ -12585,6 +12798,29 @@ impl Simulator {
                 rvalue,
             } => {
                 let val = self.eval_expr(rvalue);
+                // SV-2023: NBA to a ref formal redirects to the caller's
+                // actual lvalue (IEEE 1800-2017 §13.5.2).
+                let lvalue_owned;
+                let lvalue: &Expression = if let ExprKind::Ident(hier) = &lvalue.kind {
+                    if hier.path.len() == 1 && hier.path[0].selects.is_empty() {
+                        let formal = &hier.path[0].name.name;
+                        if let Some(actual) = self
+                            .ref_binding_stack
+                            .last()
+                            .and_then(|m| m.get(formal))
+                            .cloned()
+                        {
+                            lvalue_owned = actual;
+                            &lvalue_owned
+                        } else {
+                            lvalue
+                        }
+                    } else {
+                        lvalue
+                    }
+                } else {
+                    lvalue
+                };
                 let w = self.infer_lhs_width(lvalue);
                 let d = delay
                     .as_ref()
@@ -12633,9 +12869,61 @@ impl Simulator {
                 }
             }
             StatementKind::Case {
-                kind, expr, items, ..
+                unique_priority,
+                kind,
+                expr,
+                items,
             } => {
                 let val = self.eval_expr(expr);
+                // SV-2023: under unique/unique0/priority, pre-pass the items
+                // and emit a violation message if multiple match or (for
+                // unique/priority) none match without a default.
+                if sv_parser::is_sv2023() && unique_priority.is_some() {
+                    let mut match_count = 0usize;
+                    let mut has_default = false;
+                    for item in items.iter() {
+                        if item.is_default {
+                            has_default = true;
+                            continue;
+                        }
+                        for pat in &item.patterns {
+                            let pv = self.eval_expr(pat);
+                            let eq = match kind {
+                                CaseKind::Casez => val.casez_eq(&pv),
+                                CaseKind::Casex => val.casex_eq(&pv),
+                                _ => val.case_eq(&pv),
+                            };
+                            if eq.is_true() {
+                                match_count += 1;
+                                break;
+                            }
+                        }
+                    }
+                    let qual = match unique_priority {
+                        Some(UniquePriority::Unique) => "unique",
+                        Some(UniquePriority::Unique0) => "unique0",
+                        Some(UniquePriority::Priority) => "priority",
+                        None => "",
+                    };
+                    if match_count > 1 {
+                        self.record_output(format!(
+                            "[SV-2023 §12.5.3] {} case: multiple items matched ({})",
+                            qual, match_count
+                        ));
+                    } else if match_count == 0
+                        && !has_default
+                        && matches!(
+                            unique_priority,
+                            Some(UniquePriority::Unique)
+                                | Some(UniquePriority::Priority)
+                        )
+                    {
+                        self.record_output(format!(
+                            "[SV-2023 §12.5.3] {} case: no item matched and no default",
+                            qual
+                        ));
+                    }
+                }
                 let mut matched = false;
                 for (_iidx, item) in items.iter().enumerate() {
                     if item.is_default {
@@ -12904,7 +13192,24 @@ impl Simulator {
                 }
                 self.break_flag = true;
             }
-            StatementKind::Disable(_) | StatementKind::WaitFork => {}
+            StatementKind::Disable(name) => {
+                self.disable_target = Some(name.name.clone());
+                self.break_flag = true;
+            }
+            StatementKind::DisableFork => {
+                // SV-2023: kill all pending child processes of the current pid.
+                let cur = self.current_pid;
+                let mut to_kill: Vec<usize> = Vec::new();
+                for (pid, parent) in self.process_parents.iter() {
+                    if *parent == cur {
+                        to_kill.push(*pid);
+                    }
+                }
+                for pid in to_kill {
+                    self.killed_pids.insert(pid);
+                }
+            }
+            StatementKind::WaitFork => {}
             StatementKind::RsReturn => {
                 self.rs_return_flag = true;
                 self.break_flag = true;
@@ -16121,6 +16426,34 @@ impl Simulator {
                 if name.starts_with('$') {
                     return match name.as_str() {
                         "$time" => Value::from_u64(self.time, 64),
+                        "$realtime" => Value::from_f64(self.real_time),
+                        "$stime" => Value::from_u64(self.time & 0xFFFF_FFFF, 32),
+                        "$inferred_clock" | "$inferred_disable" if sv_parser::is_sv2023() => {
+                            Value::from_u64(0, 1)
+                        }
+                        "$global_clock" if sv_parser::is_sv2023() => Value::from_u64(0, 1),
+                        "$timeunit" if sv_parser::is_sv2023() => {
+                            let mut v = Value::from_u64(
+                                self.module.timeunit_exp as i64 as u64,
+                                32,
+                            );
+                            v.is_signed = true;
+                            v
+                        }
+                        "$timeprecision" if sv_parser::is_sv2023() => {
+                            let mut v = Value::from_u64(
+                                self.module.timeprecision_exp as i64 as u64,
+                                32,
+                            );
+                            v.is_signed = true;
+                            v
+                        }
+                        "$rose_gclk" | "$fell_gclk" | "$steady_gclk" | "$changing_gclk"
+                        | "$past_gclk" | "$future_gclk"
+                            if sv_parser::is_sv2023() =>
+                        {
+                            Value::from_u64(0, 1)
+                        }
                         "$test$plusargs" => {
                             let pat = match args.first().map(|a| &a.kind) {
                                 Some(ExprKind::StringLiteral(s)) => s.clone(),
@@ -16495,6 +16828,17 @@ impl Simulator {
             }
         }
         self.local_stack.push(locals);
+        // SV-2023: redirect NBAs targeting a `ref` formal back to the caller's
+        // actual variable (IEEE 1800-2017 §13.5.2).
+        let mut ref_map: HashMap<String, Expression> = HashMap::default();
+        for (i, port) in td.ports.iter().enumerate() {
+            if matches!(port.direction, crate::ast::types::PortDirection::Ref)
+                && i < args.len()
+            {
+                ref_map.insert(port.name.name.clone(), args[i].clone());
+            }
+        }
+        self.ref_binding_stack.push(ref_map);
         self.return_value = None;
         let prev_static = self.current_static_task.take();
         if matches!(td.lifetime, Some(crate::ast::types::Lifetime::Static)) {
@@ -16508,6 +16852,7 @@ impl Simulator {
             }
         }
         self.current_static_task = prev_static;
+        self.ref_binding_stack.pop();
         // Copy output/ref values back to caller
         let locals = self.local_stack.pop().unwrap_or_default();
         for (port_name, caller_expr) in &output_bindings {
@@ -16920,6 +17265,7 @@ impl Simulator {
 
         let mut rand_props = Vec::new();
         let mut constraints = Vec::new();
+        let mut real_rand_props: HashSet<String> = HashSet::default();
 
         let mut cur = Some(class_name.clone());
         while let Some(cname) = cur {
@@ -16927,6 +17273,9 @@ impl Simulator {
                 for prop in &class_def.random_properties {
                     if let Some(sig) = class_def.properties.get(prop) {
                         rand_props.push((prop.clone(), sig.width));
+                        if sig.is_real {
+                            real_rand_props.insert(prop.clone());
+                        }
                     }
                 }
                 for con in class_def.constraints.values() {
@@ -17080,6 +17429,78 @@ impl Simulator {
                     } else {
                         // No assignment, pick randomly (honoring ranges if possible)
                         let mut val = Value::zero(*width);
+                        if real_rand_props.contains(name) {
+                            // SV-2023: real-typed rand. Scan constraints for
+                            // `name >= lit` / `name <= lit` bounds and sample
+                            // uniformly. Default to [0.0, 1.0) when unbound.
+                            let mut lo: f64 = f64::NEG_INFINITY;
+                            let mut hi: f64 = f64::INFINITY;
+                            for con in &constraints {
+                                for item in &con.items {
+                                    if let ConstraintItem::Expr(e) = item {
+                                        if let ExprKind::Binary { op, left, right } = &e.kind {
+                                            let prop_on_left = matches!(&left.kind,
+                                                ExprKind::Ident(h) if h.path.last()
+                                                    .map_or(false, |s| &s.name.name == name));
+                                            let prop_on_right = matches!(&right.kind,
+                                                ExprKind::Ident(h) if h.path.last()
+                                                    .map_or(false, |s| &s.name.name == name));
+                                            if !prop_on_left && !prop_on_right {
+                                                continue;
+                                            }
+                                            let lit_side = if prop_on_left { right } else { left };
+                                            let lit = self.eval_expr(lit_side).to_f64();
+                                            let effective_op = if prop_on_right {
+                                                match op {
+                                                    BinaryOp::Geq => BinaryOp::Leq,
+                                                    BinaryOp::Leq => BinaryOp::Geq,
+                                                    BinaryOp::Gt => BinaryOp::Lt,
+                                                    BinaryOp::Lt => BinaryOp::Gt,
+                                                    other => *other,
+                                                }
+                                            } else {
+                                                *op
+                                            };
+                                            match effective_op {
+                                                BinaryOp::Geq | BinaryOp::Gt => {
+                                                    if lit > lo {
+                                                        lo = lit;
+                                                    }
+                                                }
+                                                BinaryOp::Leq | BinaryOp::Lt => {
+                                                    if lit < hi {
+                                                        hi = lit;
+                                                    }
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            let (lo_e, hi_e) = if !lo.is_finite() && !hi.is_finite() {
+                                (0.0_f64, 1.0_f64)
+                            } else if !lo.is_finite() {
+                                (hi - 1.0, hi)
+                            } else if !hi.is_finite() {
+                                (lo, lo + 1.0)
+                            } else {
+                                (lo, hi)
+                            };
+                            let pick = if hi_e > lo_e {
+                                self.rng.gen_range(lo_e..hi_e)
+                            } else {
+                                lo_e
+                            };
+                            val = Value::from_f64(pick);
+                            solved_props.insert(name.clone(), val.clone());
+                            if let Some(Some(inst)) = self.heap.get_mut(handle) {
+                                inst.properties.insert(name.clone(), val);
+                            }
+                            pids_to_solve.remove(i);
+                            progress = true;
+                            continue;
+                        }
                         if let Some(ranges) = prop_allowed_ranges.get(name) {
                             let r_idx = self.rng.gen_range(0..ranges.len());
                             let (lo, hi) = ranges[r_idx];

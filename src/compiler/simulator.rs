@@ -795,6 +795,10 @@ pub struct Simulator {
     dpi_unresolved: HashSet<String>,
     /// Class instance heap (index 0 is null).
     heap: Vec<Option<ClassInstance>>,
+    /// Static class properties — one shared cell per `Class::prop`,
+    /// keyed `"ClassName::propname"` where ClassName is the class that
+    /// declared the static property.
+    class_statics: HashMap<String, Value>,
     /// Built-in mailboxes (handle -> queue of values)
     mailboxes: HashMap<usize, std::collections::VecDeque<Value>>,
     /// Built-in semaphores (handle -> current count)
@@ -1749,6 +1753,7 @@ impl Simulator {
             dpi_unsupported: HashSet::default(),
             dpi_unresolved: HashSet::default(),
             heap: vec![None], // index 0 is null
+            class_statics: HashMap::default(),
             mailboxes: HashMap::default(),
             semaphores: HashMap::default(),
             cg_heap: vec![None],
@@ -9896,7 +9901,27 @@ impl Simulator {
                             }
                         }
                     }
+                    // Static class property assigned bare inside a method.
+                    if let Some(Some(ctx)) = self.class_context_stack.last().cloned() {
+                        let nm = name.clone();
+                        if self.class_static_set(&ctx, &nm, val.clone()) {
+                            return true;
+                        }
+                    }
                 } else if hier.path.len() > 1 {
+                    // `ClassName::static_prop` — explicit static property write.
+                    if hier.path.len() == 2 {
+                        let cls = hier.path[0].name.name.clone();
+                        let prop = hier.path[1].name.name.clone();
+                        if self.module.classes.contains_key(&cls)
+                            && !self.signal_name_to_id.contains_key(
+                                self.resolve_hier_name(hier).as_str(),
+                            )
+                            && self.class_static_set(&cls, &prop, val.clone())
+                        {
+                            return true;
+                        }
+                    }
                     let obj_name = &hier.path[0].name.name;
                     {
                         let sub = hier.path[1..]
@@ -10020,7 +10045,15 @@ impl Simulator {
                 // dominant cost (20s × ~40 calls = 14 minutes) of c910 time-0
                 // settle. We only write here, never read from self.signals
                 // before this path, so the sync was unnecessary.
-                let width = self.widths.get(&name).copied().unwrap_or(val.width);
+                // A 0 width here means the flat `widths` map was polluted
+                // by a same-named variable from another scope — never a
+                // valid lvalue width, so fall back to the value's width.
+                let width = self
+                    .widths
+                    .get(&name)
+                    .copied()
+                    .filter(|w| *w > 0)
+                    .unwrap_or(val.width);
                 let is_real = self.real_signals.contains(&name);
                 let mut resized = if is_real {
                     if val.is_real {
@@ -10349,6 +10382,23 @@ impl Simulator {
                 changed
             }
             ExprKind::MemberAccess { expr, member } => {
+                // `ClassName::static_prop = ...` — explicit static write.
+                if let ExprKind::Ident(hier) = &expr.kind {
+                    if hier.path.len() == 1 {
+                        let cls = hier.path[0].name.name.clone();
+                        if self.module.classes.contains_key(&cls)
+                            && !self
+                                .local_stack
+                                .last()
+                                .map_or(false, |m| m.contains_key(&cls))
+                            && !self.signal_name_to_id.contains_key(cls.as_str())
+                            && !self.signals.contains_key(&cls)
+                            && self.class_static_set(&cls, &member.name, val.clone())
+                        {
+                            return true;
+                        }
+                    }
+                }
                 if let ExprKind::Ident(hier) = &expr.kind {
                     let name = self.resolve_hier_name(hier);
                     if let Some(fields) = self.module.packed_struct_fields.get(&name).cloned() {
@@ -10432,7 +10482,27 @@ impl Simulator {
                             }
                         }
                     }
+                    // Static class property referenced bare inside a method.
+                    if let Some(Some(ctx)) = self.class_context_stack.last().cloned() {
+                        if let Some(v) = self.class_static_get(&ctx, name) {
+                            return v;
+                        }
+                    }
                 } else if hier.path.len() > 1 {
+                    // `ClassName::static_prop` — explicit static property read.
+                    if hier.path.len() == 2 {
+                        let cls = &hier.path[0].name.name;
+                        let prop = &hier.path[1].name.name;
+                        if self.module.classes.contains_key(cls)
+                            && !self.signal_name_to_id.contains_key(
+                                self.resolve_hier_name(hier).as_str(),
+                            )
+                        {
+                            if let Some(v) = self.class_static_get(cls, prop) {
+                                return v;
+                            }
+                        }
+                    }
                     // Check local stack for dotted names like "item.index"
                     if let Some(locals) = self.local_stack.last() {
                         let dotted = hier
@@ -10468,6 +10538,18 @@ impl Simulator {
                                 if let Some(v) = self.get_signal_value_by_name(c) {
                                     handle_value = Some(v);
                                     break;
+                                }
+                            }
+                            // `Class::static_prop` prefix — the leading
+                            // segment names a class and the prefix's last
+                            // segment is one of its static properties.
+                            if handle_value.is_none()
+                                && self.module.classes.contains_key(segs[0])
+                            {
+                                if let Some(v) =
+                                    self.class_static_get(segs[0], segs[split - 1])
+                                {
+                                    handle_value = Some(v);
                                 }
                             }
                             if let Some(v) = handle_value {
@@ -11699,6 +11781,26 @@ impl Simulator {
                 }
             }
             ExprKind::MemberAccess { expr, member } => {
+                // `ClassName::static_prop` — explicit static property read.
+                if let ExprKind::Ident(hier) = &expr.kind {
+                    if hier.path.len() == 1 {
+                        let cls = &hier.path[0].name.name;
+                        if self.module.classes.contains_key(cls)
+                            && !self
+                                .local_stack
+                                .last()
+                                .map_or(false, |m| m.contains_key(cls))
+                            && !self.signal_name_to_id.contains_key(cls.as_str())
+                            && !self.signals.contains_key(cls)
+                        {
+                            if let Some(v) =
+                                self.class_static_get(cls, &member.name)
+                            {
+                                return v;
+                            }
+                        }
+                    }
+                }
                 // Local-stack dotted lookup: e.g. "item.index" inside a with-clause
                 if let ExprKind::Ident(hier) = &expr.kind {
                     if hier.path.len() == 1 {
@@ -14568,7 +14670,12 @@ impl Simulator {
         } else {
             // Fallback
             self.sync_table_to_hashmap();
-            let width = self.widths.get(name).copied().unwrap_or(val.width);
+            let width = self
+                .widths
+                .get(name)
+                .copied()
+                .filter(|w| *w > 0)
+                .unwrap_or(val.width);
             let mut resized = val.resize(width);
             resized.is_signed = self.signed_signals.contains(name);
             let changed = self.signals.get(name).map_or(true, |p| *p != resized);
@@ -14717,15 +14824,24 @@ impl Simulator {
                     h.cached_signal_id.set(Some(id));
                     return self.signal_widths[id];
                 }
+                // A width of 0 is never valid for an lvalue — it usually
+                // means the flat `widths` map was polluted by a same-named
+                // class-handle elsewhere. Ignore it and fall through.
                 if let Some(w) = self.widths.get(&name).copied() {
-                    return w;
+                    if w > 0 {
+                        return w;
+                    }
                 }
                 let leaf = h.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
                 if let Some(&id) = self.signal_name_to_id.get(leaf) {
                     h.cached_signal_id.set(Some(id));
                     return self.signal_widths[id];
                 }
-                self.widths.get(leaf).copied().unwrap_or(32)
+                self.widths
+                    .get(leaf)
+                    .copied()
+                    .filter(|w| *w > 0)
+                    .unwrap_or(32)
             }
             ExprKind::RangeSelect {
                 left, right, kind, ..
@@ -16226,8 +16342,107 @@ impl Simulator {
         None
     }
 
+    /// True when the real IEEE/Accellera uvm-1.2 package is compiled in
+    /// (as opposed to the bundled `uvm_mock.svh`). The native UVM shims
+    /// below are bypassed in that case so the genuine UVM source runs —
+    /// `uvm_objection` is defined only by the real package.
+    fn uses_real_uvm(&self) -> bool {
+        self.module.classes.contains_key("uvm_objection")
+    }
+
+    /// Walk the class hierarchy from `start_class` and return the
+    /// `"DeclClass::prop"` storage key for a static property, if one of
+    /// `start_class` or its ancestors declares `prop` as `static`.
+    fn static_prop_key(&self, start_class: &str, prop: &str) -> Option<String> {
+        let mut cur = Some(start_class.to_string());
+        while let Some(cname) = cur {
+            if let Some(cd) = self.module.classes.get(&cname) {
+                if cd.static_properties.contains(prop) {
+                    return Some(format!("{}::{}", cname, prop));
+                }
+                cur = cd.extends.clone();
+            } else {
+                break;
+            }
+        }
+        None
+    }
+
+    /// Read a static class property, lazily seeding its shared cell from
+    /// the declaring class's initial value on first access.
+    fn class_static_get(&mut self, start_class: &str, prop: &str) -> Option<Value> {
+        let key = self.static_prop_key(start_class, prop)?;
+        if !self.class_statics.contains_key(&key) {
+            let decl_class = key.split("::").next().unwrap_or("");
+            let init = self
+                .module
+                .classes
+                .get(decl_class)
+                .and_then(|cd| cd.properties.get(prop))
+                .map(|sig| sig.value.clone())
+                .unwrap_or_else(|| Value::zero(32));
+            self.class_statics.insert(key.clone(), init);
+        }
+        self.class_statics.get(&key).cloned()
+    }
+
+    /// Write a static class property's shared cell. Returns false if
+    /// `prop` is not a static property of `start_class` or an ancestor.
+    fn class_static_set(&mut self, start_class: &str, prop: &str, val: Value) -> bool {
+        if let Some(key) = self.static_prop_key(start_class, prop) {
+            self.class_statics.insert(key, val);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Is `name` a static method of `class_name` or any ancestor?
+    fn is_static_method(&self, class_name: &str, name: &str) -> bool {
+        let mut cur = Some(class_name.to_string());
+        while let Some(cname) = cur {
+            if let Some(cd) = self.module.classes.get(&cname) {
+                if cd.static_methods.contains(name) {
+                    return true;
+                }
+                cur = cd.extends.clone();
+            } else {
+                break;
+            }
+        }
+        false
+    }
+
+    /// Execute `ClassName::method(args)` — a static method call with no
+    /// instance handle. Returns None if the method is not found.
+    fn exec_static_method(
+        &mut self,
+        class_name: &str,
+        method_name: &str,
+        args: &[Expression],
+    ) -> Option<Value> {
+        let mut cur = Some(class_name.to_string());
+        while let Some(cname) = cur {
+            if let Some(cd) = self.module.classes.get(&cname).cloned() {
+                if cd.methods.contains_key(method_name) {
+                    return Some(self.exec_method_in_class_hierarchy(
+                        0,
+                        &cname,
+                        method_name,
+                        args,
+                    ));
+                }
+                cur = cd.extends.clone();
+            } else {
+                break;
+            }
+        }
+        None
+    }
+
     fn eval_call(&mut self, func: &Expression, args: &[Expression]) -> Value {
         // Intercept UVM method calls
+        let real_uvm = self.uses_real_uvm();
         if let ExprKind::MemberAccess { expr, member } = &func.kind {
             let mname = member.name.as_str();
 
@@ -16246,6 +16461,27 @@ impl Simulator {
                     if let Some(td) = self.module.tasks.get(mname).cloned() {
                         self.exec_task_call(&td, args);
                         return Value::zero(32);
+                    }
+                }
+                // Static method call: `ClassName::method(args)`. The LHS
+                // names a class and is not a variable holding a handle.
+                if hier.path.len() == 1
+                    && self.module.classes.contains_key(&name)
+                    && !self
+                        .local_stack
+                        .last()
+                        .map_or(false, |m| m.contains_key(&name))
+                    && !self.signal_name_to_id.contains_key(name.as_str())
+                    && !self.signals.contains_key(&name)
+                {
+                    if let Some(res) = self.exec_static_method(&name, mname, args) {
+                        return res;
+                    }
+                    // `ClassName::new(...)` — explicit constructor call.
+                    if mname == "new" {
+                        if let Some(cd) = self.module.classes.get(&name).cloned() {
+                            return self.instantiate_class(&cd, args);
+                        }
                     }
                 }
             }
@@ -16359,7 +16595,7 @@ impl Simulator {
                 }
                 return Value::zero(32);
             }
-            if mname == "create" {
+            if mname == "create" && !real_uvm {
                 if let ExprKind::MemberAccess {
                     expr: inner_expr,
                     member: inner_member,
@@ -16375,14 +16611,15 @@ impl Simulator {
                     }
                 }
             }
-            if mname == "item_done"
-                || mname == "connect"
-                || mname == "raise_objection"
-                || mname == "drop_objection"
+            if !real_uvm
+                && (mname == "item_done"
+                    || mname == "connect"
+                    || mname == "raise_objection"
+                    || mname == "drop_objection")
             {
                 return Value::zero(32);
             }
-            if mname == "write" {
+            if mname == "write" && !real_uvm {
                 // Call write on scoreboard
                 let mut sb_handles = Vec::new();
                 for i in 1..self.heap.len() {
@@ -16477,17 +16714,18 @@ impl Simulator {
                         _ => Value::zero(32),
                     };
                 }
-                if name == "uvm_report_enabled" {
+                if name == "uvm_report_enabled" && !real_uvm {
                     return Value::from_u64(1, 32); // Always enabled for mock
                 }
-                if name == "get_is_active" {
+                if name == "get_is_active" && !real_uvm {
                     // UVM_ACTIVE is typically 1 in UVM
                     return Value::from_u64(1, 32);
                 }
-                if name == "uvm_report_info"
-                    || name == "uvm_report_warning"
-                    || name == "uvm_report_error"
-                    || name == "uvm_report_fatal"
+                if !real_uvm
+                    && (name == "uvm_report_info"
+                        || name == "uvm_report_warning"
+                        || name == "uvm_report_error"
+                        || name == "uvm_report_fatal")
                 {
                     let id = if args.len() > 0 {
                         if let ExprKind::StringLiteral(s) = &args[0].kind {
@@ -16526,7 +16764,7 @@ impl Simulator {
                     );
                     return Value::zero(32);
                 }
-                if name == "run_test" {
+                if name == "run_test" && !real_uvm {
                     let test_name = if let Some(arg) = args.first() {
                         if let ExprKind::StringLiteral(s) = &arg.kind {
                             s.clone()
@@ -16577,7 +16815,8 @@ impl Simulator {
             }
 
             // Intercept type_id::create
-            if len >= 3
+            if !real_uvm
+                && len >= 3
                 && path[len - 1].name.name == "create"
                 && path[len - 2].name.name == "type_id"
             {
@@ -16591,6 +16830,29 @@ impl Simulator {
             if hier.path.len() > 1 {
                 let obj_name = &hier.path[0].name.name;
                 let method_name = &hier.path.last().unwrap().name.name;
+
+                // Static method call `ClassName::method(args)` when the
+                // call flattened into a 2-segment hierarchical Ident.
+                if hier.path.len() == 2
+                    && self.module.classes.contains_key(obj_name)
+                    && !self
+                        .local_stack
+                        .last()
+                        .map_or(false, |m| m.contains_key(obj_name))
+                    && !self.signal_name_to_id.contains_key(obj_name.as_str())
+                    && !self.signals.contains_key(obj_name)
+                {
+                    let cls = obj_name.clone();
+                    let m = method_name.clone();
+                    if let Some(res) = self.exec_static_method(&cls, &m, args) {
+                        return res;
+                    }
+                    if m == "new" {
+                        if let Some(cd) = self.module.classes.get(&cls).cloned() {
+                            return self.instantiate_class(&cd, args);
+                        }
+                    }
+                }
 
                 if let Some(res) = self.eval_builtin_method(obj_name, method_name, args) {
                     return res;
@@ -17081,6 +17343,11 @@ impl Simulator {
         }
         for cdef in classes_to_init.iter().rev() {
             for (prop_name, prop_sig) in &cdef.properties {
+                // Static properties live in the shared `class_statics`
+                // cell, not per-instance — skip them here.
+                if cdef.static_properties.contains(prop_name) {
+                    continue;
+                }
                 instance
                     .properties
                     .insert(prop_name.clone(), prop_sig.value.clone());
@@ -17781,15 +18048,113 @@ impl Simulator {
         }
     }
 
+    /// Declared class-type name of property `prop` on `class_name` or
+    /// any ancestor (e.g. `Foo` for `Foo inst;`). Empty type names and
+    /// non-class types yield None.
+    fn class_prop_type(&self, class_name: &str, prop: &str) -> Option<String> {
+        let mut cur = Some(class_name.to_string());
+        while let Some(cname) = cur {
+            if let Some(cd) = self.module.classes.get(&cname) {
+                if let Some(sig) = cd.properties.get(prop) {
+                    if let Some(t) = &sig.type_name {
+                        if self.module.classes.contains_key(t) {
+                            return Some(t.clone());
+                        }
+                    }
+                    return None;
+                }
+                cur = cd.extends.clone();
+            } else {
+                break;
+            }
+        }
+        None
+    }
+
     fn get_expr_type_name(&self, expr: &Expression) -> Option<String> {
         match &expr.kind {
             ExprKind::Ident(hier) => {
                 let name = self.resolve_hier_name(hier);
-                self.signal_name_to_id
+                if let Some(t) = self
+                    .signal_name_to_id
                     .get(name.as_str())
                     .and_then(|id| self.signal_type_names.get(id).cloned())
+                {
+                    return Some(t);
+                }
+                // A class property referenced bare inside a method —
+                // resolve its type through the current class context.
+                if hier.path.len() == 1 {
+                    let pn = &hier.path[0].name.name;
+                    if !self
+                        .local_stack
+                        .last()
+                        .map_or(false, |m| m.contains_key(pn))
+                    {
+                        if let Some(Some(ctx)) =
+                            self.class_context_stack.last().cloned()
+                        {
+                            if let Some(t) = self.class_prop_type(&ctx, pn) {
+                                return Some(t);
+                            }
+                        }
+                    }
+                }
+                None
+            }
+            // `ClassName::static_prop` or `obj.field` — resolve the
+            // member's declared class type.
+            ExprKind::MemberAccess { expr: base, member } => {
+                if let ExprKind::Ident(bh) = &base.kind {
+                    if bh.path.len() == 1 {
+                        let bname = &bh.path[0].name.name;
+                        // ClassName::static_prop
+                        if self.module.classes.contains_key(bname) {
+                            return self.class_prop_type(bname, &member.name);
+                        }
+                        // obj.field — find obj's runtime class
+                        let handle = self
+                            .eval_ident_handle(bname)
+                            .unwrap_or(0);
+                        if handle != 0 {
+                            if let Some(Some(inst)) = self.heap.get(handle) {
+                                let cn = inst.class_name.clone();
+                                return self.class_prop_type(&cn, &member.name);
+                            }
+                        }
+                    }
+                }
+                None
             }
             _ => None,
         }
+    }
+
+    /// Resolve a bare identifier to a class handle, if it currently
+    /// holds one (local variable, `this` property, or static property).
+    fn eval_ident_handle(&self, name: &str) -> Option<usize> {
+        if let Some(locals) = self.local_stack.last() {
+            if let Some(v) = locals.get(name) {
+                return v.to_u64().map(|h| h as usize);
+            }
+        }
+        if let Some(Some(handle)) = self.this_stack.last() {
+            if let Some(Some(inst)) = self.heap.get(*handle) {
+                if let Some(v) = inst.properties.get(name) {
+                    return v.to_u64().map(|h| h as usize);
+                }
+            }
+        }
+        if let Some(Some(ctx)) = self.class_context_stack.last() {
+            if let Some(key) = self.static_prop_key(ctx, name) {
+                if let Some(v) = self.class_statics.get(&key) {
+                    return v.to_u64().map(|h| h as usize);
+                }
+            }
+        }
+        if let Some(&id) = self.signal_name_to_id.get(name) {
+            return self.signal_table[id].to_u64().map(|h| h as usize);
+        }
+        None
     }
 }

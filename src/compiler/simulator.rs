@@ -3828,6 +3828,7 @@ impl Simulator {
         if self.compiled {
             return;
         }
+        self.sanitize_class_hierarchy();
 
         // Evaluate parameter expressions whose initializers contained function
         // calls and were deferred by the elaborator.
@@ -15830,16 +15831,24 @@ impl Simulator {
     }
 
     fn get_queue_size(&self, obj_name: &str) -> u64 {
-        if let Some(v) = self.signals.get(&format!("{}.size", obj_name)) {
-            return v.to_u64().unwrap_or(0);
+        let raw = if let Some(v) = self.signals.get(&format!("{}.size", obj_name)) {
+            v.to_u64().unwrap_or(0)
+        } else if self.module.dynamic_arrays.contains(obj_name) {
+            0
+        } else if let Some((lo, hi, _)) = self.module.arrays.get(obj_name) {
+            (hi - lo + 1) as u64
+        } else {
+            0
+        };
+        // A queue/array element count above this is never legitimate — it
+        // means `<name>.size` holds a garbage value (e.g. an X-coerced or
+        // sign-extended scalar). Clamp so element-scan loops can't spin
+        // formatting billions of `name[i]` lookups.
+        if raw > 1 << 26 {
+            0
+        } else {
+            raw
         }
-        if self.module.dynamic_arrays.contains(obj_name) {
-            return 0;
-        }
-        if let Some((lo, hi, _)) = self.module.arrays.get(obj_name) {
-            return (hi - lo + 1) as u64;
-        }
-        0
     }
 
     fn set_queue_size(&mut self, obj_name: &str, size: u64) {
@@ -16348,6 +16357,43 @@ impl Simulator {
     /// `uvm_objection` is defined only by the real package.
     fn uses_real_uvm(&self) -> bool {
         self.module.classes.contains_key("uvm_objection")
+    }
+
+    /// Break any cycle in the class `extends` graph. A self- or mutually-
+    /// referential `extends` (which can arise from a parameterized class
+    /// whose base resolves to the same name) would make every ancestor-
+    /// chain walk loop forever. Walk each class's chain; the first edge
+    /// that revisits an already-seen class is cleared to `None`.
+    fn sanitize_class_hierarchy(&mut self) {
+        let names: Vec<String> = self.module.classes.keys().cloned().collect();
+        for start in names {
+            let mut seen: HashSet<String> = HashSet::default();
+            let mut cur = Some(start.clone());
+            while let Some(cname) = cur {
+                if !seen.insert(cname.clone()) {
+                    break;
+                }
+                let next = match self.module.classes.get(&cname) {
+                    Some(cd) => cd.extends.clone(),
+                    None => None,
+                };
+                match next {
+                    Some(parent) if seen.contains(&parent) => {
+                        // This edge closes a cycle — sever it.
+                        if let Some(cd) = self.module.classes.get_mut(&cname) {
+                            eprintln!(
+                                "[xezim][warning] severed cyclic class inheritance: \
+                                 '{}' extends '{}' (cycle)",
+                                cname, parent
+                            );
+                            cd.extends = None;
+                        }
+                        break;
+                    }
+                    other => cur = other,
+                }
+            }
+        }
     }
 
     /// Walk the class hierarchy from `start_class` and return the
@@ -17333,7 +17379,15 @@ impl Simulator {
         };
         let mut classes_to_init = vec![class_def.clone()];
         let mut cur = class_def.extends.clone();
+        // Cycle guard — `sanitize_class_hierarchy` already severs `extends`
+        // cycles, but keep a defensive `seen` check so a stale chain can
+        // never spin this walk.
+        let mut seen: HashSet<String> = HashSet::default();
+        seen.insert(class_def.name.clone());
         while let Some(cname) = cur {
+            if !seen.insert(cname.clone()) {
+                break;
+            }
             if let Some(cdef) = self.module.classes.get(&cname) {
                 classes_to_init.push(cdef.clone());
                 cur = cdef.extends.clone();

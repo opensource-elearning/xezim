@@ -1167,6 +1167,21 @@ struct DpiLogicVecVal {
 /// Free function so it can be shared between the `&self` resolver on
 /// Simulator and the `&[Value]`-borrowed `exec_insns_isolated` path that
 /// runs on separate threads.
+/// Self-determined bit width of a built-in type keyword, for `$bits(<type>)`
+/// where the type parses as a bare identifier (§6.11, §20.6.2). Returns None
+/// for non-type names so a same-named signal/typedef path is used instead.
+fn atom_type_keyword_width(name: &str) -> Option<u32> {
+    Some(match name {
+        "integer" | "int" => 32,
+        "shortint" => 16,
+        "longint" | "time" | "real" | "realtime" => 64,
+        "shortreal" => 32,
+        "byte" => 8,
+        "bit" | "logic" | "reg" => 1,
+        _ => return None,
+    })
+}
+
 #[inline]
 fn resolve_array_elem_id(
     name: &str,
@@ -18416,6 +18431,14 @@ impl Simulator {
                             }
                             if let Some(w) = self.module.typedefs.get(&name) {
                                 return Value::from_u64(*w as u64, 32);
+                            }
+                            // §20.6.2: `$bits(<type>)` where the type is a bare
+                            // keyword (`$bits(integer)`, `$bits(byte)`) — the
+                            // keyword parses as an Ident, so map it to the
+                            // self-determined width of the type.
+                            let leaf = hier.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
+                            if let Some(w) = atom_type_keyword_width(leaf) {
+                                return Value::from_u64(w as u64, 32);
                             }
                         }
                         Value::from_u64(self.eval_expr(arg).width as u64, 32)

@@ -5539,6 +5539,7 @@ impl Simulator {
             self.fst_start_dump();
         }
         self.auto_partition_by_clock();
+        self.auto_partition_by_scope();
         self.compiled = true;
     }
 
@@ -5594,6 +5595,52 @@ impl Simulator {
             n_blocks,
             clock_to_part.len(),
             self.edge_block_partition_count
+        );
+    }
+
+    /// Manual scope-based edge-block partition, selected by
+    /// `XEZIM_PARTITION_SCOPES="<scope0>;<scope1>;..."`. Each edge block whose
+    /// hierarchical scope equals or sits under prefix `i` is assigned partition
+    /// `i`; blocks under none land in a final "rest" partition. This aligns the
+    /// parallel edge dispatch with the design's structure (e.g. c910:
+    /// core0 | core1 | rest) so each worker thread touches a disjoint region of
+    /// the signal table — better cache locality than the generic block chunk.
+    fn auto_partition_by_scope(&mut self) {
+        let spec = match std::env::var("XEZIM_PARTITION_SCOPES") {
+            Ok(s) if !s.is_empty() => s,
+            _ => return,
+        };
+        if !self.edge_block_partition.is_empty() && self.edge_block_partition_count > 0 {
+            return; // already partitioned (clock auto-part or external file)
+        }
+        let prefixes: Vec<(String, String)> = spec
+            .split(';')
+            .filter(|s| !s.is_empty())
+            .map(|s| (s.to_string(), format!("{}.", s)))
+            .collect();
+        if prefixes.is_empty() {
+            return;
+        }
+        let rest_part = prefixes.len() as u32;
+        let n_blocks = self.edge_blocks.len();
+        self.edge_block_partition = vec![rest_part; n_blocks];
+        let mut counts = vec![0usize; prefixes.len() + 1];
+        for bi in 0..n_blocks {
+            let part = match self.edge_block_scope.get(bi).and_then(|s| s.as_ref()) {
+                Some(sc) => prefixes
+                    .iter()
+                    .position(|(p, pdot)| sc.as_str() == p.as_str() || sc.starts_with(pdot.as_str()))
+                    .map(|i| i as u32)
+                    .unwrap_or(rest_part),
+                None => rest_part,
+            };
+            self.edge_block_partition[bi] = part;
+            counts[part as usize] += 1;
+        }
+        self.edge_block_partition_count = prefixes.len() as u32 + 1;
+        eprintln!(
+            "[OPT] auto-partition-by-scope: k={} buckets, block counts {:?}",
+            self.edge_block_partition_count, counts
         );
     }
 
@@ -8303,6 +8350,37 @@ impl Simulator {
         self.edge_block_parallel.clear();
         self.edge_block_scope.clear();
         self.edge_block_needs_hint.clear();
+
+        // Single-writer NBA map: count how many edge blocks NBA-write each
+        // signal. A static-range/bit NBA block (NbaAssignRange/NbaAssignBitDyn)
+        // is normally serialized because the parallel merge is last-writer-
+        // wins on the full register, which loses bits when TWO blocks write
+        // different sub-ranges of the SAME register. But if a signal is
+        // written by exactly ONE block, its single NbaFast entry is correct
+        // as-is — so such blocks are safe to parallelize without any merge
+        // change. Set XEZIM_NO_PARALLEL_RANGE=1 to disable (revert to the
+        // conservative all-range-sequential behavior).
+        let unlock_range = std::env::var_os("XEZIM_NO_PARALLEL_RANGE").is_none();
+        let mut nba_writer_count: HashMap<usize, u32> = HashMap::default();
+        if unlock_range {
+            for cb in self.compiled_edge_blocks.iter().flatten() {
+                let mut seen: Vec<usize> = Vec::new();
+                for insn in &cb.instructions {
+                    let id = match insn {
+                        super::bytecode::Insn::NbaAssign(id, _, _)
+                        | super::bytecode::Insn::NbaAssignRange(id, _, _, _)
+                        | super::bytecode::Insn::NbaAssignBitDyn(id, _, _)
+                        | super::bytecode::Insn::NbaAssignRangeDyn(id, _, _, _) => *id,
+                        _ => continue,
+                    };
+                    if !seen.contains(&id) {
+                        seen.push(id);
+                        *nba_writer_count.entry(id).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+
         for (idx, cb) in self.compiled_edge_blocks.iter().enumerate() {
             let has_fallback = cb.as_ref().map_or(false, |cb| {
                 cb.instructions
@@ -8319,37 +8397,42 @@ impl Simulator {
             // written by earlier blocks revert to the snapshot value.
             // The sequential path merges correctly via nba_fast.rposition,
             // so keep these on the sequential path.
+            // A block is parallel-safe ("pure") when it contains none of the
+            // hard disqualifiers below. Static sub-range NBA writes
+            // (NbaAssignRange/NbaAssignBitDyn) are conditionally allowed: they
+            // disqualify only when their target signal is multi-writer (see
+            // nba_writer_count above) — single-writer sub-range writes merge
+            // correctly because their NbaFast entry is the sole one for that
+            // signal. NbaAssignRangeDyn and all array NBA writes remain
+            // sequential (dynamic-range exec is unsupported in the isolated
+            // path; array writes hit the cross-thread nba_fast_index issue
+            // that stalls c910 cmark).
+            use super::bytecode::Insn as BcInsn;
             let is_pure = cb.as_ref().map_or(false, |cb| {
-                !cb.instructions.iter().any(|insn| {
-                    matches!(
-                        insn,
-                        super::bytecode::Insn::StmtFallback(..)
-                            | super::bytecode::Insn::BlockingAssign(..)
-                            | super::bytecode::Insn::BlockingAssignRange(..)
-                            | super::bytecode::Insn::BlockingAssignRangeDyn(..)
-                            | super::bytecode::Insn::BlockingAssignBitDyn(..)
-                            | super::bytecode::Insn::NbaAssignBitDyn(..)
-                            | super::bytecode::Insn::NbaAssignRange(..)
-                            | super::bytecode::Insn::NbaAssignRangeDyn(..)
-                            | super::bytecode::Insn::BlockingAssignArray(..)
-                            // NbaAssignArray excluded: c910 cmark stalls
-                            // around sim 500k when blocks containing array
-                            // NBA writes (PRF, AIQ, ROB) execute in parallel.
-                            // Sequential dispatch via exec_insns shares
-                            // self.nba_fast_index across blocks so a later
-                            // block reading nba_fast_index for the same
-                            // array-element signal_id sees the prior
-                            // block's update; parallel exec_insns_isolated
-                            // each thread has only its local nba_out, so
-                            // cross-thread reads via the (separate, per-
-                            // signal) nba_fast_index disagree at apply
-                            // time. Hello passes (~no array writes); cmark
-                            // exercises this heavily.
-                            | super::bytecode::Insn::NbaAssignArray(..)
-                            | super::bytecode::Insn::NbaAssignArrayRange(..)
-                            | super::bytecode::Insn::BlockingAssignArrayRange(..)
-                    )
-                })
+                for insn in &cb.instructions {
+                    match insn {
+                        BcInsn::StmtFallback(..)
+                        | BcInsn::BlockingAssign(..)
+                        | BcInsn::BlockingAssignRange(..)
+                        | BcInsn::BlockingAssignRangeDyn(..)
+                        | BcInsn::BlockingAssignBitDyn(..)
+                        | BcInsn::NbaAssignRangeDyn(..)
+                        | BcInsn::BlockingAssignArray(..)
+                        | BcInsn::NbaAssignArray(..)
+                        | BcInsn::NbaAssignArrayRange(..)
+                        | BcInsn::BlockingAssignArrayRange(..) => return false,
+                        BcInsn::NbaAssignRange(id, _, _, _)
+                        | BcInsn::NbaAssignBitDyn(id, _, _) => {
+                            if !unlock_range
+                                || nba_writer_count.get(id).copied().unwrap_or(0) > 1
+                            {
+                                return false;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                true
             });
             if is_pure {
                 pure_count += 1;
@@ -8371,6 +8454,148 @@ impl Simulator {
             pure_count,
             self.compiled_edge_blocks.len()
         );
+        // XEZIM_PURITY_STATS=1: break down WHY blocks are non-pure, weighted by
+        // instruction count (a proxy for exec work), so we can see which merge
+        // limitation to fix to widen the parallel fraction.
+        if std::env::var("XEZIM_PURITY_STATS").is_ok() {
+            use super::bytecode::Insn;
+            // (category, blocks-containing-it, total-insns-of-those-blocks)
+            let mut cats: Vec<(&str, usize, usize)> = vec![
+                ("StmtFallback", 0, 0),
+                ("BlockingAssign(scalar)", 0, 0),
+                ("BlockingAssign(range/bit-dyn)", 0, 0),
+                ("BlockingAssign(array)", 0, 0),
+                ("Nba(range/bit-dyn)", 0, 0),
+                ("Nba(array)", 0, 0),
+            ];
+            let mut nonpure_blocks = 0usize;
+            let mut nonpure_insns = 0usize;
+            let mut pure_insns = 0usize;
+            for (idx, cb) in self.compiled_edge_blocks.iter().enumerate() {
+                let cb = match cb.as_ref() {
+                    Some(c) => c,
+                    None => continue,
+                };
+                let n = cb.instructions.len();
+                if self.edge_block_parallel.get(idx).copied().unwrap_or(false) {
+                    pure_insns += n;
+                    continue;
+                }
+                nonpure_blocks += 1;
+                nonpure_insns += n;
+                let mut seen = [false; 6];
+                for insn in &cb.instructions {
+                    let c = match insn {
+                        Insn::StmtFallback(..) => 0,
+                        Insn::BlockingAssign(..) => 1,
+                        Insn::BlockingAssignRange(..)
+                        | Insn::BlockingAssignRangeDyn(..)
+                        | Insn::BlockingAssignBitDyn(..) => 2,
+                        Insn::BlockingAssignArray(..) | Insn::BlockingAssignArrayRange(..) => 3,
+                        Insn::NbaAssignBitDyn(..)
+                        | Insn::NbaAssignRange(..)
+                        | Insn::NbaAssignRangeDyn(..) => 4,
+                        Insn::NbaAssignArray(..) | Insn::NbaAssignArrayRange(..) => 5,
+                        _ => continue,
+                    };
+                    seen[c] = true;
+                }
+                for (c, &s) in seen.iter().enumerate() {
+                    if s {
+                        cats[c].1 += 1;
+                        cats[c].2 += n;
+                    }
+                }
+            }
+            eprintln!(
+                "[PURITY] pure={} blocks ({} insns), non-pure={} blocks ({} insns)",
+                pure_count, pure_insns, nonpure_blocks, nonpure_insns
+            );
+            for (name, blocks, insns) in &cats {
+                if *blocks > 0 {
+                    eprintln!(
+                        "[PURITY]   {:<30} {} blocks, {} insns ({:.0}% of non-pure insns)",
+                        name,
+                        blocks,
+                        insns,
+                        100.0 * *insns as f64 / nonpure_insns.max(1) as f64
+                    );
+                }
+            }
+            // Single-writer analysis: how many range/bit-dyn-only blocks write
+            // ONLY signals that no other block writes (safe to parallelize with
+            // NO merge change — the lone NbaFast entry per signal is correct).
+            let mut writer_count: HashMap<usize, u32> = HashMap::default();
+            let block_nba_sigs = |cb: &super::bytecode::CompiledBlock| -> Vec<usize> {
+                let mut v = Vec::new();
+                for insn in &cb.instructions {
+                    let id = match insn {
+                        Insn::NbaAssign(id, _, _)
+                        | Insn::NbaAssignRange(id, _, _, _)
+                        | Insn::NbaAssignBitDyn(id, _, _)
+                        | Insn::NbaAssignRangeDyn(id, _, _, _) => *id,
+                        _ => continue,
+                    };
+                    if !v.contains(&id) {
+                        v.push(id);
+                    }
+                }
+                v
+            };
+            for cb in self.compiled_edge_blocks.iter().flatten() {
+                for id in block_nba_sigs(cb) {
+                    *writer_count.entry(id).or_insert(0) += 1;
+                }
+            }
+            let mut safe_blocks = 0usize;
+            let mut safe_insns = 0usize;
+            for (idx, cb) in self.compiled_edge_blocks.iter().enumerate() {
+                let cb = match cb.as_ref() {
+                    Some(c) => c,
+                    None => continue,
+                };
+                if self.edge_block_parallel.get(idx).copied().unwrap_or(false) {
+                    continue; // already pure
+                }
+                // Eligible only if its sole disqualifier is range/bit-dyn NBA
+                // (no fallback, blocking, or array writes).
+                let only_range = !cb.instructions.iter().any(|i| {
+                    matches!(
+                        i,
+                        Insn::StmtFallback(..)
+                            | Insn::BlockingAssign(..)
+                            | Insn::BlockingAssignRange(..)
+                            | Insn::BlockingAssignRangeDyn(..)
+                            | Insn::BlockingAssignBitDyn(..)
+                            | Insn::BlockingAssignArray(..)
+                            | Insn::BlockingAssignArrayRange(..)
+                            | Insn::NbaAssignArray(..)
+                            | Insn::NbaAssignArrayRange(..)
+                            | Insn::NbaAssignRangeDyn(..)
+                    )
+                });
+                if !only_range {
+                    continue;
+                }
+                let all_single = block_nba_sigs(cb)
+                    .iter()
+                    .all(|id| writer_count.get(id).copied().unwrap_or(0) <= 1);
+                if all_single {
+                    safe_blocks += 1;
+                    safe_insns += cb.instructions.len();
+                }
+            }
+            eprintln!(
+                "[PURITY] SAFE-to-unlock (range/bit-dyn, single-writer): {} blocks, {} insns \
+                 -> would raise pure from {} to {} insns ({:.0}% of all edge insns)",
+                safe_blocks,
+                safe_insns,
+                pure_insns,
+                pure_insns + safe_insns,
+                100.0 * (pure_insns + safe_insns) as f64
+                    / (pure_insns + nonpure_insns).max(1) as f64
+            );
+        }
     }
 
     /// Execute bytecode instructions in isolation (no &mut self).

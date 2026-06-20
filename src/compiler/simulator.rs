@@ -12327,7 +12327,9 @@ impl Simulator {
         } else {
             std::time::Duration::MAX
         };
-        let event_skip = std::env::var("XEZIM_EVENT_EDGE").ok().as_deref() == Some("1");
+        // O1 flop-fire skip is default-ON (correct-by-construction snapshot
+        // compare; ~1.1-1.6x on c910). Set XEZIM_EVENT_EDGE=0 to disable.
+        let event_skip = std::env::var("XEZIM_EVENT_EDGE").ok().as_deref() != Some("0");
         let event_meas = std::env::var("XEZIM_EVENT_EDGE_MEASURE").ok().as_deref() == Some("1");
         if event_skip || event_meas {
             self.event_measure = true; // enables stamping + state + phase clock

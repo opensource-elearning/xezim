@@ -29101,7 +29101,7 @@ impl Simulator {
                 return Value::from_u64(len, 32);
             }
 
-            if mname == "get_next_item" {
+            if mname == "get_next_item" && !real_uvm {
                 if let Some(arg) = args.first() {
                     // Create a simple_transaction
                     if let Some(class_def) = self.module.classes.get("simple_transaction").cloned()
@@ -31187,13 +31187,17 @@ impl Simulator {
         // synchronous `exec_method_call` fallback drove `#N` past the queue
         // and kept the design's clock-gen forever block from ever firing.
         //
-        // Drivers (`uvm_driver`-derived) sit in a `forever get_next_item;
-        // ap.write end` that under a non-existent objection model would
-        // block on a disconnected port — skip their run_phase to avoid the
-        // NTCONN fatal.
+        // Drivers (`uvm_driver`-derived) run a `forever get_next_item; drive;
+        // item_done end` rendezvous with the sequencer. With real UVM TLM now
+        // functional (mailbox-backed m_req_fifo + blocking get suspension) the
+        // driver's run_phase can be spawned like any other component; its
+        // get_next_item suspends until a sequence sends an item. Skipping it
+        // only under mock UVM, where the sequencer/fifo aren't modeled and the
+        // driver would block forever on a disconnected port (NTCONN).
+        let real_uvm = self.uses_real_uvm();
         for &c in &components {
             if self.finished { return; }
-            if extends_class(self, c, "uvm_driver") { continue; }
+            if !real_uvm && extends_class(self, c, "uvm_driver") { continue; }
             if !self.spawn_method_task_process(c, "run_phase", &[]) {
                 // Fallback: components whose run_phase is a function, or
                 // classes that don't override it — call inline so they at

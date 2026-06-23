@@ -1744,6 +1744,18 @@ pub struct Simulator {
     /// `ScopePop` sentinel pops and replays the top entry. Per-process (carried
     /// in ProcessContext across suspension).
     task_cleanup: Vec<TaskCleanup>,
+    /// `wait(expr)` whose condition references no signals — it depends on class
+    /// members / locals another same-time process mutates (the UVM sequencer
+    /// arbitration: `wait(m_arb_size != m_lock_arb_size)`,
+    /// `m_wait_for_arbitration_completed`, etc.). Such a process parks here
+    /// (pid + continuation whose first stmt is the Wait) and is re-checked in a
+    /// fixpoint after the same-time batch drains, suspending until the
+    /// condition genuinely flips instead of falsely proceeding.
+    condition_waiters: Vec<(usize, Vec<Statement>)>,
+    /// Bumped whenever a `wait(expr)` condition evaluates true (a parked waiter
+    /// proceeds). The condition-waiter fixpoint uses it to detect "no progress
+    /// this round" and stop (genuine stall).
+    cond_progress: u64,
     /// SV-2023: real-precision time tracker (parallel to integer `time`).
     real_time: f64,
     /// SV-2023: blocked mailbox `get`/`peek` proxies keyed by mailbox handle.
@@ -2890,6 +2902,8 @@ impl Simulator {
             killed_pids: HashSet::default(),
             ref_binding_stack: Vec::new(),
             task_cleanup: Vec::new(),
+            condition_waiters: Vec::new(),
+            cond_progress: 0,
             real_time: 0.0,
             mailbox_get_waiters: HashMap::default(),
             event_triggered_time: HashMap::default(),
@@ -12608,6 +12622,55 @@ impl Simulator {
         if self.fst_writer.is_some() {
             self.fst_write_changes();
         }
+
+        // Condition-waiter fixpoint. A `wait(expr)` on non-signal state (class
+        // members / locals — the UVM sequencer arbitration) parked in
+        // condition_waiters during the batch above instead of falsely
+        // proceeding. Now that the active + NBA regions have settled, re-check
+        // each: a waiter whose condition flipped runs its continuation (and may
+        // flip another's), so iterate to a fixpoint. Stop when a full round
+        // advances no waiter (the rest are waiting on a future-time change).
+        let mut guard = 0u32;
+        while !self.condition_waiters.is_empty() && !self.finished {
+            guard += 1;
+            if guard > 10000 {
+                break;
+            }
+            let prog_before = self.cond_progress;
+            let parked = std::mem::take(&mut self.condition_waiters);
+            for (cpid, cont) in parked {
+                self.event_queue.schedule(self.time, cpid, cont);
+            }
+            let mut batch = self.event_queue.remove(self.time);
+            while !batch.is_empty() && !self.finished {
+                let (bpid, stmts) = batch.remove(0);
+                let t_now = self.time;
+                for (p, s) in batch.drain(..) {
+                    self.event_queue.schedule(t_now, p, s);
+                }
+                self.run_scheduled_process(bpid, &stmts);
+                if !self.is_pid_suspended(bpid) {
+                    self.child_finished(bpid);
+                }
+                if self.event_queue.next_time() == Some(self.time) {
+                    batch = self.event_queue.remove(self.time);
+                } else {
+                    batch.clear();
+                }
+            }
+            if !self.nba_fast.is_empty() || !self.nba_queue.is_empty() {
+                self.apply_nba();
+            }
+            if self.dirty_any {
+                self.settle_combinatorial();
+            }
+            // No waiter proceeded this round → the remainder are genuinely
+            // blocked (future-time change); stop re-checking until the next tick.
+            if self.cond_progress == prog_before {
+                break;
+            }
+        }
+
         self.loop_iters += 1;
     }
 
@@ -13884,6 +13947,7 @@ impl Simulator {
             } = &stmt.kind
             {
                 if self.eval_expr(condition).is_true() {
+                    self.cond_progress = self.cond_progress.wrapping_add(1);
                     self.exec_statement(body);
                     i += 1;
                     continue;
@@ -13903,8 +13967,16 @@ impl Simulator {
                             .push(self.make_event_waiter(pid, sens, cont));
                         return;
                     }
-                    i += 1;
-                    continue;
+                    // No signal sensitivities: the condition depends on class
+                    // members / locals another same-time process mutates (the
+                    // UVM sequencer arbitration). Park as a condition-waiter and
+                    // suspend; the fixpoint in run_one_tick re-checks it after
+                    // the batch drains. (Previously this fell through as if the
+                    // wait were satisfied, which spun m_select_sequence forever.)
+                    let mut cont = vec![stmt.clone()];
+                    cont.extend_from_slice(&stmts[i + 1..]);
+                    self.condition_waiters.push((pid, cont));
+                    return;
                 }
             }
 
@@ -13985,7 +14057,11 @@ impl Simulator {
             }
 
             if let StatementKind::While { condition, body } = &stmt.kind {
-                if self.stmt_has_event_wait(body) {
+                // Descend into a blocking while-body (event waits, #delays, or
+                // blocking method calls like the UVM sequencer arbitration's
+                // m_select_sequence loop) so each iteration suspends via the
+                // suspend-aware path instead of spinning synchronously.
+                if self.stmt_has_event_wait(body) || self.stmt_is_blocking(body) {
                     let cond_val = self.eval_expr(condition).is_true();
                     if cond_val {
                         let body_stmts = match &body.kind {
@@ -14001,6 +14077,30 @@ impl Simulator {
                         i += 1;
                         continue;
                     }
+                }
+            }
+
+            // do...while with a blocking body: run the body once, then continue
+            // as a regular while(cond) body (above). UVM's m_select_sequence is
+            // `do { wait_for_sequences(); m_wait_for_available_sequence(); ... }
+            // while(selected==-1)` — without this it spins synchronously.
+            if let StatementKind::DoWhile { condition, body } = &stmt.kind {
+                if self.stmt_is_blocking(body) {
+                    let body_stmts = match &body.kind {
+                        StatementKind::SeqBlock { stmts, .. } => stmts.clone(),
+                        _ => vec![*body.clone()],
+                    };
+                    let mut cont: Vec<Statement> = body_stmts;
+                    cont.push(Statement::new(
+                        StatementKind::While {
+                            condition: condition.clone(),
+                            body: body.clone(),
+                        },
+                        stmt.span,
+                    ));
+                    cont.extend_from_slice(&stmts[i + 1..]);
+                    self.run_process_stmts(pid, &cont);
+                    return;
                 }
             }
 
@@ -14110,8 +14210,12 @@ impl Simulator {
                         .map_or(false, |e| self.stmt_is_blocking(e))
             }
             StatementKind::Forever { body } => self.stmt_is_blocking(body),
-            StatementKind::For { body, .. } | StatementKind::While { body, .. } => {
-                self.stmt_is_blocking(body)
+            StatementKind::For { body, .. }
+            | StatementKind::While { body, .. }
+            | StatementKind::DoWhile { body, .. }
+            | StatementKind::Foreach { body, .. } => self.stmt_is_blocking(body),
+            StatementKind::Case { items, .. } => {
+                items.iter().any(|it| self.stmt_is_blocking(&it.stmt))
             }
             // `fork...join` / `join_any` suspends the calling process until its
             // children finish, so a task containing one must be inlined (run via
@@ -14123,8 +14227,59 @@ impl Simulator {
             StatementKind::ParBlock { join_type, .. } => {
                 !matches!(join_type, JoinType::JoinNone)
             }
+            // A call to a known blocking task. UVM's TLM/sequencer chains
+            // forward through thin wrappers whose body is a single call (e.g.
+            // uvm_seq_item_pull_port::get_next_item -> `imp.get_next_item(t)`);
+            // such a wrapper is blocking-via-call even though it has no
+            // structural wait, so it must inline for the eventual suspend point
+            // (m_select_sequence's waits, m_req_fifo.peek) to reach the
+            // suspend-aware path. Recognise the canonical blocking task names.
+            StatementKind::Expr(e) => Self::call_is_blocking_task(e),
+            StatementKind::Repeat { body, .. } => self.stmt_is_blocking(body),
             _ => false,
         }
+    }
+
+    /// True if `expr` is a call to one of UVM's canonical blocking tasks (the
+    /// TLM pull / sequencer-arbitration / sequence-control chain). Used to
+    /// inline thin forwarding wrappers so their nested waits suspend.
+    fn call_is_blocking_task(expr: &Expression) -> bool {
+        let func = match &expr.kind {
+            ExprKind::Call { func, .. } => func,
+            _ => return false,
+        };
+        let name = match &func.kind {
+            ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.as_str()),
+            ExprKind::MemberAccess { member, .. } => Some(member.name.as_str()),
+            _ => None,
+        };
+        matches!(
+            name,
+            Some(
+                "get_next_item"
+                    | "try_next_item"
+                    | "peek"
+                    | "get"
+                    | "wait_for_sequences"
+                    | "get_response"
+                    | "finish_item"
+                    | "start_item"
+                    | "wait_for_grant"
+                    | "wait_for_item_done"
+                    | "body"
+                    | "start"
+                    | "m_select_sequence"
+                    | "m_wait_for_available_sequence"
+                    | "m_wait_for_arbitration_completed"
+                    | "m_wait_arb_not_equal"
+                    | "uvm_wait_for_nba_region"
+                    | "execute_item"
+                    | "send_request"
+                    | "do_get"
+                    | "do_peek"
+                    | "transport"
+            )
+        )
     }
 
     fn exec_forever_sched(&mut self, pid: usize, body: &Statement, after: &[Statement]) {
@@ -21996,6 +22151,19 @@ impl Simulator {
                             signal_id: id,
                             value: val.resize_for_assign(w),
                         });
+                    } else if matches!(&lvalue.kind, ExprKind::Ident(h)
+                        if h.path.len() == 1
+                            && self.local_stack.last().map_or(false, |m| m.contains_key(&h.path[0].name.name)))
+                    {
+                        // NBA to a bare procedural local: the deferred queue
+                        // commits in `apply_nba`, OUTSIDE the (possibly
+                        // suspended) process's local frame, so the local would
+                        // never update. Apply immediately — delta-vs-blocking
+                        // timing is unobservable for a process-local. Fixes
+                        // uvm_wait_for_nba_region (`nba <= next_nba;
+                        // wait(nba==next_nba)`), which the sequencer arbitration
+                        // calls via wait_for_sequences.
+                        self.assign_value(lvalue, &val.resize_for_assign(w));
                     } else {
                         self.nba_queue.push(NbaEntry {
                             lhs: Some(lvalue.clone()),
@@ -25670,6 +25838,9 @@ impl Simulator {
             return true;
         }
         if self.event_waiters.iter().any(|w| w.pid == pid) {
+            return true;
+        }
+        if self.condition_waiters.iter().any(|(p, _)| *p == pid) {
             return true;
         }
         false

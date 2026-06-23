@@ -13751,8 +13751,32 @@ impl Simulator {
                 if let ExprKind::Call { func, args } = &expr.kind {
                     if let ExprKind::Ident(h) = &func.kind {
                         if h.path.len() == 1 {
-                            if let Some(td) =
-                                self.module.tasks.get(&h.path[0].name.name).cloned()
+                            // A bare name that is ALSO a method on the current
+                            // `this`'s class must inline via the method path
+                            // (Stage 1b, with this-context), not as a free task —
+                            // UVM registers class methods such as
+                            // m_select_sequence in module.tasks too, and the
+                            // free-task path binds no `this`, so the method's
+                            // member accesses (arb_sequence_q, m_arb_size) would
+                            // resolve against nothing. run_test is never a
+                            // class method, so its handling below is unaffected.
+                            let is_this_method = self
+                                .this_stack
+                                .last()
+                                .copied()
+                                .flatten()
+                                .and_then(|hh| {
+                                    self.heap
+                                        .get(hh)
+                                        .and_then(|o| o.as_ref())
+                                        .map(|inst| inst.class_name.clone())
+                                })
+                                .map_or(false, |cls| {
+                                    self.class_has_method(&cls, &h.path[0].name.name)
+                                });
+                            if let Some(td) = (!is_this_method)
+                                .then(|| self.module.tasks.get(&h.path[0].name.name).cloned())
+                                .flatten()
                             {
                                 // UVM `run_test` -> built-in Rust phaser
                                 // (run_uvm_test_real builds the tree + runs
@@ -13928,8 +13952,22 @@ impl Simulator {
                         if !sens.is_empty() {
                             let mut cont = vec![*body.clone()];
                             cont.extend_from_slice(&stmts[i + 1..]);
-                            self.event_waiters
-                                .push(self.make_event_waiter(pid, sens, cont));
+                            let has_real = sens.iter().any(|s| {
+                                self.signal_name_to_id.contains_key(s.signal_name.as_str())
+                            });
+                            if has_real {
+                                self.event_waiters
+                                    .push(self.make_event_waiter(pid, sens, cont));
+                            } else {
+                                // `@(x)` where x is not a real signal — a
+                                // procedural local that was NBA-assigned then
+                                // waited on (uvm_wait_for_nba_region:
+                                // `nba <= next_nba; @(nba)`). Its event_waiter
+                                // would resolve to no signal_id and park forever;
+                                // treat it as a one-delta yield (its purpose is to
+                                // yield across the NBA region).
+                                self.event_queue.schedule(self.time, pid, cont);
+                            }
                             return;
                         }
                         // Star/empty sensitivity — just execute body
@@ -13953,8 +13991,17 @@ impl Simulator {
                     continue;
                 } else {
                     let sig_names = self.extract_signal_names(condition);
+                    // Only suspend on a signal EDGE for names that are real
+                    // edge-trackable signals (in the compact signal table).
+                    // A `wait(...)` over class members / procedural locals (the
+                    // UVM arbitration's wait(lock_arb_size != m_lock_arb_size),
+                    // wait(m_arb_size != m_lock_arb_size), ...) extracts names
+                    // that look like signals but never fire an edge, so it would
+                    // park in event_waiters forever — route it to the
+                    // condition-waiter fixpoint instead.
                     let sens: Vec<Sensitivity> = sig_names
                         .into_iter()
+                        .filter(|name| self.signal_name_to_id.contains_key(name.as_str()))
                         .map(|name| Sensitivity {
                             signal_name: name,
                             edge: EdgeKind::AnyEdge,
@@ -22155,14 +22202,14 @@ impl Simulator {
                         if h.path.len() == 1
                             && self.local_stack.last().map_or(false, |m| m.contains_key(&h.path[0].name.name)))
                     {
-                        // NBA to a bare procedural local: the deferred queue
+                        // NBA to a bare task-FRAME local: the deferred queue
                         // commits in `apply_nba`, OUTSIDE the (possibly
                         // suspended) process's local frame, so the local would
                         // never update. Apply immediately — delta-vs-blocking
-                        // timing is unobservable for a process-local. Fixes
-                        // uvm_wait_for_nba_region (`nba <= next_nba;
-                        // wait(nba==next_nba)`), which the sequencer arbitration
-                        // calls via wait_for_sequences.
+                        // timing is unobservable for a process-local. (Body-
+                        // declared locals in the signal map are left deferred:
+                        // uvm_wait_for_nba_region does `nba <= next_nba; @(nba)`
+                        // and needs the NBA region to fire the edge.)
                         self.assign_value(lvalue, &val.resize_for_assign(w));
                     } else {
                         self.nba_queue.push(NbaEntry {

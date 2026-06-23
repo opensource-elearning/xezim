@@ -1133,6 +1133,10 @@ struct TaskCleanup {
     saved_break: bool,
     saved_continue: bool,
     prev_static: Option<String>,
+    /// Set when a blocking-method inline (run_process_stmts) pushed a receiver
+    /// `this`/class-context for an `obj.method()` call; pop them on unwind.
+    /// Default false (free-task/same-`this` inlines don't touch those stacks).
+    pushed_method_this: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13646,6 +13650,33 @@ impl Simulator {
                             if let Some(td) =
                                 self.module.tasks.get(&h.path[0].name.name).cloned()
                             {
+                                // UVM `run_test` -> built-in Rust phaser
+                                // (run_uvm_test_real builds the tree + runs
+                                // phases). The source uvm_root::run_test needs
+                                // method `this` it never gets here and uses a
+                                // fork/wait phaser the scheduler can't advance.
+                                // Only route when a concrete test is named (a
+                                // run_test("x") arg OR +UVM_TESTNAME): with no
+                                // test, the source path's behavior is preserved
+                                // (e.g. chapter-16 16.17--expect-uvm calls bare
+                                // run_test() and must not hit the NOTEST fatal).
+                                if td.name.name.name == "run_test" && self.uses_real_uvm() {
+                                    let tn = args.first().and_then(|a| {
+                                        if let ExprKind::StringLiteral(s) = &a.kind {
+                                            Some(s.clone())
+                                        } else {
+                                            None
+                                        }
+                                    });
+                                    let has_plus = self.plusargs.iter().any(|a| {
+                                        Self::plusarg_payload(a)
+                                            .starts_with("UVM_TESTNAME=")
+                                    });
+                                    if tn.is_some() || has_plus {
+                                        self.run_uvm_test_real(tn);
+                                        return;
+                                    }
+                                }
                                 if self.stmts_have_blocking(&td.items) {
                                     let cleanup = self.bind_task_frame(&td, args);
                                     self.task_cleanup.push(cleanup);
@@ -13657,6 +13688,69 @@ impl Simulator {
                                     cont.extend_from_slice(&stmts[i + 1..]);
                                     self.run_process_stmts(pid, &cont);
                                     return;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Stage 1b: a call to a blocking CLASS METHOD (a `task` with a
+            // top-level wait/#/@/forever in its body) — bare `m(args)` on the
+            // current `this`, or `obj.m(args)` — is INLINED like the free-task
+            // case above: bind the frame, splice body + ScopePop + the rest,
+            // recurse. The method's waits then suspend the process instead of
+            // spinning to the loop cap. Without this, run_phase bodies that call
+            // e.g. `collect_data()` (`forever @clk`) or `seq.start()` run
+            // synchronously and hang at t=0. Non-blocking methods (functions, or
+            // tasks with no top-level wait) keep the synchronous path.
+            if let StatementKind::Expr(expr) = &stmt.kind {
+                if let ExprKind::Call { func, args } = &expr.kind {
+                    // (receiver_handle, method_name, this_changes)
+                    let resolved: Option<(usize, String, bool)> = match &func.kind {
+                        ExprKind::Ident(h) if h.path.len() == 1 => self
+                            .this_stack
+                            .last()
+                            .copied()
+                            .flatten()
+                            .map(|hh| (hh, h.path[0].name.name.clone(), false)),
+                        ExprKind::Ident(h) if h.path.len() == 2 => self
+                            .eval_ident_handle(&h.path[0].name.name)
+                            .map(|hh| (hh, h.path[1].name.name.clone(), true)),
+                        ExprKind::MemberAccess { expr: recv, member } => self
+                            .eval_handle_expr(recv)
+                            .map(|hh| (hh, member.name.clone(), true)),
+                        _ => None,
+                    };
+                    if let Some((rh, mn, this_changes)) = resolved {
+                        if rh != 0 {
+                            let cls = self
+                                .heap
+                                .get(rh)
+                                .and_then(|o| o.as_ref())
+                                .map(|inst| inst.class_name.clone());
+                            if let Some(cls) = cls {
+                                if let Some((td, mclass)) =
+                                    self.resolve_class_task(&cls, &mn)
+                                {
+                                    if self.stmts_have_blocking(&td.items) {
+                                        let mut cleanup = self.bind_task_frame(&td, args);
+                                        if this_changes {
+                                            self.this_stack.push(Some(rh));
+                                            self.class_context_stack
+                                                .push(Some(mclass));
+                                            cleanup.pushed_method_this = true;
+                                        }
+                                        self.task_cleanup.push(cleanup);
+                                        let mut cont: Vec<Statement> = td.items.clone();
+                                        cont.push(Statement::new(
+                                            StatementKind::ScopePop,
+                                            stmt.span,
+                                        ));
+                                        cont.extend_from_slice(&stmts[i + 1..]);
+                                        self.run_process_stmts(pid, &cont);
+                                        return;
+                                    }
                                 }
                             }
                         }
@@ -21915,7 +22009,16 @@ impl Simulator {
                                 Some(&self.module.typedefs),
                             );
                             self.widths.insert(name.name.clone(), w);
-                            let rv = v.resize(w);
+                            let mut rv = v.resize(w);
+                            // Preserve declared signedness: `resize` yields an
+                            // unsigned Value, so a `for (int i = ...; i >= 0;
+                            // --i)` loop var would read as unsigned and `i >= 0`
+                            // would be always-true -> infinite descending loop
+                            // (hit by UVM apply_config_settings, and any
+                            // count-down loop).
+                            if super::elaborate::is_type_signed(data_type) {
+                                rv.is_signed = true;
+                            }
                             // Declare the loop variable in the current call
                             // frame's local scope (highest read/write
                             // precedence) so its init, the step, and condition
@@ -21936,6 +22039,22 @@ impl Simulator {
                         }
                     }
                 }
+                // Loop vars declared signed (`for (int i = ...)`): the step
+                // (`--i`, `i = i-1`) can write back an unsigned result, which
+                // would make `i >= 0` always-true and spin a descending loop.
+                // Re-assert their signedness after each step (cheap, only for
+                // signed-typed for-decl vars).
+                let signed_loop_vars: Vec<String> = init
+                    .iter()
+                    .filter_map(|fi| match fi {
+                        ForInit::VarDecl { data_type, name, .. }
+                            if super::elaborate::is_type_signed(data_type) =>
+                        {
+                            Some(name.name.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect();
                 let loop_limit: u64 = std::env::var("XEZIM_LOOP_LIMIT")
                     .ok()
                     .and_then(|s| s.parse().ok())
@@ -21961,6 +22080,17 @@ impl Simulator {
                     self.continue_flag = false;
                     for s in step {
                         self.exec_expr_stmt(s);
+                    }
+                    for nm in &signed_loop_vars {
+                        if let Some(frame) = self.local_stack.last_mut() {
+                            if let Some(v) = frame.get_mut(nm) {
+                                v.is_signed = true;
+                                continue;
+                            }
+                        }
+                        if let Some(v) = self.signals.get_mut(nm) {
+                            v.is_signed = true;
+                        }
                     }
                 }
             }
@@ -28084,6 +28214,56 @@ impl Simulator {
                 &h.path[0].name.name,
                 &h.path[1].name.name,
             ),
+            // Flattened `ClassName::static_handle.member` (3+ segments, e.g.
+            // the uvm_root singleton `cs.get_root().m_children` reached through
+            // a static `m_inst`, parsed as `Ident[svc, m_inst, m_children]`).
+            // The `len==2` arm only covers a variable base; a static-handle
+            // head needs the static cell resolved first, else this access keys
+            // to a stale/empty store and reads as if unset (the UVM `NOCOMP`).
+            ExprKind::Ident(h)
+                if h.path.len() >= 3
+                    && self.module.classes.contains_key(&h.path[0].name.name) =>
+            {
+                let n = h.path.len();
+                let mut handle = match self
+                    .static_prop_key(&h.path[0].name.name, &h.path[1].name.name)
+                    .and_then(|k| self.class_statics.get(&k))
+                    .and_then(|v| v.to_u64())
+                {
+                    Some(x) => x as usize,
+                    None => return None,
+                };
+                // Walk any intermediate object segments (`Class::h.a.b.member`).
+                for seg in &h.path[2..n - 1] {
+                    if handle == 0 {
+                        return None;
+                    }
+                    handle = match self
+                        .heap
+                        .get(handle)
+                        .and_then(|o| o.as_ref())
+                        .and_then(|i| i.properties.get(&seg.name.name))
+                        .and_then(|v| v.to_u64())
+                    {
+                        Some(x) => x as usize,
+                        None => return None,
+                    };
+                }
+                if handle == 0 {
+                    return None;
+                }
+                let member = &h.path[n - 1].name.name;
+                let cn = self
+                    .heap
+                    .get(handle)
+                    .and_then(|x| x.as_ref())
+                    .map(|i| i.class_name.clone())?;
+                if self.class_assoc_member(&cn, member) {
+                    Some(format!("{}#{}", handle, member))
+                } else {
+                    None
+                }
+            }
             ExprKind::MemberAccess { expr: base, member } => {
                 if let ExprKind::Ident(bh) = &base.kind {
                     if bh.path.len() == 1 {
@@ -28169,6 +28349,25 @@ impl Simulator {
             // member property (also a handle). Enables deep object chains
             // like `obj.sub_obj.queue`.
             ExprKind::MemberAccess { expr: base, member } => {
+                // `ClassName::static_handle` base — the static property holds
+                // an object handle. The recursive `eval_handle_expr(base)`
+                // below would treat the class name as a variable (via
+                // `eval_ident_handle`) and fail. Resolve the static cell here
+                // so that `ClassName::h.assoc_member` (e.g. the uvm_root
+                // singleton reached through a static `m_inst`) yields the same
+                // handle a local copy of that handle would, and the assoc
+                // store keys to `<handle>#member` consistently.
+                if let ExprKind::Ident(bh) = &base.kind {
+                    if bh.path.len() == 1
+                        && self.module.classes.contains_key(&bh.path[0].name.name)
+                    {
+                        return self
+                            .static_prop_key(&bh.path[0].name.name, &member.name)
+                            .and_then(|key| self.class_statics.get(&key))
+                            .and_then(|v| v.to_u64())
+                            .map(|h| h as usize);
+                    }
+                }
                 let bh = self.eval_handle_expr(base)?;
                 if bh == 0 {
                     return None;
@@ -28214,6 +28413,32 @@ impl Simulator {
             }
         }
         false
+    }
+
+    /// Find a class TASK method named `method` in `start_class` or an ancestor.
+    /// Returns its declaration + the defining class name. Used by the process
+    /// scheduler to INLINE a blocking method call so its internal waits
+    /// (`forever @clk`, `#delay`, `wait`, sequence handshakes) suspend the
+    /// process instead of spinning. Returns None for functions (they cannot
+    /// consume time, so they keep the synchronous path) or unknown methods.
+    fn resolve_class_task(
+        &self,
+        start_class: &str,
+        method: &str,
+    ) -> Option<(crate::ast::decl::TaskDeclaration, String)> {
+        use crate::ast::decl::ClassMethodKind;
+        let mut cur = Some(start_class.to_string());
+        while let Some(cn) = cur {
+            let cd = self.module.classes.get(&cn)?;
+            if let Some(m) = cd.methods.get(method) {
+                if let ClassMethodKind::Task(t) = &m.kind {
+                    return Some((t.clone(), cn));
+                }
+                return None;
+            }
+            cur = cd.extends.clone();
+        }
+        None
     }
 
     /// Is `name` a static method of `class_name` or any ancestor?
@@ -28364,6 +28589,32 @@ impl Simulator {
                 }
                 if find_config_db(expr) {
                     return self.exec_config_db(mname, args);
+                }
+            }
+
+            // A user-defined method takes precedence over a same-named
+            // array/queue builtin when the receiver is a class INSTANCE that
+            // defines that method. UVM's uvm_queue/uvm_pool define
+            // size()/push_back()/get()/etc. as real methods; dispatching the
+            // queue builtin on the handle (treating the object itself as a
+            // collection) returns garbage and corrupts the resource pool.
+            // Gate on `expr_assoc_name(expr).is_none()` so a member-collection
+            // receiver (`obj.member` / bare `member`) still takes the builtin
+            // path below — only a plain class-handle receiver is rerouted.
+            if Self::is_array_builtin_method(mname) && self.expr_assoc_name(expr).is_none() {
+                if let Some(h) = self.eval_handle_expr(expr) {
+                    if h != 0 {
+                        let cn = self
+                            .heap
+                            .get(h)
+                            .and_then(|o| o.as_ref())
+                            .map(|i| i.class_name.clone());
+                        if let Some(cn) = cn {
+                            if self.class_has_method(&cn, mname) {
+                                return self.exec_method_call(h, mname, args);
+                            }
+                        }
+                    }
                 }
             }
 
@@ -29559,6 +29810,10 @@ impl Simulator {
     /// inline cleanup exactly.
     fn unwind_task_frame(&mut self, c: TaskCleanup) {
         self.current_static_task = c.prev_static;
+        if c.pushed_method_this {
+            self.this_stack.pop();
+            self.class_context_stack.pop();
+        }
         self.ref_binding_stack.pop();
         self.local_iface_aliases.pop();
         self.continue_flag = c.saved_continue;
@@ -29693,11 +29948,24 @@ impl Simulator {
                     }
                 }
                 _ => {
-                    let val = if i < args.len() {
+                    let mut val = if i < args.len() {
                         self.eval_expr(&args[i])
+                    } else if let Some(def) = &port.default {
+                        // Caller omitted this arg → apply the formal's default
+                        // value (was incorrectly using 0). e.g. UVM
+                        // uvm_sequence_base::start(..., int this_priority = -1):
+                        // a missing arg must be -1, not 0.
+                        self.eval_expr(def)
                     } else {
                         Value::zero(32)
                     };
+                    // Preserve the formal's declared signedness so a negative
+                    // default/arg compares signed (`this_priority < -1` must be
+                    // false for -1); without it the param reads unsigned and
+                    // UVM's start() fatals SEQPRI. Mirrors the for-loop var fix.
+                    if super::elaborate::is_type_signed(&port.data_type) {
+                        val.is_signed = true;
+                    }
                     locals.insert(port.name.name.clone(), val);
                 }
             }
@@ -29753,6 +30021,7 @@ impl Simulator {
             saved_break,
             saved_continue,
             prev_static,
+            pushed_method_this: false,
         }
     }
 
@@ -30636,9 +30905,20 @@ impl Simulator {
         self.record_output(line.clone());
         self.stdout_writeln(&line);
 
-        // Construct the top-level test component and give it the conventional
-        // instance name so `uvm_report_*` context strings read correctly.
-        let handle_val = self.instantiate_class(&test_def, &[]).to_u64().unwrap_or(0) as usize;
+        // Construct the top-level test component with the conventional instance
+        // name. Pass the name as the constructor's first arg (uvm_component::new
+        // is `new(name, parent)`): an EMPTY arg list makes name="" / parent=null,
+        // and that path loops in the source `new()` (after building the phase
+        // domain). The factory bridge always passes (name, parent), which is why
+        // factory-created components construct cleanly; mirror it here.
+        let name_arg = Expression::new(
+            ExprKind::StringLiteral("uvm_test_top".to_string()),
+            crate::ast::Span::dummy(),
+        );
+        let handle_val = self
+            .instantiate_class(&test_def, std::slice::from_ref(&name_arg))
+            .to_u64()
+            .unwrap_or(0) as usize;
         if let Some(Some(inst)) = self.heap.get_mut(handle_val) {
             inst.properties
                 .insert("m_name".to_string(), Value::from_string("uvm_test_top"));
@@ -32628,11 +32908,21 @@ impl Simulator {
                         {
                             continue;
                         }
-                        let val = if i < args.len() {
+                        let mut val = if i < args.len() {
                             self.eval_expr(&args[i])
+                        } else if let Some(def) = &port.default {
+                            // Caller omitted this arg → apply the formal's
+                            // default (was using 0). UVM uvm_sequence_base::
+                            // start(..., int this_priority = -1): missing arg
+                            // must be -1, not 0, else `this_priority < -1`
+                            // (read unsigned) fatals SEQPRI.
+                            self.eval_expr(def)
                         } else {
                             Value::zero(32)
                         };
+                        if super::elaborate::is_type_signed(&port.data_type) {
+                            val.is_signed = true;
+                        }
                         locals.insert(port.name.name.clone(), val);
                     }
                     if let Some(rn) = &fn_ret_name {

@@ -28602,10 +28602,6 @@ impl Simulator {
         lvalue: &Expression,
         rvalue: &Expression,
     ) -> bool {
-        let rhs_name = match &rvalue.kind {
-            ExprKind::Ident(h) if h.path.len() == 1 => h.path[0].name.name.clone(),
-            _ => return false,
-        };
         // (handle, prop) for the target. `prop` for arrays encodes the
         // index as `"vif_arr[<idx>]"` so existing single-key storage
         // can stash per-index bindings (LRM §25.10).
@@ -28681,11 +28677,57 @@ impl Simulator {
         let prop_info = self.module.classes.get(&class_name)
             .and_then(|cd| cd.virtual_iface_properties.get(prop_base).cloned());
         let Some((_iface_t, modport)) = prop_info else { return false; };
+        // RHS resolution (LRM §25.9):
+        //   - `null` clears the binding so `vif == null` reads true again
+        //     (a stale binding otherwise kept it non-null after re-assignment).
+        //   - a direct interface-instance ident binds to that instance.
+        //   - another virtual interface (`v2 = v` / `v2 = obj.v`) copies that
+        //     vif's CURRENT bound interface, not the variable name (without
+        //     this the copy bound to a name that resolves to nothing -> X).
+        if matches!(&rvalue.kind, ExprKind::Null) {
+            self.virtual_iface_bindings.remove(&(handle, prop));
+            return true;
+        }
+        let Some(rhs_name) = self.resolve_vif_rhs_name(rvalue) else { return false; };
         // Record the binding. Subsequent `obj.<prop>.<member>` accesses
         // will follow it; the modport (if any) is consulted at write
         // time to emit a direction warning.
         self.virtual_iface_bindings.insert((handle, prop), (rhs_name, modport));
         true
+    }
+
+    /// Resolve a virtual-interface RHS expression to the bound interface
+    /// instance name (LRM §25.9). A bare/member ident that is itself a bound
+    /// virtual interface yields its current target (vif-to-vif copy); a plain
+    /// interface-instance ident yields its own name. Returns None when the RHS
+    /// is neither (so the caller falls back to a normal value assignment).
+    fn resolve_vif_rhs_name(&self, rvalue: &Expression) -> Option<String> {
+        match &rvalue.kind {
+            // `v` — a bound vif of the current `this`, else a direct instance.
+            ExprKind::Ident(h) if h.path.len() == 1 => {
+                let raw = h.path[0].name.name.clone();
+                if let Some(th) = self.this_stack.last().copied().flatten() {
+                    if let Some((b, _)) = self.virtual_iface_bindings.get(&(th, raw.clone())) {
+                        return Some(b.clone());
+                    }
+                }
+                Some(raw)
+            }
+            // `obj.v` — a bound vif of another object.
+            ExprKind::Ident(h) if h.path.len() == 2 => {
+                let oh = self.eval_ident_handle(&h.path[0].name.name).unwrap_or(0);
+                self.virtual_iface_bindings
+                    .get(&(oh, h.path[1].name.name.clone()))
+                    .map(|(b, _)| b.clone())
+            }
+            ExprKind::MemberAccess { expr, member } => {
+                let oh = self.eval_handle_expr(expr).unwrap_or(0);
+                self.virtual_iface_bindings
+                    .get(&(oh, member.name.clone()))
+                    .map(|(b, _)| b.clone())
+            }
+            _ => None,
+        }
     }
 
     /// Resolve a `(handle, prop)` virtual-interface binding to its bound

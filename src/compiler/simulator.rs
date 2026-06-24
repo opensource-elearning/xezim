@@ -1118,6 +1118,7 @@ struct ProcessContext {
     return_value: Option<Value>,
     break_flag: bool,
     continue_flag: bool,
+    return_flag: bool,
     // Carried so a task that suspends mid-body keeps its full call context
     // (needed once blocking task/method calls are inlined into the process
     // statement stream — see `task_cleanup` and `StatementKind::ScopePop`).
@@ -1137,6 +1138,7 @@ struct TaskCleanup {
     array_params: Vec<String>,
     saved_break: bool,
     saved_continue: bool,
+    saved_return: bool,
     prev_static: Option<String>,
     /// Set when a blocking-method inline (run_process_stmts) pushed a receiver
     /// `this`/class-context for an `obj.method()` call; pop them on unwind.
@@ -1737,6 +1739,14 @@ pub struct Simulator {
     dollar_bound: Vec<i64>,
     break_flag: bool,
     continue_flag: bool,
+    /// Set by a `return` (alongside break_flag). Distinguishes a task/function
+    /// `return` from a loop `break`: a return must unwind to the enclosing
+    /// task's `ScopePop` boundary (which clears it via `saved_return`), whereas
+    /// a `break` only exits the nearest loop. Without this, an inlined blocking
+    /// task's `return` leaked break_flag past its ScopePop into the caller's
+    /// continuation (UVM m_wait_for_available_sequence's `return` skipped the
+    /// m_select_sequence do-while's m_choose_next_request call).
+    return_flag: bool,
     rs_return_flag: bool,
     /// SV-2023: target named block for `disable <name>` propagation.
     disable_target: Option<String>,
@@ -2902,6 +2912,7 @@ impl Simulator {
             dollar_bound: Vec::new(),
             break_flag: false,
             continue_flag: false,
+            return_flag: false,
             rs_return_flag: false,
             disable_target: None,
             killed_pids: HashSet::default(),
@@ -13559,6 +13570,7 @@ impl Simulator {
             return_value: self.return_value.clone(),
             break_flag: self.break_flag,
             continue_flag: self.continue_flag,
+            return_flag: self.return_flag,
             local_iface_aliases: self.local_iface_aliases.clone(),
             ref_binding_stack: self.ref_binding_stack.clone(),
             queue_frame_saves: self.queue_frame_saves.clone(),
@@ -13574,6 +13586,7 @@ impl Simulator {
         self.return_value = ctx.return_value;
         self.break_flag = ctx.break_flag;
         self.continue_flag = ctx.continue_flag;
+        self.return_flag = ctx.return_flag;
         self.local_iface_aliases = ctx.local_iface_aliases;
         self.ref_binding_stack = ctx.ref_binding_stack;
         self.queue_frame_saves = ctx.queue_frame_saves;
@@ -13589,6 +13602,7 @@ impl Simulator {
             && ctx.return_value.is_none()
             && !ctx.break_flag
             && !ctx.continue_flag
+            && !ctx.return_flag
         {
             self.process_contexts.remove(&pid);
         } else {
@@ -13602,6 +13616,7 @@ impl Simulator {
     fn run_events_until(&mut self, target: u64) {
         let saved_pid = self.current_pid;
         let saved_break = self.break_flag;
+        let saved_return = self.return_flag;
         loop {
             // Advance to the EARLIEST of: event_queue, clock_generators,
             // and delayed-update queue (so a `#10` from inside an initial
@@ -13668,6 +13683,7 @@ impl Simulator {
         }
         self.current_pid = saved_pid;
         self.break_flag = saved_break;
+        self.return_flag = saved_return;
     }
 
     fn run_scheduled_process(&mut self, pid: usize, stmts: &[Statement]) {
@@ -13734,6 +13750,26 @@ impl Simulator {
         let mut i = 0;
         while i < stmts.len() && !self.finished {
             let stmt = &stmts[i];
+
+            // An inlined task/method `return` (return_flag set) must unwind to
+            // the enclosing task's `ScopePop` sentinel, skipping the rest of the
+            // task body in between (including blocking statements like the
+            // `fork...join` after UVM m_wait_for_available_sequence's `return`).
+            // The ScopePop runs `unwind_task_frame`, which restores the caller's
+            // saved break/continue/return flags — consuming the return. Without
+            // this, return_flag/break_flag leaked past the ScopePop and skipped
+            // the caller's next real statement (m_select_sequence's m_choose).
+            if self.return_flag {
+                if let StatementKind::ScopePop = &stmt.kind {
+                    if let Some(c) = self.task_cleanup.pop() {
+                        self.unwind_task_frame(c);
+                    } else {
+                        self.return_flag = false;
+                    }
+                }
+                i += 1;
+                continue;
+            }
 
             // Expand SeqBlocks: flatten begin/end so that timing controls and waits
             // inside them are properly handled with process suspension.
@@ -20640,6 +20676,23 @@ impl Simulator {
                         return if fired { Value::ones(1) } else { Value::zero(1) };
                     }
                 }
+                // LRM process-class state: `<process_handle>.status` returns the
+                // state enum {FINISHED=0, RUNNING=1, WAITING=2, SUSPENDED=3,
+                // KILLED=4}. xezim doesn't model `process` objects, so
+                // `process::self()` yields a null handle. UVM's sequencer
+                // arbitration prunes queued requests whose process_id.status is
+                // in {KILLED,FINISHED}; a null handle would read 0 (==FINISHED)
+                // and spuriously drop a live sequence (SEQREQZMB → lost item /
+                // data=0). A queued requester is by construction alive (blocked
+                // in wait_for_grant), so report RUNNING for a process handle
+                // (any value that is not a live class instance on the heap).
+                if member.name == "status" {
+                    let h = self.eval_expr(expr).to_u64().unwrap_or(0) as usize;
+                    let is_class_obj = self.heap.get(h).and_then(|o| o.as_ref()).is_some();
+                    if !is_class_obj {
+                        return Value::from_u64(1, 32); // process::RUNNING
+                    }
+                }
                 // `ClassName::static_prop` — explicit static property read.
                 if let ExprKind::Ident(hier) = &expr.kind {
                     if hier.path.len() == 1 {
@@ -20951,7 +21004,9 @@ impl Simulator {
     }
 
     pub fn exec_statement(&mut self, stmt: &Statement) {
-        if self.finished || self.time > self.max_time || self.break_flag || self.continue_flag {
+        if self.finished || self.time > self.max_time || self.break_flag || self.continue_flag
+            || self.return_flag
+        {
             return;
         }
         match &stmt.kind {
@@ -22843,6 +22898,7 @@ impl Simulator {
                     self.return_value = Some(self.eval_expr(e));
                 }
                 self.break_flag = true;
+                self.return_flag = true;
             }
             StatementKind::Disable(name) => {
                 self.disable_target = Some(name.name.clone());
@@ -30217,12 +30273,14 @@ impl Simulator {
         self.return_value = None;
         let saved_break = self.break_flag;
         let saved_continue = self.continue_flag;
+        let saved_return = self.return_flag;
         self.break_flag = false;
         self.continue_flag = false;
+        self.return_flag = false;
         // Execute function body
         for stmt in &fd.items {
             self.exec_statement(stmt);
-            if self.return_value.is_some() {
+            if self.return_value.is_some() || self.return_flag {
                 break;
             }
         }
@@ -30254,6 +30312,7 @@ impl Simulator {
         // flags so the function body can't terminate the caller's loop/block.
         self.break_flag = saved_break;
         self.continue_flag = saved_continue;
+        self.return_flag = saved_return;
         self.pop_and_restore_queue_frame();
         result
     }
@@ -30264,7 +30323,7 @@ impl Simulator {
         // Execute task body
         for stmt in &td.items {
             self.exec_statement(stmt);
-            if self.return_value.is_some() {
+            if self.return_value.is_some() || self.return_flag {
                 break;
             }
         }
@@ -30316,6 +30375,7 @@ impl Simulator {
             self.module.arrays.remove(param_name);
         }
         self.break_flag = c.saved_break;
+        self.return_flag = c.saved_return;
         self.pop_and_restore_queue_frame();
     }
 
@@ -30474,8 +30534,10 @@ impl Simulator {
         self.return_value = None;
         let saved_break = self.break_flag;
         let saved_continue = self.continue_flag;
+        let saved_return = self.return_flag;
         self.break_flag = false;
         self.continue_flag = false;
+        self.return_flag = false;
         let prev_static = self.current_static_task.take();
         if matches!(td.lifetime, Some(crate::ast::types::Lifetime::Static)) {
             self.current_static_task = Some(td.name.name.name.clone());
@@ -30486,6 +30548,7 @@ impl Simulator {
             array_params,
             saved_break,
             saved_continue,
+            saved_return,
             prev_static,
             pushed_method_this: false,
         }
@@ -31318,6 +31381,7 @@ impl Simulator {
                                 return_value: None,
                                 break_flag: false,
                                 continue_flag: false,
+                                return_flag: false,
                                 local_iface_aliases: Vec::new(),
                                 ref_binding_stack: Vec::new(),
                                 queue_frame_saves: Vec::new(),
@@ -33441,8 +33505,10 @@ impl Simulator {
                     // (exec_statement bails when either flag is set).
                     let saved_break = self.break_flag;
                     let saved_continue = self.continue_flag;
+                    let saved_return = self.return_flag;
                     self.break_flag = false;
                     self.continue_flag = false;
+                    self.return_flag = false;
                     self.this_stack.push(Some(handle));
                     self.local_stack.push(locals);
                     self.class_context_stack.push(Some(cname.clone()));
@@ -33469,13 +33535,14 @@ impl Simulator {
                     self.local_iface_aliases.push(iface_alias_frame);
                     for stmt in body {
                         self.exec_statement(stmt);
-                        if self.break_flag {
+                        if self.break_flag || self.return_flag {
                             break;
                         }
                     }
                     self.local_iface_aliases.pop();
                     self.break_flag = saved_break;
                     self.continue_flag = saved_continue;
+                    self.return_flag = saved_return;
                     self.class_context_stack.pop();
                     let implicit = fn_ret_name.as_ref().and_then(|rn| {
                         self.local_stack.last().and_then(|m| m.get(rn).cloned())

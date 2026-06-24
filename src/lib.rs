@@ -8,6 +8,7 @@
 
 pub mod compiler;
 pub mod multikernel;
+pub mod should_fail_lint;
 
 // Re-export xezim-core surface so existing `xezim::...` paths keep working.
 pub use xezim_core::{
@@ -81,6 +82,18 @@ pub fn simulate_multi(
         source_paths,
         defines,
     )?;
+
+    // Second-pass `should_fail` lint (additive — reuses the elaboration above,
+    // no extra cost; does not alter elaborate/simulate behavior). Rejecting
+    // here makes `:type: simulation` should_fail tests exit non-zero too, not
+    // just the `--compile` path.
+    {
+        let dv: Vec<&SourceDefinition> = definitions.values().collect();
+        let lint = should_fail_lint::lint_should_fail(&dv, &elab);
+        if !lint.is_empty() {
+            return Err(lint.join("; "));
+        }
+    }
 
     // Drop the parsed-AST table now that elaborate has produced ElaboratedModule.
     // Nothing downstream (Simulator::new, sim.run, SDF parse) needs it. Without

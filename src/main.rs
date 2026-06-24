@@ -1027,6 +1027,16 @@ fn main() {
             &defines,
         ) {
             Ok((_defs, mut elab)) => {
+                // Second-pass `should_fail` lint (additive — does not alter the
+                // elaboration above): reject illegal SV the main path accepts.
+                let dv: Vec<&xezim::SourceDefinition> = _defs.values().collect();
+                let lint = xezim::should_fail_lint::lint_should_fail(&dv, &elab);
+                if !lint.is_empty() {
+                    for e in &lint {
+                        eprintln!("error: {}", e);
+                    }
+                    std::process::exit(1);
+                }
                 println!("Elaboration successful");
                 if let Some(ref out) = _output_file {
                     // The serialized artifact format flattens always_blocks /

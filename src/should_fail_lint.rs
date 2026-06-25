@@ -14,8 +14,9 @@
 use xezim_core::ast::decl::{
     ClassDeclaration, ClassItem, ClassMethodKind, ClassQualifier, ModuleItem, TypedefDeclaration,
 };
-use xezim_core::ast::expr::{ExprKind, NumberLiteral};
-use xezim_core::ast::types::DataType;
+use xezim_core::ast::expr::{Expression, ExprKind, NumberLiteral, RangeKind};
+use xezim_core::ast::stmt::{Statement, StatementKind};
+use xezim_core::ast::types::{DataType, PackedDimension};
 use xezim_core::elaborate::ElaboratedModule;
 use xezim_core::SourceDefinition;
 
@@ -26,7 +27,14 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
     for def in defs {
         match def {
             SourceDefinition::Class(c) => check_class(c, &mut errs),
-            SourceDefinition::Typedef(t) => check_typedef(t, elab, &mut errs),
+            SourceDefinition::Typedef(t) => {
+                check_typedef(t, elab, &mut errs);
+                // Width-identifier check is restricted to TOP-LEVEL typedefs
+                // (no enclosing module scope), where every value parameter is
+                // global and present in `elab.parameters` — so an unresolved
+                // width identifier is definitely undeclared.
+                check_struct_typedef_widths(t, elab, &mut errs);
+            }
             SourceDefinition::Module(m) => {
                 for it in &m.items {
                     check_module_item(it, elab, &mut errs);
@@ -55,6 +63,167 @@ fn check_module_item(item: &ModuleItem, elab: &ElaboratedModule, errs: &mut Vec<
         ModuleItem::TypedefDeclaration(t) => check_typedef(t, elab, errs),
         ModuleItem::DataDeclaration(d) => check_enum_type(&d.data_type, elab, errs),
         ModuleItem::NetDeclaration(d) => check_enum_type(&d.data_type, elab, errs),
+        ModuleItem::AlwaysConstruct(a) => {
+            for_each_stmt_expr(&a.stmt, &mut |e| check_zero_slice(e, elab, errs));
+        }
+        ModuleItem::InitialConstruct(i) => {
+            for_each_stmt_expr(&i.stmt, &mut |e| check_zero_slice(e, elab, errs));
+        }
+        ModuleItem::ContinuousAssign(ca) => {
+            for (l, r) in &ca.assignments {
+                for_each_expr(l, &mut |e| check_zero_slice(e, elab, errs));
+                for_each_expr(r, &mut |e| check_zero_slice(e, elab, errs));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// §11.5.1: the width of an indexed part-select (`[base +: w]` / `[base -: w]`)
+/// must be a positive constant — a width that constant-folds to 0 is illegal.
+fn check_zero_slice(e: &Expression, elab: &ElaboratedModule, errs: &mut Vec<String>) {
+    if let ExprKind::RangeSelect { kind, right, .. } = &e.kind {
+        if matches!(kind, RangeKind::IndexedUp | RangeKind::IndexedDown) {
+            if let Some(0) =
+                xezim_core::elaborate::const_eval_i64_with_params(right, Some(&elab.parameters))
+            {
+                errs.push(
+                    "indexed part-select has zero width (LRM 1800-2017 §11.5.1)".to_string(),
+                );
+            }
+        }
+    }
+}
+
+/// Visit every sub-expression of `e` (pre-order), calling `f` on each.
+fn for_each_expr(e: &Expression, f: &mut dyn FnMut(&Expression)) {
+    f(e);
+    match &e.kind {
+        ExprKind::Unary { operand, .. } => for_each_expr(operand, f),
+        ExprKind::Binary { left, right, .. } => {
+            for_each_expr(left, f);
+            for_each_expr(right, f);
+        }
+        ExprKind::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            for_each_expr(condition, f);
+            for_each_expr(then_expr, f);
+            for_each_expr(else_expr, f);
+        }
+        ExprKind::Concatenation(xs) => xs.iter().for_each(|x| for_each_expr(x, f)),
+        ExprKind::Replication { count, exprs } => {
+            for_each_expr(count, f);
+            exprs.iter().for_each(|x| for_each_expr(x, f));
+        }
+        ExprKind::Call { func, args } => {
+            for_each_expr(func, f);
+            args.iter().for_each(|x| for_each_expr(x, f));
+        }
+        ExprKind::SystemCall { args, .. } => args.iter().for_each(|x| for_each_expr(x, f)),
+        ExprKind::Inside { expr, ranges } => {
+            for_each_expr(expr, f);
+            ranges.iter().for_each(|x| for_each_expr(x, f));
+        }
+        ExprKind::MemberAccess { expr, .. } => for_each_expr(expr, f),
+        ExprKind::Index { expr, index } => {
+            for_each_expr(expr, f);
+            for_each_expr(index, f);
+        }
+        ExprKind::RangeSelect {
+            expr, left, right, ..
+        } => {
+            for_each_expr(expr, f);
+            for_each_expr(left, f);
+            for_each_expr(right, f);
+        }
+        ExprKind::Range(a, b) => {
+            for_each_expr(a, f);
+            for_each_expr(b, f);
+        }
+        ExprKind::Paren(x) => for_each_expr(x, f),
+        ExprKind::AssignExpr { lvalue, rvalue } => {
+            for_each_expr(lvalue, f);
+            for_each_expr(rvalue, f);
+        }
+        _ => {}
+    }
+}
+
+/// Walk every expression contained in a statement (and its sub-statements).
+fn for_each_stmt_expr(stmt: &Statement, f: &mut dyn FnMut(&Expression)) {
+    match &stmt.kind {
+        StatementKind::Expr(e) => for_each_expr(e, f),
+        StatementKind::BlockingAssign { lvalue, rvalue } => {
+            for_each_expr(lvalue, f);
+            for_each_expr(rvalue, f);
+        }
+        StatementKind::NonblockingAssign {
+            lvalue,
+            rvalue,
+            delay,
+        } => {
+            for_each_expr(lvalue, f);
+            for_each_expr(rvalue, f);
+            if let Some(d) = delay {
+                for_each_expr(d, f);
+            }
+        }
+        StatementKind::If {
+            condition,
+            then_stmt,
+            else_stmt,
+            ..
+        } => {
+            for_each_expr(condition, f);
+            for_each_stmt_expr(then_stmt, f);
+            if let Some(e) = else_stmt {
+                for_each_stmt_expr(e, f);
+            }
+        }
+        StatementKind::Case { expr, items, .. } => {
+            for_each_expr(expr, f);
+            for it in items {
+                for_each_stmt_expr(&it.stmt, f);
+            }
+        }
+        StatementKind::For {
+            condition,
+            step,
+            body,
+            ..
+        } => {
+            if let Some(c) = condition {
+                for_each_expr(c, f);
+            }
+            step.iter().for_each(|s| for_each_expr(s, f));
+            for_each_stmt_expr(body, f);
+        }
+        StatementKind::Foreach { array, body, .. } => {
+            for_each_expr(array, f);
+            for_each_stmt_expr(body, f);
+        }
+        StatementKind::While { condition, body }
+        | StatementKind::DoWhile { body, condition } => {
+            for_each_expr(condition, f);
+            for_each_stmt_expr(body, f);
+        }
+        StatementKind::Repeat { count, body } => {
+            for_each_expr(count, f);
+            for_each_stmt_expr(body, f);
+        }
+        StatementKind::Forever { body } => for_each_stmt_expr(body, f),
+        StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+            stmts.iter().for_each(|s| for_each_stmt_expr(s, f));
+        }
+        StatementKind::TimingControl { stmt, .. } => for_each_stmt_expr(stmt, f),
+        StatementKind::Wait { condition, stmt } => {
+            for_each_expr(condition, f);
+            for_each_stmt_expr(stmt, f);
+        }
+        StatementKind::Return(Some(e)) => for_each_expr(e, f),
         _ => {}
     }
 }
@@ -149,6 +318,86 @@ fn check_typedef(t: &TypedefDeclaration, elab: &ElaboratedModule, errs: &mut Vec
                 t.name.name, n
             ));
         }
+    }
+}
+
+/// §6.18/§7.2: a packed-struct/union typedef whose member width references a
+/// bare, undeclared identifier (e.g. `typedef struct packed { reg [A-1:0] a; }`
+/// with no `A` in scope). Top-level only (see caller). Conservative: only
+/// arithmetic-shaped width expressions are inspected, and an identifier counts
+/// as declared if it is a known value parameter or a type-ish name.
+fn check_struct_typedef_widths(
+    t: &TypedefDeclaration,
+    elab: &ElaboratedModule,
+    errs: &mut Vec<String>,
+) {
+    let DataType::Struct(su) = &t.data_type else {
+        return;
+    };
+    for m in &su.members {
+        let mut ids = Vec::new();
+        dim_idents(&m.data_type, &mut ids);
+        for id in ids {
+            if !value_ident_declared(&id, elab) {
+                errs.push(format!(
+                    "typedef '{}': struct member width references undeclared identifier '{}' \
+                     (LRM 1800-2017 §6.18)",
+                    t.name.name, id
+                ));
+            }
+        }
+    }
+}
+
+fn value_ident_declared(id: &str, elab: &ElaboratedModule) -> bool {
+    elab.parameters.contains_key(id)
+        || elab.typedefs.contains_key(id)
+        || elab.enum_members.contains_key(id)
+}
+
+/// Collect single-segment identifiers from the packed-dimension range
+/// expressions of a data type (only the `[msb:lsb]` of a vector/implicit type).
+fn dim_idents(dt: &DataType, out: &mut Vec<String>) {
+    let dims = match dt {
+        DataType::IntegerVector { dimensions, .. } => dimensions,
+        DataType::Implicit { dimensions, .. } => dimensions,
+        _ => return,
+    };
+    for d in dims {
+        if let PackedDimension::Range { left, right, .. } = d {
+            collect_idents(left, out);
+            collect_idents(right, out);
+        }
+    }
+}
+
+/// Conservatively collect bare (single-segment) identifiers from an arithmetic
+/// expression. Only descends pure operator/paren/conditional trees — never into
+/// calls, indexing, or member access — so a function-call or array-based width
+/// is never mistaken for an undeclared identifier.
+fn collect_idents(e: &Expression, out: &mut Vec<String>) {
+    match &e.kind {
+        ExprKind::Ident(h) => {
+            if h.path.len() == 1 {
+                out.push(h.path[0].name.name.clone());
+            }
+        }
+        ExprKind::Unary { operand, .. } => collect_idents(operand, out),
+        ExprKind::Binary { left, right, .. } => {
+            collect_idents(left, out);
+            collect_idents(right, out);
+        }
+        ExprKind::Paren(x) => collect_idents(x, out),
+        ExprKind::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            collect_idents(condition, out);
+            collect_idents(then_expr, out);
+            collect_idents(else_expr, out);
+        }
+        _ => {}
     }
 }
 

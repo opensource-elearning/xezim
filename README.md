@@ -36,9 +36,16 @@ Current capabilities include:
 * Test execution framework
 * Waveform / trace dumps — VCD (`$dumpfile`/`$dumpvars`), XTrace v1.0 (`--xtrace`,
   optional zstd compression + scope filtering), and AITRACE-T (`--aitrace`)
-* UVM 1.2 runtime support with `-DUVM_NO_DPI`, demonstrated by running the
-  `riscv-dv` instruction generator end-to-end (random RV32IMC programs that
-  assemble cleanly with `riscv64-unknown-elf-as -march=rv32imc_zicsr_zifencei`)
+* **UVM run-phase execution** (Accellera 1800.2-2017, with `-DUVM_NO_DPI`) — a real
+  UVM testbench runs end-to-end: build → connect → topology → `run_phase` stimulus →
+  sequencer↔driver TLM handshake → packet collection → objection-driven termination →
+  report summary. The reference testbench (GettingVerilatorStartedWithUVM) reaches exact
+  Verilator parity, and 32/35 UVM 1800.2-2017 example testbenches pass. Multiple top
+  modules (`-s hdl_top -s hvl_top`) and virtual-interface `config_db` are supported.
+  See [docs/uvm-guide.md](docs/uvm-guide.md).
+* UVM 1.2 runtime support, also demonstrated by running the `riscv-dv` instruction
+  generator end-to-end (random RV32IMC programs that assemble cleanly with
+  `riscv64-unknown-elf-as -march=rv32imc_zicsr_zifencei`)
 * Event-driven edge gating (`XEZIM_EVENT_EDGE=1`) — opt-in skip of clocked
   flop fires whose data inputs haven't changed; 1.13-1.30× wall on the C910 /
   C906 hello / memcpy / cmark benchmarks, correct-by-construction
@@ -93,6 +100,13 @@ golden expectations:
 | XuanTie C906 (single-core) | memcpy ×50 | — | 99s | **88s** (1.13×) |
 | XuanTie C906 | cmark ×1 (INIT_ZERO=1) | 295294 cycles | 714s | **587s** (1.22×) |
 | riscv-dv (UVM 1.2) | `+num_of_tests=10` random RV32IMC | — | — | 10/10 assemble clean |
+
+UVM 1800.2-2017 run-phase (see [docs/uvm-guide.md](docs/uvm-guide.md)):
+
+| Testbench | Result |
+|---|---|
+| GettingVerilatorStartedWithUVM (`data0`/`data1`/`random`/`many_random`) | 4/4 — exact Verilator parity (monitors agree, `UVM_ERROR`/`UVM_FATAL` = 0) |
+| sv-tests UVM 1800.2-2017 example suite | 32/35 pass (3 out of scope: deprecated UVM-1.0 macros, DPI backdoor) |
 
 ---
 
@@ -151,7 +165,8 @@ Common options:
 |---|---|
 | `-D<MACRO>[=val]` | Define a preprocessor macro |
 | `-I<dir>` | Add an include directory |
-| `--top <module>` | Select the top-level module |
+| `--simulate` | Run the simulation (vs `--parse` / `--compile` / `--preprocess`) |
+| `-s <module>` | Select a top-level module. Repeat for multiple roots (e.g. `-s hdl_top -s hvl_top`); xezim elaborates them all under a synthetic wrapper |
 | `--max-time <N>` | Stop simulation at time `N` |
 | `+trace`, `+<plusarg>` | Passed through to `$value$plusargs` / `$test$plusargs` |
 | `--sdf <file>` `--sdf-{min,typ,max}` | Annotate standard delays |

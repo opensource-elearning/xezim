@@ -54,11 +54,13 @@ Current capabilities include:
 
 # Project Structure
 
-xezim is split across two repos; `xezim-core` is vendored here as a submodule:
+xezim is split across two repos that live **side by side**; this repo depends on
+`xezim-core` via a relative path (`../xezim-core`) — it is a sibling directory, not a
+submodule:
 
 ```
-xezim-core/   — shared library: parser, elaboration, value, SDF, VCD sink (submodule)
-./            — bytecode interpreter + simulator (this repo, binary: xezim)
+../xezim-core/  — shared library: parser, elaboration, value, SDF, VCD sink (sibling repo)
+./              — bytecode interpreter + simulator (this repo, binary: xezim)
 ```
 
 This repo:
@@ -74,7 +76,7 @@ This repo:
 │   └── main.rs            — CLI entry point (binary: xezim)
 ├── tests/                 — Rust integration tests + SV compliance suite
 ├── examples/
-└── Cargo.toml             — depends on xezim-core (path = xezim-core, a submodule)
+└── Cargo.toml             — depends on xezim-core (path = ../xezim-core, a sibling repo)
 ```
 
 ### Components
@@ -125,13 +127,21 @@ These tests help verify correctness against real-world Verilog/SystemVerilog edg
 
 Install Rust: https://www.rust-lang.org/tools/install
 
-`xezim-core` is vendored as a git submodule under this repo (`xezim-core/`,
-referenced by `path = "xezim-core"`), so clone recursively:
+This repo depends on `xezim-core` as a **sibling directory** (Cargo references it via
+`path = "../xezim-core"`), so clone both repos side by side into the same parent:
 
 ```bash
-git clone --recursive git@github.com:<you>/xezim.git
+git clone git@github.com:<you>/xezim-core.git
+git clone git@github.com:<you>/xezim.git
 cd xezim
-# (if already cloned non-recursively: git submodule update --init)
+```
+
+Expected layout:
+
+```
+<parent>/
+├── xezim-core/   — shared library (parser, elaboration, value, SDF, VCD)
+└── xezim/        — this repo (binary: xezim)
 ```
 
 Build the simulator:

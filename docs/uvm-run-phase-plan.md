@@ -249,3 +249,27 @@ sequence arbitration/lock/grab. None are needed for `data0_test` M3.
   synchronously (exec_method_in_class_hierarchy) instead of inlined. Next:
   extend run_process_stmts' blocking-call inline to class methods (P0), then
   un-skip the driver + sequencer↔driver TLM rendezvous (P4) + objections (P3).
+
+### 2026-06-28 — M2/M3 packet+report parity (branch `uvm-handshake`)
+- GVS **data0_test AND data1_test now hit EXACT Verilator parity**: both monitors
+  COLLECTED PACKETS=76, coverage=152, UVM_ERROR=0, clean `$finish` at t=1555.
+- **Root cause of the prior output-monitor=1 bug:** `name_resolve_hint` (the
+  transient sibling-scope hint `resolve_hier_name` records while resolving DOTTED
+  names) is NOT part of the per-process ProcessContext, so it leaked across
+  scheduled processes. After a UVM monitor resolved `ivif.clk` (hint→"ivif"), the
+  top clock generator `always #5 clk<=~clk` ran and its bare `clk` resolved to
+  `ivif.clk` — freezing the real `clk` net + its fanout (`ovif.clk`,
+  `pipe_top.clk`) while only `ivif.clk` kept toggling. So the output monitor
+  (watches `ovif.clk`) and the DUT (watches `pipe_top.clk`) stalled once the
+  design went quiet (~t=45). The same leak produced the spurious
+  `UVM/FIELD_OP/GET_USER_HOOK` UVM_ERRORs.
+- **Fix (commit 0d1f0ad):** save+clear+restore `name_resolve_hint` in
+  `run_scheduled_process` so each process resolves unqualified names from a clean
+  slate. A second-layer guard in `resolve_nba_target` (context-free caching of
+  ambiguous leaves) was tried and REVERTED — it shifted timing to 78/78.
+- Validated: sv-tests static **1013/14 with IDENTICAL fail set** (baseline diff,
+  zero regression), **c910 hello TEST PASSED**.
+- **Remaining for full reference parity:** the test-topology table prints empty
+  (`this.sprint(printer)` yields nothing) and there is no `--- UVM Report
+  Summary ---` block (report-server INFO/WARNING/ERROR/FATAL counts). Both are
+  separate features, not blockers for the stimulus/collection milestone.

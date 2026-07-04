@@ -17,8 +17,11 @@ fn unique_so_path(stem: &str) -> PathBuf {
 fn compile_dpi_lib(c_file: &str, stem: &str) -> PathBuf {
     let c_path = manifest_path(c_file);
     let so_path = unique_so_path(stem);
-    // Include the xezim root dir for vpi_user.h and svdpi.h
-    let include_dir = manifest_path("");
+    // Include the xezim/include dir for vpi_user.h, svdpi.h,
+    // sv_vpi_user.h, veriuser.h. The headers live in their own
+    // subdirectory so users don't accidentally pick up unrelated
+    // xezim source files via the include search path.
+    let include_dir = manifest_path("include");
     let status = Command::new("cc")
         .arg("-shared")
         .arg("-fPIC")
@@ -119,6 +122,17 @@ fn dpi_vpi_backdoor_compliance_test() {
     assert!(
         log.contains("RESULT: PASSED"),
         "missing RESULT: PASSED for vpi_backdoor_compliance:\n{}",
+        log
+    );
+}
+
+#[test]
+fn dpi_uvm_test() {
+    let so = compile_dpi_lib("tests/dpi/uvm_dpi_test.c", "uvm_dpi_test");
+    let log = run_xezim_with_dpi(&so, "tests/dpi/uvm_dpi_test.sv");
+    assert!(
+        log.contains("RESULT: PASSED"),
+        "uvm_dpi_test missing RESULT: PASSED:\n{}",
         log
     );
 }

@@ -115,6 +115,13 @@ pub fn simulate_multi(
     sim.fst_scopes = fst_scopes.to_vec();
     sim.set_plusargs(plusargs);
     sim.set_threads(threads);
+    // Default argv for vpi_get_vlog_info — the real CLI passes the
+    // full tokenized list via set_args() in main.rs. Here we hand
+    // back just "xezim" + plusargs so UVM's tool banner works for
+    // library users that never go through the binary.
+    let mut argv: Vec<String> = vec!["xezim".to_string()];
+    argv.extend(plusargs.iter().cloned());
+    sim.set_args(&argv);
 
     if let Some(sdf_path) = sdf_file {
         let sdf_content = std::fs::read_to_string(sdf_path)

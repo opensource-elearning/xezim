@@ -850,6 +850,10 @@ fn main() {
                         sim.fst_scopes = fst_scopes.clone();
                         sim.set_plusargs(&plusargs);
                         sim.set_threads(threads);
+                        // Pass the full CLI invocation (binary name +
+                        // all args + plusargs) so vpi_get_vlog_info
+                        // can hand the same argv back to UVM.
+                        sim.set_args(&args);
                         let compilation_start = std::time::Instant::now();
                         sim.compile();
                         eprintln!(

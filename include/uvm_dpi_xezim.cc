@@ -163,4 +163,11 @@ int uvm_hdl_release_and_read(char *path, p_vpi_vecval value) {
 #include "uvm_common.c"
 #include "uvm_regex.cc"
 #include "uvm_svcmd_dpi.c"
+
+// uvm_hdl_polling.c ships with uvm-core and 1800.2-2020.3.1, but is
+// absent from 1800.2-2017-1.0 (whose uvm_dpi.cc has this include
+// `#ifdef UVM_PLI_POLLING_ENABLE`'d out by default). Define
+// XEZIM_UVM_POLLING via -D when the source dir provides the file.
+#ifdef XEZIM_UVM_POLLING
 #include "uvm_hdl_polling.c"
+#endif

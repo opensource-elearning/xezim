@@ -22586,6 +22586,32 @@ impl Simulator {
                 if self.try_bind_virtual_iface(lvalue, rvalue) {
                     return;
                 }
+                // IEEE 1800-2017 §10.9.2/§10.10: an assignment pattern written
+                // to an aggregate whose leaves are separate signals (unpacked
+                // struct, unpacked array of them, associative array) must be
+                // spread, not collapsed into one packed value. This is also
+                // what makes a DECLARATION initializer work — elaboration
+                // lowers `T v[int] = '{...}` to `v = '{...}` in an initial block.
+                if let ExprKind::AssignmentPattern(items) = &rvalue.kind {
+                    let spread = if let ExprKind::Ident(lh) = &lvalue.kind {
+                        let lname = self.resolve_hier_name(lh);
+                        self.assign_pattern_aggregate(&lname, items)
+                    } else {
+                        // `assoc[key] = '{...}` resolves its key precisely;
+                        // everything else goes through the flattened path.
+                        self.assign_pattern_element(lvalue, rvalue)
+                            || match self.flat_member_name(lvalue) {
+                                Some(flat) => self.assign_pattern_flat(&flat, items),
+                                None => false,
+                            }
+                    };
+                    if spread {
+                        if !self.in_edge_block {
+                            self.settle_combinatorial();
+                        }
+                        return;
+                    }
+                }
                 // `collection[key] = new(...)`: a bare `new` assigned to an
                 // associative-array / array ELEMENT of class type. The element's
                 // class comes from the COLLECTION's element type (keyed by the
@@ -25738,16 +25764,19 @@ impl Simulator {
                                 // nested structs, unpacked arrays, enum labels,
                                 // strings and reals, in declaration order.
                                 if let Some(flat) = self.flat_member_name(arg) {
-                                    let rendered = if self.module.var_decl_types.contains_key(&flat) {
-                                        self.render_p_var(&flat)
-                                    } else if self.signal_name_to_id.contains_key(flat.as_str()) {
-                                        // A sub-path (`cmb[10].str`): render the leaf.
+                                    // Whole variables AND flattened sub-paths
+                                    // (`arr[0]`, `c.nodes`, `cmb[10].str`) are
+                                    // rendered from their declared type.
+                                    let mut rendered = self.render_p_var(&flat);
+                                    if rendered.is_none()
+                                        && self.signal_name_to_id.contains_key(flat.as_str())
+                                    {
+                                        // Untyped leaf: render the raw value.
                                         let is_str = self.string_signals.contains(&flat);
-                                        self.get_signal_value_by_name(&flat)
-                                            .map(|v| Self::render_p_value(&v, is_str))
-                                    } else {
-                                        None
-                                    };
+                                        rendered = self
+                                            .get_signal_value_by_name(&flat)
+                                            .map(|v| Self::render_p_value(&v, is_str));
+                                    }
                                     if let Some(mut s) = rendered {
                                         // §21.2.1.7: an implementation may cap the
                                         // string (at least 1024 chars); on truncation
@@ -30000,11 +30029,312 @@ impl Simulator {
         }
     }
 
+    /// Write one flattened leaf, honouring the declared width / signedness /
+    /// real-ness when the signal is registered. An associative-array element
+    /// has no pre-registered signal, so it is created at its natural width.
+    fn write_leaf_by_name(&mut self, flat: &str, val: Value) {
+        if let Some(&id) = self.signal_name_to_id.get(flat) {
+            let width = self.signal_widths[id];
+            let mut resized = if self.signal_real[id] {
+                if val.is_real { val } else { Value::from_f64(val.to_f64()) }
+            } else if val.is_real {
+                Value::from_u64(val.to_f64() as u64, width)
+            } else {
+                val.resize(width)
+            };
+            resized.is_signed = self.signal_signed[id];
+            self.set_signal_value_by_name(flat, resized);
+            return;
+        }
+        self.set_signal_value_by_name(flat, val);
+    }
+
+    /// Assign `e` to the flattened target `target` of declared type `dt`. When
+    /// `e` is itself an assignment pattern and `dt` an unpacked struct, recurse
+    /// member-wise; otherwise evaluate and write the leaf.
+    fn assign_pattern_or_leaf(&mut self, target: &str, dt: &DataType, e: &Expression) {
+        if let ExprKind::AssignmentPattern(sub) = &e.kind {
+            if !sub.is_empty() {
+                if let DataType::Struct(su) = self.resolve_dt(dt) {
+                    if !su.packed {
+                        self.assign_pattern_into_struct(target, &su, sub);
+                        return;
+                    }
+                }
+            }
+        }
+        let v = self.eval_expr(e);
+        self.write_leaf_by_name(target, v);
+    }
+
+    /// Spread an assignment pattern across the members of the UNPACKED struct
+    /// `su` rooted at `base` (IEEE 1800-2017 §10.9.1): `name:` items bind by
+    /// member name, bare items bind positionally, `default:` fills the rest.
+    fn assign_pattern_into_struct(
+        &mut self,
+        base: &str,
+        su: &crate::ast::types::StructUnionType,
+        items: &[AssignmentPatternItem],
+    ) {
+        let members: Vec<(String, DataType, Vec<crate::ast::types::UnpackedDimension>)> = su
+            .members
+            .iter()
+            .flat_map(|m| {
+                m.declarators.iter().map(move |md| {
+                    (md.name.name.clone(), m.data_type.clone(), md.dimensions.clone())
+                })
+            })
+            .collect();
+
+        let mut by_name: Vec<Option<&Expression>> = vec![None; members.len()];
+        let mut ordered: Vec<&Expression> = Vec::new();
+        let mut default: Option<&Expression> = None;
+        for item in items {
+            match item {
+                AssignmentPatternItem::Named(id, e) => {
+                    if let Some(i) = members.iter().position(|(n, _, _)| *n == id.name) {
+                        by_name[i] = Some(e);
+                    }
+                }
+                AssignmentPatternItem::Default(e) => default = Some(e),
+                AssignmentPatternItem::Ordered(e) => ordered.push(e),
+                _ => {}
+            }
+        }
+
+        for (i, (mname, mdt, dims)) in members.iter().enumerate() {
+            let Some(e) = by_name[i].or_else(|| ordered.get(i).copied()).or(default) else {
+                continue;
+            };
+            let target = format!("{}.{}", base, mname);
+            if dims.is_empty() {
+                self.assign_pattern_or_leaf(&target, mdt, e);
+                continue;
+            }
+            // Array member: an inner pattern supplies one value per element,
+            // anything else (typically `default:`) fills every element.
+            let Some(idxs) = self.member_dim_indices(dims) else { continue };
+            match &e.kind {
+                ExprKind::AssignmentPattern(sub) if !sub.is_empty() => {
+                    for (k, idx) in idxs.iter().enumerate() {
+                        if let Some(se) = sub.get(k) {
+                            self.assign_pattern_or_leaf(
+                                &format!("{}[{}]", target, idx),
+                                mdt,
+                                se.expr(),
+                            );
+                        }
+                    }
+                }
+                _ => {
+                    for idx in idxs {
+                        self.assign_pattern_or_leaf(&format!("{}[{}]", target, idx), mdt, e);
+                    }
+                }
+            }
+        }
+    }
+
+    /// IEEE 1800-2017 §10.9.2 / §10.10: an assignment pattern assigned to an
+    /// aggregate whose leaves each live in their OWN signal — an unpacked
+    /// struct, an unpacked array of unpacked structs, or an associative array —
+    /// must be spread member-/element-/key-wise. Collapsing it into one packed
+    /// value (the scalar path) writes a container signal nobody ever reads, so
+    /// every member stays X and an associative array stays empty.
+    ///
+    /// Returns false when `base` really IS a single signal (a scalar, a packed
+    /// struct, an array of packed elements) — those keep the packed path.
+    fn assign_pattern_aggregate(&mut self, base: &str, items: &[AssignmentPatternItem]) -> bool {
+        if items.is_empty() {
+            return false;
+        }
+        // For an array this is the ELEMENT type; for a scalar, its own type.
+        let Some(dt) = self.module.var_decl_types.get(base).cloned() else { return false };
+
+        // Associative array: `'{key:value, ...}`. `default:` is recorded at
+        // elaboration (`assoc_defaults`) and needs no element write.
+        if self.module.associative_arrays.contains_key(base) {
+            let mut wrote = false;
+            for item in items {
+                if let AssignmentPatternItem::Keyed(k, v) = item {
+                    let kv = self.eval_expr(k);
+                    let key = self.assoc_key_str(base, &kv);
+                    self.assign_pattern_or_leaf(&format!("{}[{}]", base, key), &dt, v);
+                    wrote = true;
+                }
+            }
+            return wrote;
+        }
+
+        let elem_is_unpacked_struct =
+            matches!(self.resolve_dt(&dt), DataType::Struct(ref su) if !su.packed);
+
+        // Fixed unpacked array of unpacked structs: `'{'{...}, '{...}}`.
+        // Queues and dynamic arrays keep the existing (size-tracking) path.
+        if let Some(&(lo, hi, _)) = self.module.arrays.get(base) {
+            if !elem_is_unpacked_struct
+                || hi < lo
+                || self.module.dynamic_arrays.contains(base)
+                || !items.iter().all(|i| matches!(i, AssignmentPatternItem::Ordered(_)))
+            {
+                return false;
+            }
+            let descending = self.module.descending_arrays.contains(base);
+            for (i, item) in items.iter().enumerate() {
+                let idx = if descending { hi - i as i64 } else { lo + i as i64 };
+                if idx < lo || idx > hi {
+                    break;
+                }
+                self.assign_pattern_or_leaf(&format!("{}[{}]", base, idx), &dt, item.expr());
+            }
+            return true;
+        }
+
+        if let DataType::Struct(su) = self.resolve_dt(&dt) {
+            if !su.packed {
+                self.assign_pattern_into_struct(base, &su, items);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// `arr[i] = '{...}` / `assoc[key] = '{...}` where the element is an
+    /// unpacked struct: spread the pattern into that element's members.
+    fn assign_pattern_element(&mut self, lvalue: &Expression, rvalue: &Expression) -> bool {
+        let (ExprKind::Index { expr: b, index }, ExprKind::AssignmentPattern(items)) =
+            (&lvalue.kind, &rvalue.kind)
+        else {
+            return false;
+        };
+        if items.is_empty() {
+            return false;
+        }
+        let ExprKind::Ident(bh) = &b.kind else { return false };
+        let bname = self.resolve_hier_name(bh);
+        let Some(dt) = self.module.var_decl_types.get(&bname).cloned() else { return false };
+        let DataType::Struct(su) = self.resolve_dt(&dt) else { return false };
+        if su.packed {
+            return false;
+        }
+        let iv = self.eval_expr(index);
+        let key = if self.module.associative_arrays.contains_key(&bname) {
+            self.assoc_key_str(&bname, &iv)
+        } else {
+            iv.to_i64().unwrap_or(0).to_string()
+        };
+        self.assign_pattern_into_struct(&format!("{}[{}]", bname, key), &su, items);
+        true
+    }
+
+    /// `c.nodes = '{...}` / `c.nodes[0] = '{...}`: an assignment pattern to a
+    /// flattened sub-path — an unpacked-struct member, or an unpacked array
+    /// member (whole or one element). The type comes from the base variable's
+    /// declaration, since a sub-path has none of its own.
+    fn assign_pattern_flat(&mut self, flat: &str, items: &[AssignmentPatternItem]) -> bool {
+        if items.is_empty() {
+            return false;
+        }
+        let Some((dt, arr)) = self.flat_path_type(flat) else { return false };
+        let DataType::Struct(su) = self.resolve_dt(&dt) else { return false };
+        if su.packed {
+            return false;
+        }
+        // Unindexed array member: one pattern item per element.
+        if let Some(idxs) = arr {
+            if !items.iter().all(|i| matches!(i, AssignmentPatternItem::Ordered(_))) {
+                return false;
+            }
+            for (k, idx) in idxs.iter().enumerate() {
+                let Some(item) = items.get(k) else { break };
+                self.assign_pattern_or_leaf(&format!("{}[{}]", flat, idx), &dt, item.expr());
+            }
+            return true;
+        }
+        self.assign_pattern_into_struct(flat, &su, items);
+        true
+    }
+
+    /// Split a flattened path (`c.nodes[0].str`) into `(segment, index_count)`
+    /// pairs. Dots inside brackets belong to an associative key, not the path.
+    fn split_flat_path(flat: &str) -> Vec<(String, usize)> {
+        let mut out = Vec::new();
+        let mut name = String::new();
+        let mut idx = 0usize;
+        let mut depth = 0usize;
+        for ch in flat.chars() {
+            match ch {
+                '[' => {
+                    depth += 1;
+                    if depth == 1 {
+                        idx += 1;
+                    }
+                }
+                ']' => depth = depth.saturating_sub(1),
+                '.' if depth == 0 => {
+                    out.push((std::mem::take(&mut name), idx));
+                    idx = 0;
+                }
+                _ if depth == 0 => name.push(ch),
+                _ => {}
+            }
+        }
+        out.push((name, idx));
+        out
+    }
+
+    /// Declared type of a flattened SUB-PATH (`c.nodes[0].str`, `cmb[20]`),
+    /// which has no declaration of its own — walk the base variable's declared
+    /// type. The second element holds the element indices when the path still
+    /// names an unindexed unpacked array (so `%p` can print an element list).
+    fn flat_path_type(&self, flat: &str) -> Option<(DataType, Option<Vec<i64>>)> {
+        let segs = Self::split_flat_path(flat);
+        let (base, base_idx) = segs.first()?.clone();
+        // For an array (or associative array) this is already the ELEMENT type.
+        let mut dt = self.module.var_decl_types.get(&base)?.clone();
+        let mut arr: Option<Vec<i64>> = if base_idx > 0
+            || self.module.associative_arrays.contains_key(&base)
+        {
+            None
+        } else {
+            self.module.arrays.get(&base).and_then(|&(lo, hi, _)| {
+                if hi >= lo && hi - lo < 4096 { Some((lo..=hi).collect()) } else { None }
+            })
+        };
+
+        for (seg, nidx) in segs.iter().skip(1) {
+            let DataType::Struct(su) = self.resolve_dt(&dt) else { return None };
+            let (mdt, dims) = su.members.iter().find_map(|m| {
+                m.declarators
+                    .iter()
+                    .find(|md| md.name.name == *seg)
+                    .map(|md| (m.data_type.clone(), md.dimensions.clone()))
+            })?;
+            dt = mdt;
+            arr = if *nidx > 0 || dims.is_empty() {
+                None
+            } else {
+                self.member_dim_indices(&dims)
+            };
+        }
+        Some((dt, arr))
+    }
+
     /// LRM §21.2.1.7 `%p` on the variable `name`: recursively render nested
     /// structs, unpacked arrays, enums, strings and reals in assignment-pattern
-    /// form. `None` if the variable has no recorded declared type.
+    /// form. `None` if neither the variable nor its base has a declared type.
     fn render_p_var(&mut self, name: &str) -> Option<String> {
-        let dt = self.module.var_decl_types.get(name).cloned()?;
+        let Some(dt) = self.module.var_decl_types.get(name).cloned() else {
+            let (dt, arr) = self.flat_path_type(name)?;
+            if let Some(idxs) = arr {
+                let parts: Vec<String> = idxs
+                    .iter()
+                    .map(|i| self.render_p_typed(&format!("{}[{}]", name, i), &dt))
+                    .collect();
+                return Some(format!("'{{{}}}", parts.join(", ")));
+            }
+            return Some(self.render_p_typed(name, &dt));
+        };
         // Associative array -> `'{key:value, ...}` over its populated keys
         // (LRM §21.2.1.7). Elements live in `signals` as `name[key]…`.
         if self.module.associative_arrays.contains_key(name) {

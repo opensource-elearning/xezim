@@ -1216,6 +1216,9 @@ struct TaskCleanup {
     output_bindings: Vec<(String, crate::ast::expr::Expression)>,
     assoc_params: Vec<(String, String)>,
     array_params: Vec<String>,
+    /// `(formal, actual, lo, hi)` for an `output`/`inout`/`ref` ARRAY formal:
+    /// its elements are copied back to the caller's array on return.
+    array_writebacks: Vec<(String, String, i64, i64)>,
     saved_break: bool,
     saved_continue: bool,
     saved_return: bool,
@@ -35204,7 +35207,135 @@ impl Simulator {
         )
     }
 
+    /// Copy a fixed unpacked ARRAY actual into the formal's element signals and
+    /// register the formal as an array so `a[i]` resolves inside the body.
+    /// Returns `(formal, actual, lo, hi)` so an `output`/`inout`/`ref` formal
+    /// can be copied back on return (§13.5.2).
+    ///
+    /// Only `[lo:hi]` range dimensions were handled, and only for tasks, so the
+    /// far commoner `int a[3]` size form silently passed nothing: the body read
+    /// X and a `ref` write never reached the caller.
+    fn bind_array_arg(
+        &mut self,
+        port: &crate::ast::decl::FunctionPort,
+        arg: &Expression,
+    ) -> Option<(String, String, i64, i64)> {
+        use crate::ast::types::UnpackedDimension as UD;
+        if port.dimensions.is_empty() {
+            return None;
+        }
+        let dims = super::elaborate::normalize_unpacked_dims(
+            &port.dimensions,
+            &self.module.parameters,
+            &self.module.typedef_types,
+        );
+        let params = Some(&self.module.parameters);
+        let (lo, hi) = match dims.first()? {
+            UD::Range { left, right, .. } => {
+                let l = super::elaborate::const_eval_i64_with_params(left, params)?;
+                let r = super::elaborate::const_eval_i64_with_params(right, params)?;
+                (l.min(r), l.max(r))
+            }
+            UD::Expression { expr, .. } => {
+                let n = super::elaborate::const_eval_i64_with_params(expr, params)?;
+                if n <= 0 {
+                    return None;
+                }
+                (0, n - 1)
+            }
+            _ => return None,
+        };
+        let ExprKind::Ident(h) = &arg.kind else { return None };
+        let caller = self.resolve_hier_name(h);
+        if !self.module.arrays.contains_key(&caller) {
+            return None;
+        }
+        let param = port.name.name.clone();
+        for idx in lo..=hi {
+            if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", caller, idx)) {
+                self.signals.insert(format!("{}[{}]", param, idx), v);
+            }
+        }
+        let w = self.module.arrays.get(&caller).map(|t| t.2).unwrap_or(32);
+        self.module.arrays.insert(param.clone(), (lo, hi, w));
+        Some((param, caller, lo, hi))
+    }
+
+    /// Copy an array formal's elements back onto the caller's array, then drop
+    /// the formal's element signals.
+    fn writeback_array_args(&mut self, wb: &[(String, String, i64, i64)]) {
+        for (param, caller, lo, hi) in wb {
+            for idx in *lo..=*hi {
+                if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", param, idx)) {
+                    self.set_signal_value_by_name(&format!("{}[{}]", caller, idx), v);
+                }
+            }
+        }
+    }
+
+    /// IEEE 1800-2017 §13.5.4 named arguments (`f(.b(2), .a(1))`) and §13.5.3
+    /// default arguments. Reorders the actuals into FORMAL order and fills any
+    /// omitted formal from its default. Returns `None` when there are no named
+    /// arguments, so callers keep their original slice.
+    ///
+    /// Argument binding is positional everywhere in the simulator, so without
+    /// this a `.name(expr)` actual was evaluated as an opaque expression in
+    /// whatever position it happened to occupy — silently binding the wrong
+    /// formal, or nothing at all.
+    fn normalize_call_args(
+        ports: &[crate::ast::decl::FunctionPort],
+        args: &[Expression],
+    ) -> Option<Vec<Expression>> {
+        if !args.iter().any(|a| matches!(a.kind, ExprKind::NamedArg { .. })) {
+            return None;
+        }
+        let mut bound: Vec<Option<Expression>> = vec![None; ports.len()];
+        let mut pos = 0usize;
+        for a in args {
+            if let ExprKind::NamedArg { name, expr } = &a.kind {
+                if let Some(i) = ports.iter().position(|p| p.name.name == name.name) {
+                    if let Some(e) = expr {
+                        bound[i] = Some((**e).clone());
+                    }
+                }
+            } else if pos < ports.len() {
+                bound[pos] = Some(a.clone());
+                pos += 1;
+            }
+        }
+        // Everything up to the last bound formal must be supplied; a gap is
+        // filled from the formal's default.
+        let last = bound
+            .iter()
+            .enumerate()
+            .filter(|(i, b)| b.is_some() || ports[*i].default.is_some())
+            .map(|(i, _)| i)
+            .max()?;
+        let zero = || {
+            Expression::new(
+                ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
+                    size: None,
+                    signed: false,
+                    base: crate::ast::expr::NumberBase::Decimal,
+                    value: "0".to_string(),
+                    cached_val: std::cell::Cell::new(None),
+                }),
+                crate::ast::Span::dummy(),
+            )
+        };
+        let mut out = Vec::with_capacity(last + 1);
+        for (i, p) in ports.iter().enumerate().take(last + 1) {
+            out.push(match bound[i].take() {
+                Some(e) => e,
+                None => p.default.clone().unwrap_or_else(zero),
+            });
+        }
+        Some(out)
+    }
+
     fn exec_function_call(&mut self, fd: &FunctionDeclaration, args: &[Expression]) -> Value {
+        let normalized = Self::normalize_call_args(&fd.ports, args);
+        let args: &[Expression] = normalized.as_deref().unwrap_or(args);
         // Serve UVM's command-line iterator from `plusargs` regardless of the
         // (stubbed under `-DUVM_NO_DPI`) library body, so `uvm_cmdline_processor`
         // sees the real `+arg=val` list (`+num_of_tests=`, etc.).
@@ -35229,16 +35360,27 @@ impl Simulator {
         // `output`/`inout`/`ref` formals copy back to the caller's actual on
         // return (e.g. `get_int_arg_value(string s, ref int val)`).
         let mut output_bindings: Vec<(String, Expression)> = Vec::new();
+        let mut array_writebacks: Vec<(String, String, i64, i64)> = Vec::new();
         for (i, port) in fd.ports.iter().enumerate() {
-            if matches!(
+            let is_out = matches!(
                 port.direction,
                 PortDirection::Output | PortDirection::Inout | PortDirection::Ref
-            ) && i < args.len()
-            {
-                output_bindings.push((port.name.name.clone(), args[i].clone()));
-            }
+            );
             if i < args.len() && self.bind_queue_param(&port.name.name, &port.dimensions, &args[i]) {
                 continue;
+            }
+            // Unpacked ARRAY formal: functions never bound one, so the body read
+            // X and a `ref` write never reached the caller (§13.5.2).
+            if i < args.len() {
+                if let Some(info) = self.bind_array_arg(port, &args[i]) {
+                    if is_out {
+                        array_writebacks.push(info);
+                    }
+                    continue;
+                }
+            }
+            if is_out && i < args.len() {
+                output_bindings.push((port.name.name.clone(), args[i].clone()));
             }
             let val = if i < args.len() {
                 self.eval_expr(&args[i])
@@ -35285,6 +35427,21 @@ impl Simulator {
                 .and_then(|l| l.get(&ret_name).cloned())
                 .unwrap_or(Value::zero(32))
         };
+        // Array formals copy element-wise; scalars go through `output_bindings`.
+        self.writeback_array_args(&array_writebacks);
+        for (param, ..) in &array_writebacks {
+            let prefix = format!("{}[", param);
+            let keys: Vec<String> = self
+                .signals
+                .keys()
+                .filter(|k| k.starts_with(&prefix))
+                .cloned()
+                .collect();
+            for k in keys {
+                self.signals.remove(&k);
+            }
+            self.module.arrays.remove(param);
+        }
         // Copy `output`/`inout`/`ref` formals back to the caller's actuals
         // before popping this frame's locals.
         let writebacks: Vec<(Value, Expression)> = output_bindings
@@ -35340,6 +35497,8 @@ impl Simulator {
                 self.assign_value(caller_expr, val);
             }
         }
+        let wb = c.array_writebacks.clone();
+        self.writeback_array_args(&wb);
         for (param_name, _caller_name) in &c.assoc_params {
             let prefix = format!("{}[", param_name);
             let keys: Vec<String> = self
@@ -35373,44 +35532,28 @@ impl Simulator {
 
     fn bind_task_frame(&mut self, td: &TaskDeclaration, args: &[Expression]) -> TaskCleanup {
         use crate::ast::types::PortDirection;
+        let normalized = Self::normalize_call_args(&td.ports, args);
+        let args: &[Expression] = normalized.as_deref().unwrap_or(args);
         // Evaluate input args and collect output/ref arg expressions
         let mut locals = HashMap::default();
         let mut output_bindings: Vec<(String, Expression)> = Vec::new();
         let mut assoc_params: Vec<(String, String)> = Vec::new(); // (param_name, caller_array_name)
         let mut array_params: Vec<String> = Vec::new(); // param names with unpacked Range dim
         self.push_queue_frame();
+        let mut array_writebacks: Vec<(String, String, i64, i64)> = Vec::new();
         for (i, port) in td.ports.iter().enumerate() {
-            // Unpacked array parameter (e.g. `int a [2:0]`): copy caller's
-            // array elements into `param[idx]` signals so `a[0]` resolves.
-            if let Some(crate::ast::types::UnpackedDimension::Range { left, right, .. }) =
-                port.dimensions.first()
-            {
-                if i < args.len() {
-                    if let ExprKind::Ident(hier) = &args[i].kind {
-                        let caller_name = self.resolve_hier_name(hier);
-                        let param_name = port.name.name.clone();
-                        let l =
-                            super::elaborate::const_eval_i64_with_params(left, None).unwrap_or(0);
-                        let r =
-                            super::elaborate::const_eval_i64_with_params(right, None).unwrap_or(0);
-                        let (lo, hi) = (l.min(r), l.max(r));
-                        for idx in lo..=hi {
-                            let caller_elem = format!("{}[{}]", caller_name, idx);
-                            let param_elem = format!("{}[{}]", param_name, idx);
-                            if let Some(v) = self.get_signal_value_by_name(&caller_elem) {
-                                self.signals.insert(param_elem, v);
-                            }
-                        }
-                        let w = self
-                            .module
-                            .arrays
-                            .get(&caller_name)
-                            .map(|t| t.2)
-                            .unwrap_or(32);
-                        self.module.arrays.insert(param_name.clone(), (lo, hi, w));
-                        array_params.push(param_name);
-                        continue;
+            // Unpacked array formal (`int a[2:0]` or `int a[3]`): copy the
+            // caller's elements in, and copy them back for an out/inout/ref.
+            if i < args.len() {
+                if let Some(info) = self.bind_array_arg(port, &args[i]) {
+                    if matches!(
+                        port.direction,
+                        PortDirection::Output | PortDirection::Inout | PortDirection::Ref
+                    ) {
+                        array_writebacks.push(info.clone());
                     }
+                    array_params.push(info.0);
+                    continue;
                 }
             }
             let is_assoc = port
@@ -35529,6 +35672,7 @@ impl Simulator {
             self.current_static_task = Some(td.name.name.name.clone());
         }
         TaskCleanup {
+            array_writebacks,
             output_bindings,
             assoc_params,
             array_params,

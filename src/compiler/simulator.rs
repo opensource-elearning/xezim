@@ -20193,6 +20193,17 @@ impl Simulator {
                 val
             }
             ExprKind::Ident(hier) => {
+                // §7.3.2 tagged-union member read (`t.Valid`).
+                if hier.path.len() == 2 {
+                    let base = hier.path[0].name.name.as_str();
+                    if self.active_union_tag.contains_key(base) {
+                        let (base, member) =
+                            (base.to_string(), hier.path[1].name.name.clone());
+                        if let Some(v) = self.tagged_union_member(&base, &member) {
+                            return v;
+                        }
+                    }
+                }
                 // `item.field` inside a `with` filter over a struct queue.
                 if hier.path.len() >= 2 {
                     if let Some(alias) = self.item_alias.clone() {
@@ -20661,6 +20672,20 @@ impl Simulator {
                 }
             }
             ExprKind::Binary { op, left, right } => {
+                // §11.4.5: equality on unpacked structs is member-wise.
+                if matches!(op, BinaryOp::Eq | BinaryOp::Neq) {
+                    if let Some(v) = self.compare_unpacked_structs(left, right) {
+                        return if matches!(op, BinaryOp::Eq) {
+                            v
+                        } else if v.has_unknown() {
+                            v
+                        } else if v.to_u64() == Some(1) {
+                            Value::zero(1)
+                        } else {
+                            Value::ones(1)
+                        };
+                    }
+                }
                 // Short-circuit evaluation for logical operators (IEEE §11.3.5)
                 if matches!(op, BinaryOp::LogAnd | BinaryOp::LogOr) {
                     let l = self.eval_expr_ctx(left, ctx_width);
@@ -21876,19 +21901,28 @@ impl Simulator {
                     if let Some(arg) = args.first() {
                         if let ExprKind::Ident(hier) = &arg.kind {
                             let aname = self.resolve_hier_name(hier);
-                            let has_unpacked = self.module.arrays.contains_key(&aname);
-                            let packed_w = if has_unpacked {
-                                self.module.arrays[&aname].2
-                            } else if let Some(&id) = self.signal_name_to_id.get(aname.as_str()) {
-                                self.signal_widths[id]
-                            } else {
-                                0
-                            };
+                            // §20.7: EVERY unpacked dimension counts, not just
+                            // the first — `int m[2][3]` has two, `int n[2][3][4]`
+                            // three. Only the 1-D table was consulted.
+                            let unpacked_dim =
+                                self.foreach_dims(&aname).map_or(0, |d| d.len()) as u64;
                             if name == "$unpacked_dimensions" {
-                                return Value::from_u64(if has_unpacked { 1 } else { 0 }, 32);
+                                return Value::from_u64(unpacked_dim, 32);
                             }
-                            let packed_dim: u64 = if packed_w > 1 { 1 } else { 0 };
-                            let unpacked_dim: u64 = if has_unpacked { 1 } else { 0 };
+                            let elem_w = self
+                                .module
+                                .arrays
+                                .get(&aname)
+                                .map(|&(_, _, w)| w)
+                                .or_else(|| self.module.arrays_2d.get(&aname).map(|&(_, _, w)| w))
+                                .or_else(|| self.module.arrays_nd.get(&aname).map(|(_, w)| *w))
+                                .or_else(|| {
+                                    self.signal_name_to_id
+                                        .get(aname.as_str())
+                                        .map(|&id| self.signal_widths[id])
+                                })
+                                .unwrap_or(0);
+                            let packed_dim: u64 = if elem_w > 1 { 1 } else { 0 };
                             let total = packed_dim + unpacked_dim;
                             return Value::from_u64(total.max(1), 32);
                         }
@@ -22099,6 +22133,16 @@ impl Simulator {
                 }
             }
             ExprKind::MemberAccess { expr, member } => {
+                // §7.3.2 tagged-union member read (`t.Valid`).
+                if let ExprKind::Ident(h) = &expr.kind {
+                    if h.path.len() == 1 && self.active_union_tag.contains_key(&h.path[0].name.name)
+                    {
+                        let (base, m) = (h.path[0].name.name.clone(), member.name.clone());
+                        if let Some(v) = self.tagged_union_member(&base, &m) {
+                            return v;
+                        }
+                    }
+                }
                 // `item.field` / `item.inner.field` inside a `with` filter over a
                 // struct queue. Fold the whole receiver chain, then swap the
                 // `item` prefix for the element's flat name.
@@ -31353,6 +31397,56 @@ impl Simulator {
     /// LRM §7.12.2: in-place sort/rsort/unique on `arr` with the
     /// per-element key expression `filter` (binds `item` to each
     /// element). Mirrors `reduce_with`'s `item` plumbing.
+    /// IEEE 1800-2017 §11.4.5 / §7.2: `==` and `!=` on unpacked structs compare
+    /// them member by member. Their leaves live in separate signals, so the
+    /// packed-value path compared two container signals that do not exist and
+    /// always yielded X. An X in any leaf makes the result X, as for vectors.
+    /// `None` when either side is not an unpacked struct with storage.
+    fn compare_unpacked_structs(&mut self, lhs: &Expression, rhs: &Expression) -> Option<Value> {
+        let (a, b) = (self.flat_member_name(lhs)?, self.flat_member_name(rhs)?);
+        let dt = self.p_elem_type(&a)?;
+        let DataType::Struct(su) = self.resolve_dt(&dt) else { return None };
+        if !Self::spreads_member_wise(&su) {
+            return None;
+        }
+        if !self.struct_storage_exists(&a, &su) || !self.struct_storage_exists(&b, &su) {
+            return None;
+        }
+        let mut equal = true;
+        for sfx in self.struct_leaf_suffixes(&su) {
+            let av = self.get_signal_value_by_name(&format!("{}.{}", a, sfx));
+            let bv = self.get_signal_value_by_name(&format!("{}.{}", b, sfx));
+            match (av, bv) {
+                (Some(x), Some(y)) => {
+                    if x.has_unknown() || y.has_unknown() {
+                        return Some(Value::new(1)); // X
+                    }
+                    if x != y {
+                        equal = false;
+                    }
+                }
+                _ => return Some(Value::new(1)),
+            }
+        }
+        Some(if equal { Value::ones(1) } else { Value::zero(1) })
+    }
+
+    /// IEEE 1800-2017 §7.3.2: a tagged union stores ONE member at a time. A
+    /// member expression yields the stored value only when that member is the
+    /// active one; reading any other member is not valid and yields X.
+    fn tagged_union_member(&mut self, base: &str, member: &str) -> Option<Value> {
+        let tag = self.active_union_tag.get(base)?.clone();
+        let w = self.lookup_signal_width(base).unwrap_or(32);
+        if tag == member {
+            Some(
+                self.get_signal_value_by_name(base)
+                    .unwrap_or_else(|| Value::new(w)),
+            )
+        } else {
+            Some(Value::new(w))
+        }
+    }
+
     /// IEEE 1800-2017 §7.12.1 array LOCATOR methods. They select elements and
     /// RETURN a queue — none of them modifies the source array.
     fn is_locator_method(m: &str) -> bool {

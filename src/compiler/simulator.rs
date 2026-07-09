@@ -29790,6 +29790,15 @@ impl Simulator {
             return None;
         }
         let vname = h.path[0].name.name.clone();
+        // An ARRAY of structs is not a struct: `%p` must print it as an element
+        // list, and scope-randomize handles it via the array path. Never treat
+        // it as a single aggregate here.
+        if self.module.arrays.contains_key(&vname)
+            || self.module.dynamic_arrays.contains(&vname)
+            || self.module.associative_arrays.contains_key(&vname)
+        {
+            return None;
+        }
         // Field names: a packed struct is registered in `packed_struct_fields`;
         // an unpacked struct's members exist only as individual signals named
         // `<var>.<field>`, so discover those by a direct-child prefix scan.

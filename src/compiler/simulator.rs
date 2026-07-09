@@ -30005,6 +30005,42 @@ impl Simulator {
     /// form. `None` if the variable has no recorded declared type.
     fn render_p_var(&mut self, name: &str) -> Option<String> {
         let dt = self.module.var_decl_types.get(name).cloned()?;
+        // Associative array -> `'{key:value, ...}` over its populated keys
+        // (LRM §21.2.1.7). Elements live in `signals` as `name[key]…`.
+        if self.module.associative_arrays.contains_key(name) {
+            let prefix = format!("{}[", name);
+            // Elements written at run time live in `signals`; elements created
+            // by a declaration initializer live in the compact signal table.
+            let mut keys: Vec<String> = self
+                .signals
+                .keys()
+                .map(|k| k.as_str())
+                .chain(self.signal_name_to_id.keys().map(|k| &**k))
+                .filter_map(|k| k.strip_prefix(prefix.as_str()))
+                .filter_map(|rest| rest.split(']').next())
+                .map(|s| s.to_string())
+                .collect();
+            keys.sort();
+            keys.dedup();
+            // Numeric keys sort numerically, not lexically.
+            if keys.iter().all(|k| k.parse::<i64>().is_ok()) {
+                keys.sort_by_key(|k| k.parse::<i64>().unwrap_or(0));
+            }
+            let string_keyed = self.is_string_keyed_array(name);
+            let parts: Vec<String> = keys
+                .iter()
+                .map(|k| {
+                    let elem = format!("{}[{}]", name, k);
+                    let v = self.render_p_typed(&elem, &dt);
+                    if string_keyed {
+                        format!("\"{}\":{}", k, v)
+                    } else {
+                        format!("{}:{}", k, v)
+                    }
+                })
+                .collect();
+            return Some(format!("'{{{}}}", parts.join(", ")));
+        }
         // Fixed unpacked array -> element list.
         if let Some(&(lo, hi, _)) = self.module.arrays.get(name) {
             if hi >= lo && (hi - lo) < 4096 {

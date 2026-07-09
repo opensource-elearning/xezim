@@ -18881,6 +18881,16 @@ impl Simulator {
                 changed
             }
             ExprKind::Index { expr, index } => {
+                // Element of an unpacked ARRAY OF QUEUES: `q[i][k] = v` writes
+                // element k of the queue `q[i]` (§7.4.5), not a bit of a scalar.
+                if let Some(qn) = self.indexed_queue_base(expr) {
+                    let k = self.eval_expr(index).to_i64().unwrap_or(0);
+                    let elem = format!("{}[{}]", qn, k);
+                    let prev = self.get_signal_value_by_name(&elem);
+                    let changed = prev.as_ref() != Some(val);
+                    self.set_signal_value_by_name(&elem, val.clone());
+                    return changed;
+                }
                 // Ascending packed vector bit-write (`logic [0:7] pa; pa[i]=b`):
                 // label i targets internal bit (W-1)-i (LRM §7.4.1, §11.5.1).
                 if let ExprKind::Ident(h) = &expr.kind {
@@ -20977,6 +20987,15 @@ impl Simulator {
                 r
             }
             ExprKind::Index { expr, index } => {
+                // Element of an unpacked ARRAY OF QUEUES: `q[i][k]` selects
+                // element k of the queue `q[i]` (§7.4.5). Without this the base
+                // resolves to a scalar and `[k]` becomes a bit-select.
+                if let Some(qn) = self.indexed_queue_base(expr) {
+                    let k = self.eval_expr(index).to_i64().unwrap_or(0);
+                    return self
+                        .get_signal_value_by_name(&format!("{}[{}]", qn, k))
+                        .unwrap_or_else(|| Value::new(32));
+                }
                 // Ascending packed vector bit-select (`logic [0:7] pa; pa[i]`):
                 // label i is the MSB end, so it reads internal bit (W-1)-i
                 // (LRM §7.4.1, §11.5.1). Whole-value storage is normal.
@@ -24373,6 +24392,19 @@ impl Simulator {
                     let mut name = self.resolve_hier_name(hier);
                     if let Some(scoped) = self.instance_assoc_member(&name) {
                         name = scoped;
+                    }
+                    // IEEE 1800-2017 §12.7.3: one loop variable per leading
+                    // dimension — `foreach (m[i, j])`. A null entry (`m[, j]`)
+                    // skips that dimension. Only `vars[0]` was ever bound, so
+                    // `j` stayed X and the loop ran over the first dim alone.
+                    if vars.len() >= 2 {
+                        if let Some(dims) = self.foreach_dims(&name) {
+                            if dims.len() >= vars.len() {
+                                self.exec_foreach_nested(&dims[..vars.len()], vars, body);
+                                self.restore_loop_vars(&fe_saved);
+                                return;
+                            }
+                        }
                     }
                     if let Some(var) = vars.first().and_then(|v| v.as_ref()) {
                         self.widths.insert(var.name.clone(), 32);
@@ -29622,6 +29654,78 @@ impl Simulator {
     /// `instr_category[category][$]`), return the compound storage base
     /// `assoc[<keyval>]`. The nested collection then lives under that name and
     /// reuses the ordinary queue/array machinery (`<base>.size`, `<base>[i]`).
+    /// Declared index bounds of `name`, outermost dimension first.
+    fn foreach_dims(&self, name: &str) -> Option<Vec<(i64, i64)>> {
+        if let Some((shape, _)) = self.module.arrays_nd.get(name) {
+            return Some(shape.clone());
+        }
+        if let Some(&(d1, d2, _)) = self.module.arrays_2d.get(name) {
+            return Some(vec![d1, d2]);
+        }
+        self.module.arrays.get(name).map(|&(lo, hi, _)| vec![(lo, hi)])
+    }
+
+    /// Run `body` once per index tuple of `dims`, last dimension varying
+    /// fastest, binding each non-null entry of `vars`.
+    fn exec_foreach_nested(
+        &mut self,
+        dims: &[(i64, i64)],
+        vars: &[Option<crate::ast::Identifier>],
+        body: &Statement,
+    ) {
+        if dims.iter().any(|&(lo, hi)| hi < lo) {
+            return;
+        }
+        for v in vars.iter().flatten() {
+            self.widths.insert(v.name.clone(), 32);
+        }
+        let n = dims.len();
+        let mut idx: Vec<i64> = dims.iter().map(|d| d.0).collect();
+        loop {
+            if self.finished {
+                return;
+            }
+            for (k, v) in vars.iter().enumerate() {
+                if let Some(id) = v {
+                    self.set_loop_var(&id.name, Value::from_u64(idx[k] as u64, 32));
+                }
+            }
+            self.continue_flag = false;
+            self.exec_statement(body);
+            if self.break_flag {
+                return;
+            }
+            self.continue_flag = false;
+            // Odometer: advance the innermost dimension first.
+            let mut k = n;
+            loop {
+                if k == 0 {
+                    return;
+                }
+                k -= 1;
+                idx[k] += 1;
+                if idx[k] <= dims[k].1 {
+                    break;
+                }
+                idx[k] = dims[k].0;
+            }
+        }
+    }
+
+    /// `q[i]` / `q[i][j]` naming an ELEMENT of an unpacked array of queues —
+    /// the element is itself a queue stored under that flat name (§7.4.5).
+    fn indexed_queue_base(&mut self, base: &Expression) -> Option<String> {
+        if !matches!(base.kind, ExprKind::Index { .. }) {
+            return None;
+        }
+        let n = self.flat_member_name(base)?;
+        if self.module.dynamic_arrays.contains(&n) {
+            Some(n)
+        } else {
+            None
+        }
+    }
+
     fn nested_index_name(&mut self, expr: &Expression) -> Option<String> {
         if let ExprKind::Index { expr: base, index } = &expr.kind {
             if let ExprKind::Ident(bh) = &base.kind {
@@ -30426,6 +30530,22 @@ impl Simulator {
     /// structs, unpacked arrays, enums, strings and reals in assignment-pattern
     /// form. `None` if neither the variable nor its base has a declared type.
     fn render_p_var(&mut self, name: &str) -> Option<String> {
+        // A queue / dynamic array prints exactly its `size()` elements — not the
+        // fixed 64-slot buffer it is backed by. Its ELEMENTS (`q[i]` of an
+        // array of queues) have no declared type of their own.
+        if self.module.dynamic_arrays.contains(name) {
+            let dt = self
+                .module
+                .var_decl_types
+                .get(name)
+                .cloned()
+                .or_else(|| self.flat_path_type(name).map(|(d, _)| d))?;
+            let sz = self.get_queue_size(name);
+            let parts: Vec<String> = (0..sz)
+                .map(|i| self.render_p_typed(&format!("{}[{}]", name, i), &dt))
+                .collect();
+            return Some(format!("'{{{}}}", parts.join(", ")));
+        }
         let Some(dt) = self.module.var_decl_types.get(name).cloned() else {
             let (dt, arr) = self.flat_path_type(name)?;
             if let Some(idxs) = arr {
@@ -33057,6 +33177,29 @@ impl Simulator {
                             if self.class_has_method(&cn, mname) {
                                 return self.exec_method_call(h, mname, args);
                             }
+                        }
+                    }
+                }
+            }
+
+            // Element of an unpacked ARRAY OF QUEUES (IEEE 1800-2017 §7.4.5):
+            // `q[i].push_back(x)`, `q[i][j].size()`. The element IS a queue,
+            // stored flat under `q[i]` / `q[i][j]`. The bare-array dispatch
+            // below only accepts an `Ident` receiver, so this would otherwise
+            // fall through and silently do nothing.
+            if matches!(&expr.kind, ExprKind::Index { .. })
+                && (Self::is_array_builtin_method(mname)
+                    || matches!(
+                        mname,
+                        "push_back" | "push_front" | "pop_front" | "pop_back"
+                            | "insert" | "delete" | "sort" | "rsort"
+                            | "reverse" | "shuffle"
+                    ))
+            {
+                if let Some(qn) = self.flat_member_name(expr) {
+                    if self.module.dynamic_arrays.contains(&qn) {
+                        if let Some(res) = self.eval_builtin_method(&qn, mname, args) {
+                            return res;
                         }
                     }
                 }

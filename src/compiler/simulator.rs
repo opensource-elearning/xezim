@@ -18891,6 +18891,13 @@ impl Simulator {
                     self.set_signal_value_by_name(&elem, val.clone());
                     return changed;
                 }
+                // `a[i][key] = v` on an array of associative arrays.
+                if let Some(elem) = self.indexed_assoc_elem(expr, index) {
+                    let prev = self.get_signal_value_by_name(&elem);
+                    let changed = prev.as_ref() != Some(val);
+                    self.set_signal_value_by_name(&elem, val.clone());
+                    return changed;
+                }
                 // Ascending packed vector bit-write (`logic [0:7] pa; pa[i]=b`):
                 // label i targets internal bit (W-1)-i (LRM §7.4.1, §11.5.1).
                 if let ExprKind::Ident(h) = &expr.kind {
@@ -20994,6 +21001,13 @@ impl Simulator {
                     let k = self.eval_expr(index).to_i64().unwrap_or(0);
                     return self
                         .get_signal_value_by_name(&format!("{}[{}]", qn, k))
+                        .unwrap_or_else(|| Value::new(32));
+                }
+                // Element of an unpacked array of ASSOCIATIVE arrays:
+                // `a[i][key]` looks the key up in the assoc array `a[i]`.
+                if let Some(elem) = self.indexed_assoc_elem(expr, index) {
+                    return self
+                        .get_signal_value_by_name(&elem)
                         .unwrap_or_else(|| Value::new(32));
                 }
                 // Ascending packed vector bit-select (`logic [0:7] pa; pa[i]`):
@@ -29665,19 +29679,26 @@ impl Simulator {
         self.module.arrays.get(name).map(|&(lo, hi, _)| vec![(lo, hi)])
     }
 
-    /// Run `body` once per index tuple of `dims`, last dimension varying
-    /// fastest, binding each non-null entry of `vars`.
+    /// Run `body` once per index tuple, last dimension varying fastest.
+    /// IEEE 1800-2017 §12.7.3: a dimension whose loop variable is OMITTED
+    /// (`foreach (m[, j])`) is not traversed at all — only the named ones are.
     fn exec_foreach_nested(
         &mut self,
-        dims: &[(i64, i64)],
+        all_dims: &[(i64, i64)],
         vars: &[Option<crate::ast::Identifier>],
         body: &Statement,
     ) {
-        if dims.iter().any(|&(lo, hi)| hi < lo) {
+        let iterated: Vec<((i64, i64), &crate::ast::Identifier)> = all_dims
+            .iter()
+            .zip(vars)
+            .filter_map(|(d, v)| v.as_ref().map(|id| (*d, id)))
+            .collect();
+        if iterated.is_empty() || iterated.iter().any(|((lo, hi), _)| hi < lo) {
             return;
         }
-        for v in vars.iter().flatten() {
-            self.widths.insert(v.name.clone(), 32);
+        let dims: Vec<(i64, i64)> = iterated.iter().map(|(d, _)| *d).collect();
+        for (_, id) in &iterated {
+            self.widths.insert(id.name.clone(), 32);
         }
         let n = dims.len();
         let mut idx: Vec<i64> = dims.iter().map(|d| d.0).collect();
@@ -29685,10 +29706,8 @@ impl Simulator {
             if self.finished {
                 return;
             }
-            for (k, v) in vars.iter().enumerate() {
-                if let Some(id) = v {
-                    self.set_loop_var(&id.name, Value::from_u64(idx[k] as u64, 32));
-                }
+            for (k, (_, id)) in iterated.iter().enumerate() {
+                self.set_loop_var(&id.name, Value::from_u64(idx[k] as u64, 32));
             }
             self.continue_flag = false;
             self.exec_statement(body);
@@ -29724,6 +29743,28 @@ impl Simulator {
         } else {
             None
         }
+    }
+
+    /// `a[i]` naming an ELEMENT of an unpacked array of ASSOCIATIVE arrays
+    /// (`int a[2][u8_t]`): the element is itself an associative array.
+    fn indexed_assoc_base(&mut self, base: &Expression) -> Option<String> {
+        if !matches!(base.kind, ExprKind::Index { .. }) {
+            return None;
+        }
+        let n = self.flat_member_name(base)?;
+        if self.module.associative_arrays.contains_key(&n) {
+            Some(n)
+        } else {
+            None
+        }
+    }
+
+    /// Flat storage name of `<assoc>[key]` for such an element.
+    fn indexed_assoc_elem(&mut self, base: &Expression, index: &Expression) -> Option<String> {
+        let an = self.indexed_assoc_base(base)?;
+        let kv = self.eval_expr(index);
+        let key = self.assoc_key_str(&an, &kv);
+        Some(format!("{}[{}]", an, key))
     }
 
     fn nested_index_name(&mut self, expr: &Expression) -> Option<String> {
@@ -30339,6 +30380,63 @@ impl Simulator {
         }
     }
 
+    /// Copy every leaf of an unpacked struct from `src` to `dst`.
+    fn copy_unpacked_struct(
+        &mut self,
+        dst: &str,
+        src: &str,
+        su: &crate::ast::types::StructUnionType,
+    ) {
+        for m in &su.members {
+            for md in &m.declarators {
+                let d = format!("{}.{}", dst, md.name.name);
+                let sname = format!("{}.{}", src, md.name.name);
+                if md.dimensions.is_empty() {
+                    if let DataType::Struct(inner) = self.resolve_dt(&m.data_type) {
+                        if Self::spreads_member_wise(&inner) {
+                            self.copy_unpacked_struct(&d, &sname, &inner);
+                            continue;
+                        }
+                    }
+                    if let Some(v) = self.get_signal_value_by_name(&sname) {
+                        self.write_leaf_by_name(&d, v);
+                    }
+                } else if let Some(idxs) = self.member_dim_indices(&md.dimensions) {
+                    for i in idxs {
+                        let (di, si) = (format!("{}[{}]", d, i), format!("{}[{}]", sname, i));
+                        if let Some(v) = self.get_signal_value_by_name(&si) {
+                            self.write_leaf_by_name(&di, v);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Store `arg` into queue element `elem`. An UNPACKED-STRUCT element keeps
+    /// each member in its own signal, so writing one packed value (what
+    /// `push_back` used to do) loses every member.
+    fn queue_store_elem(&mut self, obj_name: &str, elem: &str, arg: &Expression) {
+        if let Some(dt) = self.p_elem_type(obj_name) {
+            if let DataType::Struct(su) = self.resolve_dt(&dt) {
+                if Self::spreads_member_wise(&su) {
+                    if let ExprKind::AssignmentPattern(items) = &arg.kind {
+                        if !items.is_empty() {
+                            self.assign_pattern_into_struct(elem, &su, items);
+                            return;
+                        }
+                    }
+                    if let Some(src) = self.flat_member_name(arg) {
+                        self.copy_unpacked_struct(elem, &src, &su.clone());
+                        return;
+                    }
+                }
+            }
+        }
+        let val = self.queue_eval_arg(obj_name, arg);
+        self.set_signal_value_by_name(elem, val);
+    }
+
     /// IEEE 1800-2017 §10.9.2 / §10.10: an assignment pattern assigned to an
     /// aggregate whose leaves each live in their OWN signal — an unpacked
     /// struct, an unpacked array of unpacked structs, or an associative array —
@@ -30526,6 +30624,36 @@ impl Simulator {
         Some((dt, arr))
     }
 
+    /// Element type recorded for `name`, or derived from its base when `name`
+    /// is a flattened sub-path (`q[i]`, which has no declaration of its own).
+    fn p_elem_type(&self, name: &str) -> Option<DataType> {
+        self.module
+            .var_decl_types
+            .get(name)
+            .cloned()
+            .or_else(|| self.flat_path_type(name).map(|(d, _)| d))
+    }
+
+    /// Nested element list for a multi-dimensional unpacked array. The innermost
+    /// element may itself be a collection (an array of queues), so it goes back
+    /// through `render_p_var` first.
+    fn render_p_dims(&mut self, base: &str, dims: &[(i64, i64)], dt: &DataType) -> String {
+        let (lo, hi) = dims[0];
+        let mut parts: Vec<String> = Vec::new();
+        for i in lo..=hi {
+            let elem = format!("{}[{}]", base, i);
+            if dims.len() == 1 {
+                let rendered = self
+                    .render_p_var(&elem)
+                    .unwrap_or_else(|| self.render_p_typed(&elem, dt));
+                parts.push(rendered);
+            } else {
+                parts.push(self.render_p_dims(&elem, &dims[1..], dt));
+            }
+        }
+        format!("'{{{}}}", parts.join(", "))
+    }
+
     /// LRM §21.2.1.7 `%p` on the variable `name`: recursively render nested
     /// structs, unpacked arrays, enums, strings and reals in assignment-pattern
     /// form. `None` if neither the variable nor its base has a declared type.
@@ -30534,17 +30662,19 @@ impl Simulator {
         // fixed 64-slot buffer it is backed by. Its ELEMENTS (`q[i]` of an
         // array of queues) have no declared type of their own.
         if self.module.dynamic_arrays.contains(name) {
-            let dt = self
-                .module
-                .var_decl_types
-                .get(name)
-                .cloned()
-                .or_else(|| self.flat_path_type(name).map(|(d, _)| d))?;
+            let dt = self.p_elem_type(name)?;
             let sz = self.get_queue_size(name);
             let parts: Vec<String> = (0..sz)
                 .map(|i| self.render_p_typed(&format!("{}[{}]", name, i), &dt))
                 .collect();
             return Some(format!("'{{{}}}", parts.join(", ")));
+        }
+        // A MULTI-dimensional unpacked array is a nested element list; only the
+        // 1-D case was handled, so `int m[2][3]` printed `'{x, x}`.
+        if self.module.arrays_2d.contains_key(name) || self.module.arrays_nd.contains_key(name) {
+            let dims = self.foreach_dims(name)?;
+            let dt = self.p_elem_type(name)?;
+            return Some(self.render_p_dims(name, &dims, &dt));
         }
         let Some(dt) = self.module.var_decl_types.get(name).cloned() else {
             let (dt, arr) = self.flat_path_type(name)?;
@@ -30593,13 +30723,11 @@ impl Simulator {
                 .collect();
             return Some(format!("'{{{}}}", parts.join(", ")));
         }
-        // Fixed unpacked array -> element list.
+        // Fixed unpacked array -> element list. An element may itself be a
+        // collection (`int q[3][$]`), so it goes back through `render_p_var`.
         if let Some(&(lo, hi, _)) = self.module.arrays.get(name) {
             if hi >= lo && (hi - lo) < 4096 {
-                let parts: Vec<String> = (lo..=hi)
-                    .map(|i| self.render_p_typed(&format!("{}[{}]", name, i), &dt))
-                    .collect();
-                return Some(format!("'{{{}}}", parts.join(", ")));
+                return Some(self.render_p_dims(name, &[(lo, hi)], &dt));
             }
             return None;
         }
@@ -31417,14 +31545,14 @@ impl Simulator {
                 // class instead of `eval_expr`-ing the call (which
                 // returns 0 because the bare `new` has no class
                 // context). The resulting handle is what gets pushed.
-                let val = self.queue_eval_arg(obj_name, arg);
                 let cur_size = self.get_queue_size(obj_name);
                 if let Some(&max) = self.module.queue_max_sizes.get(obj_name) {
                     if cur_size >= max as u64 {
                         return Some(Value::zero(32));
                     }
                 }
-                self.set_signal_value_by_name(&format!("{}[{}]", obj_name, cur_size), val);
+                let elem = format!("{}[{}]", obj_name, cur_size);
+                self.queue_store_elem(obj_name, &elem, arg);
                 self.set_queue_size(obj_name, cur_size + 1);
             }
             return Some(Value::zero(32));
@@ -33197,7 +33325,9 @@ impl Simulator {
                     ))
             {
                 if let Some(qn) = self.flat_member_name(expr) {
-                    if self.module.dynamic_arrays.contains(&qn) {
+                    if self.module.dynamic_arrays.contains(&qn)
+                        || self.module.associative_arrays.contains_key(&qn)
+                    {
                         if let Some(res) = self.eval_builtin_method(&qn, mname, args) {
                             return res;
                         }

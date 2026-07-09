@@ -26737,6 +26737,18 @@ impl Simulator {
         if hier.path.len() >= 2 && self.packed_leaf_of_hier(&raw).is_some() {
             return raw;
         }
+        // `p.a` where `p` is an unpacked STRUCT variable: the dotted name is a
+        // member access, not a hierarchical instance path. The suffix scan below
+        // would collapse it to the last segment, so `p.a = 5` silently wrote an
+        // unrelated module-scope signal that happened to be called `a`.
+        if hier.path.len() >= 2
+            && self
+                .module
+                .struct_members
+                .contains_key(&hier.path[0].name.name)
+        {
+            return raw;
+        }
         // LRM §25.9: if the leading segment names a virtual-interface
         // formal-arg alias in the current task call frame, rewrite the
         // path to use the bound interface instance name. Has to fire

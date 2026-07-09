@@ -17,23 +17,33 @@ module tb;
   typedef struct { int i; bit [7:0] b; string s; real r; } m_t;
   typedef struct { int status; tag_t tag; string name; } node_t;
 
-  m_t    a[2];
-  node_t arr[2];
+  // array of unpacked structs nested INSIDE a struct
+  typedef struct { int cid; node_t nodes[2]; } cluster_t;
+
+  m_t       a[2];
+  node_t    arr[2];
+  cluster_t c;
 
   // observation copies (hierarchical reads of array members)
   int  a0_i, a1_i;
   real a0_r, a1_r;
   int  n0_st, n1_st;
+  int  vlan0;          // nested PACKED member inside an unpacked element
+  int  c0_st, c1_st;   // array-of-structs nested inside a struct
 
   initial begin
     a[0].i = 11; a[0].b = 8'hAB; a[0].s = "A0"; a[0].r = 1.5;
     a[1].i = 22; a[1].b = 8'hCD; a[1].s = "A1"; a[1].r = 2.5;
     arr[0].status = 11; arr[1].status = 22;
     arr[0].name = "N0";  arr[1].name = "N1";
+    arr[0].tag = '{vlan: 4'h3, id: 12'h0AB};
+    c.nodes[0].status = 11; c.nodes[1].status = 22;
 
     a0_i = a[0].i; a1_i = a[1].i;
     a0_r = a[0].r; a1_r = a[1].r;
     n0_st = arr[0].status; n1_st = arr[1].status;
+    vlan0 = arr[0].tag.vlan;
+    c0_st = c.nodes[0].status; c1_st = c.nodes[1].status;
   end
 endmodule
 "#;
@@ -68,4 +78,11 @@ fn unpacked_struct_array_members_keep_per_element_types() {
     // A member sitting beside a packed-struct / string member must not alias.
     assert_eq!(u(&sim, "n0_st") & 0xFFFF_FFFF, 11, "arr[0].status aliased");
     assert_eq!(u(&sim, "n1_st") & 0xFFFF_FFFF, 22, "arr[1].status aliased");
+
+    // Nested PACKED struct member inside an unpacked element: arr[0].tag.vlan.
+    assert_eq!(u(&sim, "vlan0") & 0xF, 0x3, "arr[0].tag.vlan not sliced from its own signal");
+
+    // Array-of-structs nested inside a struct: c.nodes[i].status.
+    assert_eq!(u(&sim, "c0_st") & 0xFFFF_FFFF, 11, "c.nodes[0].status aliased");
+    assert_eq!(u(&sim, "c1_st") & 0xFFFF_FFFF, 22, "c.nodes[1].status aliased");
 }

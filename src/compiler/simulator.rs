@@ -18521,6 +18521,37 @@ impl Simulator {
         }
     }
 
+    /// Flatten an `Ident` / `Index` / `MemberAccess` chain into the dotted-and-
+    /// indexed signal name the elaborator pre-registers for unpacked aggregates
+    /// (`c.nodes[1].status`, `arr[0].tag`). `None` for shapes it can't flatten
+    /// (non-constant index, ranges, calls, …).
+    fn flat_member_name(&mut self, e: &Expression) -> Option<String> {
+        match &e.kind {
+            ExprKind::Ident(h) => {
+                if h.path.iter().any(|s| !s.selects.is_empty()) {
+                    return None;
+                }
+                Some(
+                    h.path
+                        .iter()
+                        .map(|s| s.name.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join("."),
+                )
+            }
+            ExprKind::Index { expr, index } => {
+                let base = self.flat_member_name(expr)?;
+                let i = self.eval_expr(index).to_i64()?;
+                Some(format!("{}[{}]", base, i))
+            }
+            ExprKind::MemberAccess { expr, member } => {
+                let base = self.flat_member_name(expr)?;
+                Some(format!("{}.{}", base, member.name))
+            }
+            _ => None,
+        }
+    }
+
     fn assign_value(&mut self, lhs: &Expression, val: &Value) -> bool {
         match &lhs.kind {
             ExprKind::Ident(hier) => {
@@ -19717,40 +19748,44 @@ impl Simulator {
                         }
                     }
                 }
-                // `arr[i].member = …` where `arr`'s element is an UNPACKED
-                // struct: each member lives in its own signal `arr[i].member`
-                // (there is no contiguous bit layout to slice — a `real` member
-                // has no meaningful bit offset). Write that signal directly,
-                // honouring its declared width / signedness / real-ness. Packed
-                // element types keep the bit-slice path below.
-                if let ExprKind::Index { expr: base, index } = &expr.kind {
-                    if let ExprKind::Ident(bh) = &base.kind {
-                        if bh.path.len() == 1
-                            && !self
-                                .module
-                                .packed_struct_fields
-                                .contains_key(&bh.path[0].name.name)
+                // Unpacked aggregates keep every leaf in its own signal
+                // (`arr[i].m`, `c.nodes[i].m`) — there is no contiguous bit
+                // layout to slice, and a `real` member has no bit offset. If the
+                // flattened name names a signal, write it directly, honouring the
+                // declared width / signedness / real-ness.
+                if let Some(flat) = self.flat_member_name(lhs) {
+                    if let Some(&id) = self.signal_name_to_id.get(flat.as_str()) {
+                        let width = self.signal_widths[id];
+                        let mut resized = if self.signal_real[id] {
+                            if val.is_real { val.clone() } else { Value::from_f64(val.to_f64()) }
+                        } else if val.is_real {
+                            Value::from_u64(val.to_f64() as u64, width)
+                        } else {
+                            val.resize(width)
+                        };
+                        resized.is_signed = self.signal_signed[id];
+                        let prev = self.get_signal_value_by_name(&flat);
+                        let changed = prev.as_ref() != Some(&resized);
+                        self.set_signal_value_by_name(&flat, resized);
+                        return changed;
+                    }
+                }
+                // A nested PACKED struct member inside an unpacked aggregate
+                // (`arr[i].tag.vlan`): slice the parent's own signal.
+                if let Some(pflat) = self.flat_member_name(expr) {
+                    if let Some(fields) = self.module.packed_struct_fields.get(&pflat).cloned() {
+                        if let Some((_, off, w)) =
+                            fields.iter().find(|(m, _, _)| *m == member.name).cloned()
                         {
-                            let idx = self.eval_expr(index).to_i64().unwrap_or(0);
-                            let target =
-                                format!("{}[{}].{}", bh.path[0].name.name, idx, member.name);
-                            if let Some(&id) = self.signal_name_to_id.get(target.as_str()) {
-                                let width = self.signal_widths[id];
-                                let mut resized = if self.signal_real[id] {
-                                    if val.is_real {
-                                        val.clone()
-                                    } else {
-                                        Value::from_f64(val.to_f64())
-                                    }
-                                } else if val.is_real {
-                                    Value::from_u64(val.to_f64() as u64, width)
-                                } else {
-                                    val.resize(width)
-                                };
-                                resized.is_signed = self.signal_signed[id];
-                                let prev = self.get_signal_value_by_name(&target);
-                                let changed = prev.as_ref() != Some(&resized);
-                                self.set_signal_value_by_name(&target, resized);
+                            if let Some(cur_sig) = self.get_signal_value_by_name(&pflat) {
+                                let total_w = cur_sig.width;
+                                let mut cur = cur_sig.resize(total_w);
+                                let piece = val.resize(w);
+                                for i in 0..w {
+                                    cur.set_bit((off + i) as usize, piece.get_bit(i as usize));
+                                }
+                                let changed = Some(&cur) != Some(&cur_sig);
+                                self.set_signal_value_by_name(&pflat, cur);
                                 return changed;
                             }
                         }
@@ -21954,25 +21989,29 @@ impl Simulator {
                 }
             }
             ExprKind::MemberAccess { expr, member } => {
-                // `arr[i].member` where `arr`'s element is an UNPACKED struct:
-                // the member lives in its own signal `arr[i].member` (there is
-                // no contiguous bit layout to slice). Mirror of the write path
-                // in `assign_value`; packed element types keep bit-slicing.
-                if let ExprKind::Index { expr: base, index } = &expr.kind {
-                    if let ExprKind::Ident(bh) = &base.kind {
-                        if bh.path.len() == 1
-                            && !self
-                                .module
-                                .packed_struct_fields
-                                .contains_key(&bh.path[0].name.name)
+                // Mirror of the unpacked-aggregate write path in `assign_value`:
+                // a flattened leaf (`arr[i].m`, `c.nodes[i].m`) reads its own
+                // signal; a nested PACKED member (`arr[i].tag.vlan`) slices its
+                // parent's signal. Packed scalars keep the bit-slice paths below.
+                if let Some(base_flat) = self.flat_member_name(expr) {
+                    let flat = format!("{}.{}", base_flat, member.name);
+                    if self.signal_name_to_id.contains_key(flat.as_str()) {
+                        if let Some(v) = self.get_signal_value_by_name(&flat) {
+                            return v;
+                        }
+                    }
+                    if let Some(fields) =
+                        self.module.packed_struct_fields.get(&base_flat).cloned()
+                    {
+                        if let Some((_, off, w)) =
+                            fields.iter().find(|(m, _, _)| *m == member.name).cloned()
                         {
-                            let idx = self.eval_expr(index).to_i64().unwrap_or(0);
-                            let target =
-                                format!("{}[{}].{}", bh.path[0].name.name, idx, member.name);
-                            if self.signal_name_to_id.contains_key(target.as_str()) {
-                                if let Some(v) = self.get_signal_value_by_name(&target) {
-                                    return v;
+                            if let Some(cur) = self.get_signal_value_by_name(&base_flat) {
+                                let mut out = Value::zero(w.max(1));
+                                for i in 0..w {
+                                    out.set_bit(i as usize, cur.get_bit((off + i) as usize));
                                 }
+                                return out;
                             }
                         }
                     }

@@ -1941,6 +1941,8 @@ pub struct Simulator {
     /// Label of a process-level named block (`initial begin : worker`) -> its
     /// pid, so `disable worker` from another process can terminate it.
     disable_labels: HashMap<String, usize>,
+    /// Associative arrays already warned about an x/z index.
+    warned_assoc_index: HashSet<String>,
     /// SV-2023: PIDs killed by `disable fork` — skip dispatch on these.
     killed_pids: HashSet<usize>,
     /// Names of init-declared (automatic) `for`-loop variables that — because
@@ -3182,6 +3184,7 @@ impl Simulator {
             rs_return_flag: false,
             disable_target: None,
             disable_labels: HashMap::default(),
+            warned_assoc_index: HashSet::default(),
             killed_pids: HashSet::default(),
             auto_loop_vars: Vec::new(),
             ref_binding_stack: Vec::new(),
@@ -18678,7 +18681,10 @@ impl Simulator {
                             if let Some((_, off, w)) =
                                 fields.iter().find(|(m, _, _)| m == &sub).cloned()
                             {
-                                if let Some(cur_sig) = self.get_signal_value_by_name(obj_name) {
+                                // The container may be a procedural LOCAL (a
+                                // packed struct declared inside a task), which
+                                // `get/set_signal_value_by_name` cannot see.
+                                if let Some(cur_sig) = self.get_local_or_signal(obj_name) {
                                     let total_w = cur_sig.width;
                                     let mut cur = cur_sig.resize(total_w);
                                     let piece = val.resize(w);
@@ -18686,9 +18692,9 @@ impl Simulator {
                                         let bit = piece.get_bit(i as usize);
                                         cur.set_bit((off + i) as usize, bit);
                                     }
-                                    let prev = self.get_signal_value_by_name(obj_name);
+                                    let prev = self.get_local_or_signal(obj_name);
                                     let changed = prev.as_ref() != Some(&cur);
-                                    self.set_signal_value_by_name(obj_name, cur);
+                                    self.set_local_or_signal(obj_name, cur);
                                     return changed;
                                 }
                             }
@@ -19077,6 +19083,13 @@ impl Simulator {
                         name = scoped;
                     }
                     let idx_val = self.eval_expr(index);
+                    // §7.8.2: an associative index containing x/z is invalid.
+                    // The write is ignored (with a warning) — it must not fold
+                    // the unknown bits away and clobber a real element.
+                    if self.is_associative_array(&name) && idx_val.has_xz() {
+                        self.warn_invalid_assoc_index(&name);
+                        return false;
+                    }
                     let idx_str = if self.is_associative_array(&name) {
                         self.assoc_key_str(&name, &idx_val)
                     } else {
@@ -19857,15 +19870,19 @@ impl Simulator {
                         if let Some((_, off, w)) =
                             fields.iter().find(|(m, _, _)| *m == member.name).cloned()
                         {
-                            if let Some(cur_sig) = self.get_signal_value_by_name(&pflat) {
+                            // The container may be a procedural LOCAL: a packed
+                            // struct declared inside a task lives in the call
+                            // frame, not the signal table, so a member write
+                            // reached nothing and the struct read back as X.
+                            if let Some(cur_sig) = self.get_local_or_signal(&pflat) {
                                 let total_w = cur_sig.width;
                                 let mut cur = cur_sig.resize(total_w);
                                 let piece = val.resize(w);
                                 for i in 0..w {
                                     cur.set_bit((off + i) as usize, piece.get_bit(i as usize));
                                 }
-                                let changed = Some(&cur) != Some(&cur_sig);
-                                self.set_signal_value_by_name(&pflat, cur);
+                                let changed = cur != cur_sig;
+                                self.set_local_or_signal(&pflat, cur);
                                 return changed;
                             }
                         }
@@ -21222,6 +21239,12 @@ impl Simulator {
                                 }
                             }
                         }
+                        // §7.8.2: reading with an x/z index yields the element
+                        // type's default rather than folding to another key.
+                        if self.is_associative_array(&name) && idx_val.has_xz() {
+                            self.warn_invalid_assoc_index(&name);
+                            return Value::zero(ctx_width.max(1));
+                        }
                         let idx_str = if self.is_associative_array(&name) {
                             self.assoc_key_str(&name, &idx_val)
                         } else {
@@ -22193,7 +22216,7 @@ impl Simulator {
                         if let Some((_, off, w)) =
                             fields.iter().find(|(m, _, _)| *m == member.name).cloned()
                         {
-                            if let Some(cur) = self.get_signal_value_by_name(&base_flat) {
+                            if let Some(cur) = self.get_local_or_signal(&base_flat) {
                                 let mut out = Value::zero(w.max(1));
                                 for i in 0..w {
                                     out.set_bit(i as usize, cur.get_bit((off + i) as usize));
@@ -22363,7 +22386,7 @@ impl Simulator {
                         if let Some((_, off, w)) =
                             fields.iter().find(|(m, _, _)| m == &member.name).cloned()
                         {
-                            if let Some(sig) = self.get_signal_value_by_name(&name) {
+                            if let Some(sig) = self.get_local_or_signal(&name) {
                                 return sig.range_select((off + w - 1) as usize, off as usize);
                             }
                         }
@@ -25244,6 +25267,9 @@ impl Simulator {
                             &self.module.typedef_types,
                         ) {
                             if !fields.is_empty() {
+                                if std::env::var("XEZIM_PSDBG").is_ok() {
+                                    eprintln!("[PSDBG] register packed local {}", d.name.name);
+                                }
                                 self.module
                                     .packed_struct_fields
                                     .insert(d.name.name.clone(), fields);
@@ -29255,6 +29281,17 @@ impl Simulator {
             .unwrap_or(false)
     }
 
+    /// Warn once per associative array about an invalid (x/z) index.
+    fn warn_invalid_assoc_index(&mut self, name: &str) {
+        if self.warned_assoc_index.insert(name.to_string()) {
+            eprintln!(
+                "[xezim][warning] associative array '{}' indexed with an unknown (x/z) \
+                 value — the access is ignored (IEEE 1800-2017 §7.8.2)",
+                name
+            );
+        }
+    }
+
     fn assoc_key_str(&self, name: &str, idx_val: &Value) -> String {
         if self.is_string_keyed_array(name) {
             idx_val.to_sv_string()
@@ -29441,6 +29478,20 @@ impl Simulator {
     /// string/scalar PARAMETERS and locals live) over the global signal table.
     /// String built-ins like `.len()`/`.substr()` need this — a `string` formal
     /// (e.g. `format_string(string str, …)`) is not in `self.signals`.
+    /// Write a variable that may be a procedural LOCAL (a task/function frame)
+    /// rather than a signal. A packed struct declared inside a task lives in the
+    /// local frame, so slicing a member into it through `set_signal_value_by_name`
+    /// wrote nothing and the whole struct read back as X.
+    fn set_local_or_signal(&mut self, name: &str, v: Value) {
+        if let Some(frame) = self.local_stack.last_mut() {
+            if frame.contains_key(name) {
+                frame.insert(name.to_string(), v);
+                return;
+            }
+        }
+        self.set_signal_value_by_name(name, v);
+    }
+
     fn get_local_or_signal(&self, name: &str) -> Option<Value> {
         if let Some(m) = self.local_stack.last() {
             if let Some(v) = m.get(name) {
@@ -35384,6 +35435,91 @@ impl Simulator {
         Value::from_u64(f.trunc() as i64 as u64, width.max(1))
     }
 
+    /// Bind an ASSOCIATIVE-array actual to a formal: copy the caller's entries to
+    /// `<formal>[key]` and register the formal so `.size()`/`.exists()`/indexing
+    /// work inside the body. Returns `(formal, actual)`.
+    ///
+    /// Only tasks did this; functions bound nothing, so `arr.size()` on an assoc
+    /// formal read 0.
+    fn bind_assoc_param(
+        &mut self,
+        port: &crate::ast::decl::FunctionPort,
+        arg: &Expression,
+    ) -> Option<(String, String)> {
+        use crate::ast::types::UnpackedDimension as UD;
+        if !port
+            .dimensions
+            .iter()
+            .any(|d| matches!(d, UD::Associative { .. }))
+        {
+            return None;
+        }
+        let ExprKind::Ident(hier) = &arg.kind else { return None };
+        let caller = self.resolve_hier_name(hier);
+        let param = port.name.name.clone();
+        let prefix = format!("{}[", caller);
+        let entries: Vec<(String, Value)> = self
+            .signals
+            .iter()
+            .filter(|(k, _)| k.starts_with(&prefix) && k.ends_with(']'))
+            .map(|(k, v)| {
+                let key = &k[prefix.len()..k.len() - 1];
+                (format!("{}[{}]", param, key), v.clone())
+            })
+            .collect();
+        for (k, v) in entries {
+            self.signals.insert(k, v);
+        }
+        let is_string_key = self.is_string_keyed_array(&caller);
+        self.module
+            .associative_arrays
+            .insert(param.clone(), is_string_key);
+        Some((param, caller))
+    }
+
+    /// Drop a formal associative array's entries and registration.
+    fn purge_assoc_param(&mut self, param: &str) {
+        let prefix = format!("{}[", param);
+        let keys: Vec<String> = self
+            .signals
+            .keys()
+            .filter(|k| k.starts_with(&prefix))
+            .cloned()
+            .collect();
+        for k in keys {
+            self.signals.remove(&k);
+        }
+        self.module.associative_arrays.remove(param);
+    }
+
+    /// Copy a `ref`/`output`/`inout` associative formal back onto the caller's
+    /// array, replacing its contents.
+    fn writeback_assoc_param(&mut self, param: &str, caller: &str) {
+        let cprefix = format!("{}[", caller);
+        let old: Vec<String> = self
+            .signals
+            .keys()
+            .filter(|k| k.starts_with(&cprefix))
+            .cloned()
+            .collect();
+        for k in old {
+            self.signals.remove(&k);
+        }
+        let pprefix = format!("{}[", param);
+        let entries: Vec<(String, Value)> = self
+            .signals
+            .iter()
+            .filter(|(k, _)| k.starts_with(&pprefix) && k.ends_with(']'))
+            .map(|(k, v)| {
+                let key = &k[pprefix.len()..k.len() - 1];
+                (format!("{}[{}]", caller, key), v.clone())
+            })
+            .collect();
+        for (k, v) in entries {
+            self.signals.insert(k, v);
+        }
+    }
+
     /// Copy a fixed unpacked ARRAY actual into the formal's element signals and
     /// register the formal as an array so `a[i]` resolves inside the body.
     /// Returns `(formal, actual, lo, hi)` so an `output`/`inout`/`ref` formal
@@ -35538,11 +35674,20 @@ impl Simulator {
         // return (e.g. `get_int_arg_value(string s, ref int val)`).
         let mut output_bindings: Vec<(String, Expression)> = Vec::new();
         let mut array_writebacks: Vec<(String, String, i64, i64)> = Vec::new();
+        let mut assoc_params: Vec<(String, String, bool)> = Vec::new();
         for (i, port) in fd.ports.iter().enumerate() {
             let is_out = matches!(
                 port.direction,
                 PortDirection::Output | PortDirection::Inout | PortDirection::Ref
             );
+            // An ASSOCIATIVE-array formal: functions bound nothing at all, so
+            // `arr.size()` inside the body read 0.
+            if i < args.len() {
+                if let Some((param, caller)) = self.bind_assoc_param(port, &args[i]) {
+                    assoc_params.push((param, caller, is_out));
+                    continue;
+                }
+            }
             if i < args.len() && self.bind_queue_param(&port.name.name, &port.dimensions, &args[i]) {
                 continue;
             }
@@ -35605,6 +35750,12 @@ impl Simulator {
                 .unwrap_or(Value::zero(32))
         };
         // Array formals copy element-wise; scalars go through `output_bindings`.
+        for (param, caller, is_out) in std::mem::take(&mut assoc_params) {
+            if is_out {
+                self.writeback_assoc_param(&param, &caller);
+            }
+            self.purge_assoc_param(&param);
+        }
         self.writeback_array_args(&array_writebacks);
         for (param, ..) in &array_writebacks {
             let prefix = format!("{}[", param);

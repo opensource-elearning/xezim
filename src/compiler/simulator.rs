@@ -25906,6 +25906,104 @@ impl Simulator {
         }
     }
 
+    /// IEEE 1800-2017 §6.16 string methods that MUTATE the receiver
+    /// (`putc`, `itoa`, `hextoa`, `octtoa`, `bintoa`, `realtoa`) plus `atoreal`.
+    /// Every one of them was a silent no-op / returned 0.
+    ///
+    /// `recv` is the receiver expression; it is assigned back in place. Called
+    /// from both the `MemberAccess` dispatch and the flattened `Ident([s, m])`
+    /// one, which is how a statement like `s.putc(0, "J");` actually parses.
+    fn string_method(
+        &mut self,
+        recv: &Expression,
+        mname: &str,
+        args: &[Expression],
+    ) -> Option<Value> {
+            // §6.16.4 `s.putc(i, c)` and §6.16.10 `s.itoa/hextoa/octtoa/bintoa/
+        // realtoa(v)` MODIFY the receiver in place. Every one of them was a
+        // silent no-op.
+        if mname == "putc" && args.len() == 2 {
+            let cur = self.eval_expr(recv).to_sv_string();
+            let idx = self.eval_expr(&args[0]).to_i64().unwrap_or(-1);
+            let ch = (self.eval_expr(&args[1]).to_u64().unwrap_or(0) & 0xFF) as u8;
+            // §6.16.4: an out-of-range index or a null character leaves the
+            // string unchanged.
+            if idx >= 0 && (idx as usize) < cur.len() && ch != 0 {
+                let mut b = cur.into_bytes();
+                b[idx as usize] = ch;
+                let out = String::from_utf8_lossy(&b).into_owned();
+                let v = Value::from_string(&out);
+                self.assign_value(recv, &v);
+            }
+            return Some(Value::zero(1));
+        }
+        if matches!(mname, "itoa" | "hextoa" | "octtoa" | "bintoa" | "realtoa")
+            && args.len() == 1
+        {
+            let v = self.eval_expr(&args[0]);
+            let text = match mname {
+                // `itoa` renders a SIGNED decimal; the others are unsigned
+                // radix conversions of the bit pattern.
+                "itoa" => {
+                    if v.width > 32 {
+                        format!("{}", v.to_i64().unwrap_or(0))
+                    } else {
+                        format!("{}", v.to_u64().unwrap_or(0) as u32 as i32)
+                    }
+                }
+                "hextoa" => format!("{:x}", v.to_u64().unwrap_or(0)),
+                "octtoa" => format!("{:o}", v.to_u64().unwrap_or(0)),
+                "bintoa" => format!("{:b}", v.to_u64().unwrap_or(0)),
+                _ => format!("{:.6}", v.to_f64()),
+            };
+            let sv = Value::from_string(&text);
+            self.assign_value(recv, &sv);
+            return Some(Value::zero(1));
+        }
+        // §6.16.9 `atoreal` — the longest valid real prefix, 0.0 on no match.
+        if mname == "atoreal" && args.is_empty() {
+            let raw = self.eval_expr(recv).to_sv_string();
+            let t = raw.trim();
+            let b = t.as_bytes();
+            let mut i = 0usize;
+            let mut end = 0usize;
+            if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+                i += 1;
+            }
+            while i < b.len() && b[i].is_ascii_digit() {
+                i += 1;
+                end = i;
+            }
+            if i < b.len() && b[i] == b'.' {
+                i += 1;
+                while i < b.len() && b[i].is_ascii_digit() {
+                    i += 1;
+                    end = i;
+                }
+            }
+            if i < b.len() && (b[i] == b'e' || b[i] == b'E') {
+                let save = i;
+                i += 1;
+                if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+                    i += 1;
+                }
+                let ds = i;
+                while i < b.len() && b[i].is_ascii_digit() {
+                    i += 1;
+                }
+                if i > ds {
+                    end = i;
+                } else {
+                    i = save;
+                    let _ = i;
+                }
+            }
+            let val: f64 = t.get(..end).and_then(|p| p.parse().ok()).unwrap_or(0.0);
+            return Some(Value::from_f64(val));
+        }
+        None
+    }
+
     fn exec_expr_stmt(&mut self, expr: &Expression) {
         match &expr.kind {
             ExprKind::SystemCall { name, args } => self.exec_system_task(name, args),
@@ -34524,6 +34622,10 @@ impl Simulator {
                 let r = if mname == "tolower" { s.to_lowercase() } else { s.to_uppercase() };
                 return Value::from_string(&r);
             }
+            // §6.16.4 putc / §6.16.10 itoa-family / §6.16.9 atoreal.
+            if let Some(v) = self.string_method(expr, mname, args) {
+                return v;
+            }
             // String-to-number conversions (IEEE 1800-2023 §6.16.9). Parse the
             // longest valid numeric prefix in the given radix; 0 on no match.
             if matches!(mname, "atoi" | "atohex" | "atooct" | "atobin")
@@ -35043,6 +35145,29 @@ impl Simulator {
             // receiver flattened into the ident path (`v.name()` ->
             // Ident([v, name])). The MemberAccess form is handled earlier; this
             // covers the common local-variable case.
+            //
+            // §6.16 string methods on a flattened receiver — `s.putc(0, "J");`
+            // as a statement parses this way, which is why the mutators looked
+            // like no-ops even though the MemberAccess path handled them.
+            if len >= 2
+                && matches!(
+                    path[len - 1].name.name.as_str(),
+                    "putc" | "itoa" | "hextoa" | "octtoa" | "bintoa" | "realtoa" | "atoreal"
+                )
+            {
+                let m = path[len - 1].name.name.clone();
+                let base = HierarchicalIdentifier {
+                    root: hier.root.clone(),
+                    path: path[..len - 1].to_vec(),
+                    span: hier.span,
+                    cached_signal_id: std::cell::Cell::new(None),
+                    cached_resolved_name: std::cell::OnceCell::new(),
+                };
+                let base_expr = Expression::new(ExprKind::Ident(base), hier.span);
+                if let Some(v) = self.string_method(&base_expr, &m, args) {
+                    return v;
+                }
+            }
             if len >= 2 && args.is_empty()
                 && matches!(
                     path[len - 1].name.name.as_str(),

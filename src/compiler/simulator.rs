@@ -30460,6 +30460,26 @@ impl Simulator {
 
     /// Class type of a variable, if it is a class-handle variable. Guards `%p`
     /// against treating a plain integer as an object handle.
+    /// Declared type NAME of a variable, whatever its storage. Unlike
+    /// `class_of_var` this does not require the name to be a known class, so an
+    /// enum-typed destination can be recognised too.
+    fn type_name_of_var(&self, vname: &str) -> Option<String> {
+        if let Some(c) = self.var_class_types.get(vname) {
+            return Some(c.clone());
+        }
+        if let Some(sig) = self.module.signals.get(vname) {
+            if let Some(tn) = &sig.type_name {
+                return Some(tn.clone());
+            }
+        }
+        if let Some(&id) = self.signal_name_to_id.get(vname) {
+            if let Some(tn) = self.signal_type_names.get(&id) {
+                return Some(tn.clone());
+            }
+        }
+        None
+    }
+
     fn class_of_var(&self, vname: &str) -> Option<String> {
         // Procedural locals record their class at VarDecl exec time.
         if let Some(c) = self.var_class_types.get(vname) {
@@ -33579,6 +33599,21 @@ impl Simulator {
     /// so only a definite type mismatch fails — the case UVM's
     /// `if (!$cast(seq, item))` relies on.
     fn cast_type_ok(&self, dest: &Expression, src: &Value) -> bool {
+        // §6.24.1: casting to an ENUM succeeds only when the value is one of
+        // its members. Checked before the class logic, whose "not a live class
+        // object" escape hatch would otherwise wave every integer through.
+        if let ExprKind::Ident(hh) = &dest.kind {
+            if hh.path.len() == 1 {
+                if let Some(tn) = self.type_name_of_var(&hh.path[0].name.name) {
+                    if let Some(members) = self.module.enum_members.get(&tn) {
+                        return match src.to_u64() {
+                            Some(x) => members.iter().any(|(_, mv)| *mv == x),
+                            None => false,
+                        };
+                    }
+                }
+            }
+        }
         let h = src.to_u64().unwrap_or(0) as usize;
         if h == 0 {
             return true; // null assigns through
@@ -33587,9 +33622,12 @@ impl Simulator {
             Some(i) => i.class_name.clone(),
             None => return true, // not a live class object — don't enforce
         };
+        // A module-scope class handle is not in `var_class_types` (only
+        // procedural locals are), so it used to fall into the permissive
+        // `None` branch and EVERY downcast reported success.
         let dest_type = match &dest.kind {
             ExprKind::Ident(hh) if hh.path.len() == 1 => {
-                self.var_class_types.get(&hh.path[0].name.name).cloned()
+                self.class_of_var(&hh.path[0].name.name)
             }
             _ => None,
         };

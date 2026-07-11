@@ -307,6 +307,9 @@ fn vpi_systf_test() {
         !log.contains("vpi_control(vpiFinish) did not end the run"),
         "vpi_control(vpiFinish) did not end the run:\n{}",
         log
+    );
+}
+
 // Regression: a DPI-C import using a typedef name for a packed logic
 // vector (the UVM `uvm_hdl_data_t` pattern) must resolve to a
 // svLogicVecVal* argument. Before the fix this emitted

@@ -26324,7 +26324,11 @@ impl Simulator {
                                 // A `string q[$]` queue: mark the name so its
                                 // elements are treated as strings (`%p`, `%s`,
                                 // concat) — the element-string check keys off
-                                // the queue name being in `string_signals`.
+                                // the queue name being in `string_signals`. A
+                                // non-string decl must UNmark: the set is keyed
+                                // by bare name, so a stale entry from another
+                                // frame's same-named `string q[$]` would give
+                                // this queue string treatment.
                                 if matches!(
                                     data_type,
                                     crate::ast::types::DataType::Simple {
@@ -26333,6 +26337,8 @@ impl Simulator {
                                     }
                                 ) {
                                     self.string_signals.insert(name.clone());
+                                } else {
+                                    self.string_signals.remove(&name);
                                 }
                                 // LRM §7.10 / §7.12.1 — if an initializer
                                 // is provided (e.g. `int idx[$] =
@@ -26592,7 +26598,11 @@ impl Simulator {
                             self.signed_signals.remove(&d.name.name);
                         }
                         // Track `string`-typed locals so `{a, b}` concatenations
-                        // involving them are evaluated as string concat.
+                        // involving them are evaluated as string concat. A
+                        // non-string decl clears a stale same-named flag from
+                        // another frame (else `s[1]` on an `int s` would take
+                        // the string char-index path) — same pattern as
+                        // `signed_signals` above.
                         if matches!(
                             data_type,
                             crate::ast::types::DataType::Simple {
@@ -26601,6 +26611,8 @@ impl Simulator {
                             }
                         ) {
                             self.string_signals.insert(d.name.name.clone());
+                        } else {
+                            self.string_signals.remove(&d.name.name);
                         }
                         // Record a class-typed local's type so a later
                         // separate `name = new();` knows what to construct.
@@ -27342,6 +27354,17 @@ impl Simulator {
                                                 .push_str(&format!("'{{{}}}", parts.join(", ")));
                                             continue;
                                         }
+                                    }
+                                }
+                                // A collection PROPERTY receiver (`o.q` where q
+                                // is a native queue/assoc member) lives under the
+                                // instance-scoped name `<handle>#<member>` — the
+                                // flat path "o.q" matches nothing, so resolve it
+                                // first or the fallback prints a raw 0.
+                                if let Some(scoped) = self.expr_assoc_name(arg) {
+                                    if let Some(s) = self.render_p_var(&scoped) {
+                                        result.push_str(&s);
+                                        continue;
                                     }
                                 }
                                 // §21.2.1.7: type-directed recursive render —
@@ -33873,11 +33896,16 @@ impl Simulator {
             }
             // Dynamic-array/queue size may live in the compact signal table
             // (e.g. package- or module-scope `arr[] = {...}` whose `.size`
-            // entry was materialised at elaboration time).
+            // entry was materialised at elaboration time). A queue with NO
+            // `.size` entry anywhere has never been touched — it is empty; do
+            // NOT fall through to the `arrays` bounds, which are a (0, 63)
+            // registration placeholder, not a length (a fresh module-scope
+            // queue read size()==64).
             if self.module.dynamic_arrays.contains(obj_name) {
                 if let Some(v) = self.get_signal_value_by_name(&format!("{}.size", obj_name)) {
                     return Some(v);
                 }
+                return Some(Value::from_u64(0, 32));
             }
             if let Some((lo, hi, _)) = self.module.arrays.get(obj_name) {
                 return Some(Value::from_u64((hi - lo + 1) as u64, 32));
@@ -35805,7 +35833,20 @@ impl Simulator {
             // already resolves via `instance_assoc_member`; this is the external
             // counterpart that UVM's phase graph relies on
             // (`domain.m_successors.num()`, `phase.m_predecessors.exists(p)`).
-            if Self::is_array_builtin_method(mname) {
+            // Queue-MUTATION builtins must route here too: `o.q.push_back(x)`
+            // on a native queue property otherwise falls through to the flat
+            // bare-name path and lands on a phantom module-scope queue
+            // (`is_array_builtin_method` only lists the query methods). A
+            // class-handle member (e.g. a uvm_queue property) never resolves
+            // through `expr_assoc_name`, so user methods are unaffected.
+            if Self::is_array_builtin_method(mname)
+                || matches!(
+                    mname,
+                    "push_back" | "push_front" | "pop_back" | "pop_front"
+                        | "insert" | "delete" | "sort" | "rsort"
+                        | "reverse" | "shuffle" | "unique"
+                )
+            {
                 if let Some(an) = self.expr_assoc_name(expr) {
                     if let Some(res) = self.eval_builtin_method(&an, mname, args) {
                         return res;
@@ -36872,8 +36913,63 @@ impl Simulator {
             // the receiver would wrongly resolve to the package name.
             if hier.path.len() >= 2 {
                 let m = hier.path.last().unwrap().name.name.as_str();
-                if Self::is_array_builtin_method(m) {
+                if Self::is_array_builtin_method(m)
+                    || matches!(
+                        m,
+                        "push_back" | "push_front" | "pop_back" | "pop_front"
+                            | "insert" | "delete" | "sort" | "rsort"
+                            | "reverse" | "shuffle" | "unique"
+                    )
+                {
                     let arr = hier.path[hier.path.len() - 2].name.name.clone();
+                    // `o.q.push_back(x)` flattens to `[o, q, push_back]`: when
+                    // `q` is a native collection PROPERTY it lives under
+                    // `<handle>#q`, so walk the handle chain to the
+                    // second-to-last segment FIRST — a same-named module-scope
+                    // collection must not shadow the object's own member.
+                    // Without this the fallthrough dispatches on `path[0]` and
+                    // pushes onto a phantom queue named after the OBJECT. A
+                    // class-handle member (uvm_queue) fails
+                    // `class_assoc_member`, so user methods still dispatch
+                    // below; a package head (`pkg::arr.size()`) resolves no
+                    // handle and falls to the plain-name dispatch.
+                    if hier.path.len() >= 3 {
+                        let head = hier.path[0].name.name.as_str();
+                        let mut handle = if head == "this" {
+                            self.this_stack.last().copied().flatten().unwrap_or(0)
+                        } else {
+                            self.eval_ident_handle(head).unwrap_or(0)
+                        };
+                        for seg in &hier.path[1..hier.path.len() - 2] {
+                            if handle == 0 {
+                                break;
+                            }
+                            handle = self
+                                .heap
+                                .get(handle)
+                                .and_then(|o| o.as_ref())
+                                .and_then(|i| i.properties.get(&seg.name.name))
+                                .and_then(|v| v.to_u64())
+                                .unwrap_or(0) as usize;
+                        }
+                        if handle != 0 {
+                            let cn = self
+                                .heap
+                                .get(handle)
+                                .and_then(|x| x.as_ref())
+                                .map(|i| i.class_name.clone());
+                            if let Some(cn) = cn {
+                                if self.class_assoc_member(&cn, &arr) {
+                                    let scoped = format!("{}#{}", handle, arr);
+                                    if let Some(res) =
+                                        self.eval_builtin_method(&scoped, m, args)
+                                    {
+                                        return res;
+                                    }
+                                }
+                            }
+                        }
+                    }
                     if self.module.arrays.contains_key(&arr)
                         || self.module.dynamic_arrays.contains(&arr)
                         || self.is_associative_array(&arr)
@@ -37459,6 +37555,15 @@ impl Simulator {
         self.break_flag = false;
         self.continue_flag = false;
         self.return_flag = false;
+        // §13.4: a free (module/package) function body must NOT see the
+        // caller's class context. Without this shield a bare name in the body
+        // that collides with a caller property resolves to `<handle>#<member>`
+        // (instance_assoc_member outranks the bound formal), so the body
+        // mutates the caller's property directly and the copy-out writeback
+        // then clobbers it with the stale formal. Args were already bound
+        // above, in the caller's context.
+        self.this_stack.push(None);
+        self.class_context_stack.push(None);
         // Execute function body
         for stmt in &fd.items {
             self.exec_statement(stmt);
@@ -37466,6 +37571,8 @@ impl Simulator {
                 break;
             }
         }
+        self.this_stack.pop();
+        self.class_context_stack.pop();
         let result = if let Some(rv) = self.return_value.take() {
             rv
         } else {

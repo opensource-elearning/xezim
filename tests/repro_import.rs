@@ -10,7 +10,7 @@ fn test_repro_import_wildcard() {
         module top;
             import p::*;
             initial begin
-                $display("A=%d B=%d", A, B);
+                $display("A=%0d B=%0d", A, B);
                 $finish;
             end
         endmodule

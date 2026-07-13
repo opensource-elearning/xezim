@@ -23600,11 +23600,46 @@ impl Simulator {
                                     self.queue_copy_elem(&sn, i, &name, i);
                                 }
                             }
-                            for i in keep..n {
-                                self.set_signal_value_by_name(
-                                    &format!("{}[{}]", name, i),
-                                    Value::zero(32),
-                                );
+                            // `T a[][16]`: each slot is itself a fixed array
+                            // whose elements live at `a[i][j]` — default-init
+                            // those, not a phantom scalar `a[i]`.
+                            let inner: Option<(Vec<(i64, i64)>, u32)> = self
+                                .module
+                                .arrays_2d
+                                .get(&name)
+                                .map(|&(_, d2, w)| (vec![d2], w))
+                                .or_else(|| {
+                                    self.module
+                                        .arrays_nd
+                                        .get(&name)
+                                        .map(|(sh, w)| (sh[1..].to_vec(), *w))
+                                });
+                            if let Some((shape, w)) = inner {
+                                let mut suffixes: Vec<String> = vec![String::new()];
+                                for &(lo, hi) in &shape {
+                                    let mut next = Vec::new();
+                                    for s in &suffixes {
+                                        for k in lo..=hi {
+                                            next.push(format!("{}[{}]", s, k));
+                                        }
+                                    }
+                                    suffixes = next;
+                                }
+                                for i in keep..n {
+                                    for s in &suffixes {
+                                        self.set_signal_value_by_name(
+                                            &format!("{}[{}]{}", name, i, s),
+                                            Value::zero(w),
+                                        );
+                                    }
+                                }
+                            } else {
+                                for i in keep..n {
+                                    self.set_signal_value_by_name(
+                                        &format!("{}[{}]", name, i),
+                                        Value::zero(32),
+                                    );
+                                }
                             }
                             self.set_queue_size(&name, n);
                             if !self.in_edge_block {
@@ -25504,7 +25539,14 @@ impl Simulator {
                     // skips that dimension. Only `vars[0]` was ever bound, so
                     // `j` stayed X and the loop ran over the first dim alone.
                     if vars.len() >= 2 {
-                        if let Some(dims) = self.foreach_dims(&name) {
+                        if let Some(mut dims) = self.foreach_dims(&name) {
+                            // A dynamic outer dimension (`T a[][16]`) is backed
+                            // by a fixed 64-slot buffer; iterate only the
+                            // CURRENT size, like the 1-var dynamic path below.
+                            if self.module.dynamic_arrays.contains(&name) {
+                                let sz = self.get_queue_size(&name) as i64;
+                                dims[0] = (0, sz - 1);
+                            }
                             if dims.len() >= vars.len() {
                                 self.exec_foreach_nested(&dims[..vars.len()], vars, body);
                                 self.restore_loop_vars(&fe_saved);
@@ -27013,9 +27055,9 @@ impl Simulator {
             // the `$sformatf` *function* form, the format string is arg1 here.
             // UVM's report path uses `$swrite(time_str, "%0t", $time)`, so
             // without this the composed report line had a blank time field.
-            "$swrite" | "$swriteb" | "$swriteh" | "$swriteo" | "$sformat"
-                if self.pure_sv_lrm =>
-            {
+            // Not gated on PURE_SV_LRM: these are plain §21.3 tasks and were a
+            // silent no-op in the default mode (issue #24).
+            "$swrite" | "$swriteb" | "$swriteh" | "$swriteo" | "$sformat" => {
                 if let Some(dest) = args.first() {
                     let s = self.format_args(&args[1..], name);
                     self.assign_value(dest, &Value::from_string(&s));
@@ -27198,18 +27240,6 @@ impl Simulator {
         if args.is_empty() {
             return String::new();
         }
-        if let ExprKind::StringLiteral(fmt) = &args[0].kind {
-            return self.format_string(fmt, &args[1..], tn);
-        }
-        // The format string may also be any string-valued expression — a
-        // ternary `cond ? "%0df" : "%0db"`, a string variable, the result of
-        // another `$sformatf`, etc. Evaluate, recover the runtime string, and
-        // use it as the format spec. (riscv-dv's branch-label code uses the
-        // ternary form.)
-        if self.expr_is_string_valued(&args[0]) {
-            let fmt = self.eval_expr(&args[0]).to_sv_string();
-            return self.format_string(&fmt, &args[1..], tn);
-        }
         let r = if tn.ends_with('b') {
             'b'
         } else if tn.ends_with('h') {
@@ -27217,23 +27247,50 @@ impl Simulator {
         } else {
             'd'
         };
-        let mut result = Vec::new();
-        for a in args {
-            let v = self.eval_expr(a);
-            // A string-valued argument with no format string (e.g.
-            // `$fwrite(fd, {str, "\n"})`) must be emitted as its text, not as a
-            // decimal/hex number. riscv-dv writes its whole assembly this way.
-            if self.expr_is_string_valued(a) {
-                result.push(v.to_sv_string());
+        // IEEE 1800-2017 §21.2.1.2: the display-family argument list is walked
+        // left to right. A string LITERAL is a format spec whose `%`
+        // directives consume the following arguments; any argument not
+        // consumed by a preceding format prints in the task's default radix.
+        // Several format strings may interleave in one call —
+        // `$swrite(s, "Hex %h ", h, "Bin %b ", b, "Done.")` — and nothing is
+        // separated by implicit spaces. (Previously only the first format
+        // string was honoured and every leftover argument was dropped.)
+        let mut result = String::new();
+        let mut i = 0usize;
+        while i < args.len() {
+            let a = &args[i];
+            if let ExprKind::StringLiteral(fmt) = &a.kind {
+                let fmt = fmt.clone();
+                let (s, used) = self.format_string_consumed(&fmt, &args[i + 1..], tn);
+                result.push_str(&s);
+                i += 1 + used;
                 continue;
             }
-            result.push(match r {
-                'b' => v.to_bin_string(),
-                'h' => v.to_hex_string(),
-                _ => v.to_dec_string(),
-            });
+            // A leading string-valued EXPRESSION acts as the format spec — a
+            // ternary `cond ? "%0df" : "%0db"`, a string variable, the result
+            // of another `$sformatf`, etc. (riscv-dv's branch-label code uses
+            // the ternary form.) Later string-valued arguments emit their
+            // text: `$fwrite(fd, {str, "\n"})` writes text, not a number.
+            if i == 0 && self.expr_is_string_valued(a) {
+                let fmt = self.eval_expr(a).to_sv_string();
+                let (s, used) = self.format_string_consumed(&fmt, &args[1..], tn);
+                result.push_str(&s);
+                i += 1 + used;
+                continue;
+            }
+            let v = self.eval_expr(a);
+            if self.expr_is_string_valued(a) {
+                result.push_str(&v.to_sv_string());
+            } else {
+                result.push_str(&match r {
+                    'b' => v.to_bin_string(),
+                    'h' => v.to_hex_string(),
+                    _ => v.to_dec_string(),
+                });
+            }
+            i += 1;
         }
-        result.join(" ")
+        result
     }
 
     /// Best-effort check that an expression evaluates to a SystemVerilog string
@@ -27271,18 +27328,86 @@ impl Simulator {
         }
     }
 
-    fn format_string(&mut self, fmt: &str, args: &[Expression], _tn: &str) -> String {
+    fn format_string(&mut self, fmt: &str, args: &[Expression], tn: &str) -> String {
+        self.format_string_consumed(fmt, args, tn).0
+    }
+
+    /// Like `format_string`, but also reports how many of `args` the format
+    /// specifiers consumed, so `format_args` can continue the LRM §21.2.1.2
+    /// argument walk (several format strings may interleave in one call).
+    fn format_string_consumed(
+        &mut self,
+        fmt: &str,
+        args: &[Expression],
+        _tn: &str,
+    ) -> (String, usize) {
         let mut result = String::new();
         let mut ai = 0;
         let mut chars = fmt.chars().peekable();
         while let Some(c) = chars.next() {
             if c == '%' {
+                // §21.2.1.2: %[flags][width][.precision]<spec>. Flags: '-'
+                // left-justifies (pad spaces on the right), '+' forces a sign
+                // on decimal/real output. A width with a leading '0' zero-pads
+                // AND selects the minimal (leading-zero-trimmed) form for
+                // b/o/h; a bare `%0<spec>` means "minimal width, no padding".
+                let mut left_align = false;
+                let mut plus_sign = false;
+                loop {
+                    match chars.peek() {
+                        Some('-') => {
+                            left_align = true;
+                            chars.next();
+                        }
+                        Some('+') => {
+                            plus_sign = true;
+                            chars.next();
+                        }
+                        _ => break,
+                    }
+                }
                 let mut width_str = String::new();
                 while chars.peek().map_or(false, |c| c.is_ascii_digit()) {
                     width_str.push(chars.next().unwrap());
                 }
+                let mut precision: Option<usize> = None;
+                if chars.peek() == Some(&'.') {
+                    chars.next();
+                    let mut p = String::new();
+                    while chars.peek().map_or(false, |c| c.is_ascii_digit()) {
+                        p.push(chars.next().unwrap());
+                    }
+                    precision = Some(p.parse().unwrap_or(0));
+                }
                 let pad_width: usize = width_str.parse().unwrap_or(0);
                 let zero_pad = width_str.starts_with('0');
+                let has_width = !width_str.is_empty();
+                // Resolve the final field width/pad-char and justify `core`.
+                // `default_width` applies only when no explicit width is given.
+                let field = |core: String, default_width: usize| -> String {
+                    let (w, zero) = if has_width {
+                        (pad_width, zero_pad)
+                    } else {
+                        (default_width, false)
+                    };
+                    if core.len() >= w {
+                        return core;
+                    }
+                    let pad = w - core.len();
+                    if left_align {
+                        format!("{}{}", core, " ".repeat(pad))
+                    } else if zero {
+                        // Zero-padding goes between the sign and the digits.
+                        match core.chars().next() {
+                            Some(sign @ ('-' | '+')) => {
+                                format!("{}{}{}", sign, "0".repeat(pad), &core[1..])
+                            }
+                            _ => format!("{}{}", "0".repeat(pad), core),
+                        }
+                    } else {
+                        format!("{}{}", " ".repeat(pad), core)
+                    }
+                };
                 if let Some(&spec) = chars.peek() {
                     chars.next();
                     match spec {
@@ -27300,10 +27425,11 @@ impl Simulator {
                                     }
                                     _ => self.eval_expr(&args[ai]).to_f64(),
                                 };
-                                let s = self.format_time_field(value);
-                                // $timeformat's own min-width governs %t; only
-                                // apply an explicit `%NNt` field width on top.
-                                result.push_str(&pad_string(&s, pad_width, zero_pad));
+                                // $timeformat's min field width (default 20,
+                                // §21.3.5) governs a bare %t; an explicit
+                                // `%NNt` width overrides it, `%0t` is minimal.
+                                let (body, tf_width) = self.format_time_parts(value);
+                                result.push_str(&field(body, tf_width));
                                 ai += 1;
                             }
                         }
@@ -27439,74 +27565,143 @@ impl Simulator {
                                 result.push_str(&v.to_dec_string());
                             }
                         }
+                        'm' | 'M' => {
+                            // %m: hierarchical name of the current scope. It
+                            // consumes NO argument, so it must not be gated on
+                            // one being available — `$display("%m")` printed
+                            // nothing at all (issue #25). Qualify the top
+                            // module with the running process's instance scope
+                            // so a multiply-instantiated module reports
+                            // `TB.p1` rather than just `TB`.
+                            if self.current_scope.is_empty() {
+                                result.push_str(&self.module.name);
+                            } else {
+                                result.push_str(&format!(
+                                    "{}.{}",
+                                    self.module.name, self.current_scope
+                                ));
+                            }
+                        }
                         _ => {
                             if ai < args.len() {
                                 let v = self.eval_expr(&args[ai]);
                                 ai += 1;
                                 match spec {
                                     'd' | 'D' => {
-                                        let s = v.to_dec_string();
-                                        result.push_str(&pad_string(&s, pad_width, zero_pad));
+                                        // §21.2.1.3: default field width is the
+                                        // widest decimal the operand's type can
+                                        // take (sign included), space-padded.
+                                        let mut core = v.to_dec_string();
+                                        if plus_sign && !core.starts_with('-') {
+                                            core.insert(0, '+');
+                                        }
+                                        let dw = Self::dec_default_width(
+                                            v.width,
+                                            v.is_signed,
+                                        );
+                                        result.push_str(&field(core, dw));
                                     }
                                     'b' | 'B' => {
-                                        let s = v.to_bin_string();
-                                        result.push_str(&pad_string(&s, pad_width, zero_pad));
+                                        let full = v.to_bin_string();
+                                        let core = if zero_pad {
+                                            Self::trim_radix_zeros(&full)
+                                        } else {
+                                            full
+                                        };
+                                        result.push_str(&field(core, 0));
                                     }
                                     'h' | 'H' | 'x' | 'X' => {
-                                        let s = v.to_hex_string();
-                                        result.push_str(&pad_string(&s, pad_width, zero_pad));
+                                        let full = v.to_hex_string();
+                                        let core = if zero_pad {
+                                            Self::trim_radix_zeros(&full)
+                                        } else {
+                                            full
+                                        };
+                                        result.push_str(&field(core, 0));
                                     }
                                     'o' | 'O' => {
-                                        let s = if let Some(u) = v.to_u64() {
-                                            format!("{:o}", u)
+                                        // Full width is ceil(bits/3) digits
+                                        // (§21.2.1.3) — "075" for an 8-bit 8'o75.
+                                        let full = Self::bin_to_oct_string(&v.to_bin_string());
+                                        let core = if zero_pad {
+                                            Self::trim_radix_zeros(&full)
                                         } else {
-                                            "x".to_string()
+                                            full
                                         };
-                                        result.push_str(&pad_string(&s, pad_width, zero_pad));
+                                        result.push_str(&field(core, 0));
                                     }
                                     'f' | 'F' => {
-                                        let s = format!("{:.6}", v.to_f64());
-                                        result.push_str(&pad_string(&s, pad_width, zero_pad));
+                                        let mut core = format!(
+                                            "{:.*}",
+                                            precision.unwrap_or(6),
+                                            v.to_f64()
+                                        );
+                                        if plus_sign && !core.starts_with('-') {
+                                            core.insert(0, '+');
+                                        }
+                                        result.push_str(&field(core, 0));
                                     }
                                     'g' | 'G' => {
                                         let s = format!("{:?}", v.to_f64());
-                                        result.push_str(&pad_string(&s, pad_width, zero_pad));
+                                        result.push_str(&field(s, 0));
                                     }
                                     'e' | 'E' => {
-                                        let s = format!("{:.6e}", v.to_f64());
-                                        result.push_str(&pad_string(&s, pad_width, zero_pad));
+                                        // C-style exponent: `1.0e+02`, two
+                                        // exponent digits minimum (§21.2.1.2).
+                                        let core = Self::c_style_exp(
+                                            v.to_f64(),
+                                            precision.unwrap_or(6),
+                                            spec == 'E',
+                                        );
+                                        result.push_str(&field(core, 0));
                                     }
                                     's' | 'S' => {
                                         if let ExprKind::StringLiteral(s) = &args[ai - 1].kind {
                                             result.push_str(s);
                                         } else {
-                                            let s = v.to_sv_string();
-                                            result.push_str(&pad_string(&s, pad_width, zero_pad));
+                                            result.push_str(&field(v.to_sv_string(), 0));
                                         }
                                     }
                                     'c' | 'C' => {
                                         let b = (v.to_u64().unwrap_or(0) & 0xff) as u8;
-                                        result.push(b as char);
+                                        result.push_str(&field((b as char).to_string(), 0));
                                     }
-                                    'm' | 'M' => {
-                                        // %m: hierarchical name of the current
-                                        // scope. Qualify the top module with the
-                                        // running process's instance scope so a
-                                        // multiply-instantiated module reports
-                                        // `TB.p1` rather than just `TB`.
-                                        if self.current_scope.is_empty() {
-                                            result.push_str(&self.module.name);
-                                        } else {
-                                            result.push_str(&format!(
-                                                "{}.{}",
-                                                self.module.name, self.current_scope
-                                            ));
-                                        }
-                                        ai -= 1;
+                                    'u' | 'U' => {
+                                        // §21.2.1.4: unformatted 2-state dump —
+                                        // the aval words as raw little-endian
+                                        // bytes, x/z read as 0, padded to whole
+                                        // 32-bit words.
+                                        result.push_str(&Self::unformatted_2state(
+                                            &v.to_bin_string(),
+                                        ));
+                                    }
+                                    'z' | 'Z' => {
+                                        // §21.2.1.4: unformatted 4-state dump —
+                                        // per 32-bit word the bval (x/z mask)
+                                        // word then the aval word, little-endian.
+                                        result.push_str(&Self::unformatted_4state(
+                                            &v.to_bin_string(),
+                                        ));
+                                    }
+                                    'v' | 'V' => {
+                                        // §21.2.1.5 strength format: driven
+                                        // strength abbreviation + logic value;
+                                        // `z` displays as HiZ.
+                                        let s = self.strength_field(&args[ai - 1], &v);
+                                        result.push_str(&field(s, 0));
                                     }
                                     _ => {
                                         result.push('%');
+                                        if left_align {
+                                            result.push('-');
+                                        }
+                                        if plus_sign {
+                                            result.push('+');
+                                        }
                                         result.push_str(&width_str);
+                                        if let Some(p) = precision {
+                                            result.push_str(&format!(".{}", p));
+                                        }
                                         result.push(spec);
                                         ai -= 1;
                                     }
@@ -27533,7 +27728,7 @@ impl Simulator {
                 result.push(c);
             }
         }
-        result
+        (result, ai)
     }
 
     /// Format and emit each queued `$strobe` after NBAs have applied
@@ -29343,10 +29538,33 @@ impl Simulator {
                 }
             }
             ExprKind::Index { expr: e, index: _ } => {
-                if let ExprKind::Ident(h) = &e.kind {
+                // Walk chained Index nodes to the root identifier, counting
+                // depth, so a multi-D element lvalue (`a[i][j]`, `a[i][j][k]`)
+                // resolves to the ELEMENT width. Falling through to 1 here
+                // truncated a mailbox/class handle assigned via
+                // `arr[i][j] = new()` to a single bit.
+                let mut depth = 1usize;
+                let mut cur: &Expression = e.as_ref();
+                while let ExprKind::Index { expr: inner, .. } = &cur.kind {
+                    depth += 1;
+                    cur = inner.as_ref();
+                }
+                if let ExprKind::Ident(h) = &cur.kind {
                     let n = self.resolve_hier_name(h);
-                    if let Some((_, _, w)) = self.module.arrays.get(&n) {
-                        return *w;
+                    if depth == 1 {
+                        if let Some((_, _, w)) = self.module.arrays.get(&n) {
+                            return *w;
+                        }
+                    }
+                    if depth == 2 {
+                        if let Some((_, _, w)) = self.module.arrays_2d.get(&n) {
+                            return *w;
+                        }
+                    }
+                    if let Some((shape, w)) = self.module.arrays_nd.get(&n) {
+                        if depth == shape.len() {
+                            return *w;
+                        }
                     }
                 }
                 1
@@ -31948,18 +32166,192 @@ impl Simulator {
     /// current scope's time unit ($time/$realtime already are); it is scaled to
     /// the $timeformat unit, printed with the configured fraction digits and
     /// suffix, and right-justified in the minimum field width.
-    fn format_time_field(&self, value: f64) -> String {
+    /// `%t` body (unpadded) plus the minimum field width in effect —
+    /// `$timeformat`'s if called, else the §21.3.5 default of 20.
+    fn format_time_parts(&self, value: f64) -> (String, usize) {
         let (scope_unit_exp, _) = self.current_timescale_exp();
         let (tf_units, tf_prec, tf_suffix, tf_width) = self
             .time_format
             .clone()
-            .unwrap_or_else(|| (Self::secs_to_exp(self.tick_s), 0, String::new(), 0));
+            .unwrap_or_else(|| (Self::secs_to_exp(self.tick_s), 0, String::new(), 20));
         let display = value * 10f64.powi(scope_unit_exp - tf_units);
         let body = format!("{:.*}{}", tf_prec, display, tf_suffix);
-        if body.len() < tf_width {
-            format!("{}{}", " ".repeat(tf_width - body.len()), body)
+        (body, tf_width)
+    }
+
+    /// §21.2.1.3: widest decimal string the operand's type can produce —
+    /// `%d` with no explicit width space-pads to this.
+    fn dec_default_width(bits: u32, signed: bool) -> usize {
+        if bits == 0 {
+            return 1;
+        }
+        let digits_of = |b: u32| (b as f64 * std::f64::consts::LOG2_10.recip()).floor() as usize + 1;
+        if signed {
+            digits_of(bits.saturating_sub(1).max(1)) + 1
         } else {
-            body
+            digits_of(bits)
+        }
+    }
+
+    /// Minimal (leading-zero-trimmed) form of a binary/octal/hex string; x/z
+    /// digits stop the trim, and an all-zero value keeps one digit.
+    fn trim_radix_zeros(s: &str) -> String {
+        let t = s.trim_start_matches('0');
+        if t.is_empty() {
+            "0".to_string()
+        } else {
+            t.to_string()
+        }
+    }
+
+    /// Full-width octal rendering from a binary string, x/z-aware: a digit is
+    /// `x`/`z` when all three bits are, `X`/`Z` when only some are.
+    fn bin_to_oct_string(bin: &str) -> String {
+        let b: Vec<char> = bin.chars().collect();
+        let mut digits: Vec<char> = Vec::with_capacity((b.len() + 2) / 3);
+        let mut hi = b.len();
+        while hi > 0 {
+            let lo = hi.saturating_sub(3);
+            let grp = &b[lo..hi];
+            let n_x = grp.iter().filter(|c| matches!(c, 'x' | 'X')).count();
+            let n_z = grp.iter().filter(|c| matches!(c, 'z' | 'Z')).count();
+            let d = if n_x == grp.len() {
+                'x'
+            } else if n_z == grp.len() {
+                'z'
+            } else if n_x > 0 {
+                'X'
+            } else if n_z > 0 {
+                'Z'
+            } else {
+                let mut val = 0u32;
+                for c in grp {
+                    val = val * 2 + if *c == '1' { 1 } else { 0 };
+                }
+                char::from_digit(val, 8).unwrap_or('0')
+            };
+            digits.push(d);
+            hi = lo;
+        }
+        digits.reverse();
+        digits.into_iter().collect()
+    }
+
+    /// C-printf-style scientific notation: `1.0e+02` — sign always present,
+    /// at least two exponent digits (Rust's `{:e}` writes `1.0e2`).
+    fn c_style_exp(x: f64, prec: usize, upper: bool) -> String {
+        let s = format!("{:.*e}", prec, x);
+        let Some(pos) = s.find(['e', 'E']) else { return s };
+        let (mantissa, exp) = s.split_at(pos);
+        let exp = &exp[1..];
+        let (sign, digits) = match exp.strip_prefix('-') {
+            Some(d) => ('-', d),
+            None => ('+', exp.trim_start_matches('+')),
+        };
+        format!(
+            "{}{}{}{:0>2}",
+            mantissa,
+            if upper { 'E' } else { 'e' },
+            sign,
+            digits
+        )
+    }
+
+    /// §21.2.1.4 `%u`: the 2-state data (x/z read as 0) as raw little-endian
+    /// bytes, padded to whole 32-bit words.
+    fn unformatted_2state(bin: &str) -> String {
+        let bits: Vec<char> = bin.chars().rev().collect(); // LSB first
+        let words = (bits.len() + 31) / 32;
+        let mut out = String::with_capacity(words * 4);
+        for byte_idx in 0..words * 4 {
+            let mut byte = 0u8;
+            for bit in 0..8 {
+                if bits.get(byte_idx * 8 + bit) == Some(&'1') {
+                    byte |= 1 << bit;
+                }
+            }
+            out.push(byte as char);
+        }
+        out
+    }
+
+    /// §21.2.1.4 `%z`: the 4-state data as raw little-endian bytes — for each
+    /// 32-bit word, the bval (x/z mask) word then the aval word. VPI encoding:
+    /// 0=(a0,b0), 1=(a1,b0), z=(a0,b1), x=(a1,b1).
+    fn unformatted_4state(bin: &str) -> String {
+        let bits: Vec<char> = bin.chars().rev().collect(); // LSB first
+        let words = (bits.len() + 31) / 32;
+        let mut out = String::with_capacity(words * 8);
+        for w in 0..words {
+            let mut word_bytes = |aval: bool, out: &mut String| {
+                for byte_in_word in 0..4 {
+                    let mut byte = 0u8;
+                    for bit in 0..8 {
+                        let c = bits.get(w * 32 + byte_in_word * 8 + bit);
+                        let set = match c {
+                            Some('1') => aval,
+                            Some('x') | Some('X') => true,
+                            Some('z') | Some('Z') => !aval,
+                            _ => false,
+                        };
+                        if set {
+                            byte |= 1 << bit;
+                        }
+                    }
+                    out.push(byte as char);
+                }
+            };
+            word_bytes(false, &mut out); // bval word
+            word_bytes(true, &mut out); // aval word
+        }
+        out
+    }
+
+    /// §21.2.1.5 `%v`: strength abbreviation + logic value for a scalar net.
+    /// The drive strength comes from the continuous assign that drives it
+    /// (`assign (pull1, pull0) n = …`); undriven or unrecorded nets display
+    /// as strong. A `z` value displays as HiZ regardless of strength.
+    fn strength_field(&mut self, arg: &Expression, v: &Value) -> String {
+        fn abbrev(tok: &str) -> &'static str {
+            if tok.starts_with("supply") {
+                "Su"
+            } else if tok.starts_with("pull") {
+                "Pu"
+            } else if tok.starts_with("weak") {
+                "We"
+            } else if tok.starts_with("highz") {
+                "Hi"
+            } else if tok.starts_with("small") {
+                "Sm"
+            } else if tok.starts_with("medium") {
+                "Me"
+            } else if tok.starts_with("large") {
+                "La"
+            } else {
+                "St"
+            }
+        }
+        let strengths: Option<(String, String)> = if let ExprKind::Ident(h) = &arg.kind {
+            let name = self.resolve_hier_name(h);
+            self.module
+                .net_strengths
+                .get(&name)
+                .or_else(|| {
+                    h.path
+                        .last()
+                        .and_then(|s| self.module.net_strengths.get(&s.name.name))
+                })
+                .cloned()
+        } else {
+            None
+        };
+        let (s1, s0) = strengths.unwrap_or_default();
+        let bit = v.to_bin_string().chars().last().unwrap_or('x');
+        match bit {
+            '1' => format!("{}1", abbrev(&s1)),
+            '0' => format!("{}0", abbrev(&s0)),
+            'z' | 'Z' => "HiZ".to_string(),
+            _ => format!("{}X", abbrev(&s1)),
         }
     }
 
@@ -33911,24 +34303,12 @@ impl Simulator {
                 return Some(Value::from_u64((hi - lo + 1) as u64, 32));
             }
             // Fallback for strings (value may be a frame-local/parameter).
+            // Counts the content bytes — including embedded/trailing NULs,
+            // which §21.2.1.4 unformatted dumps legitimately contain.
             let base_val = self.get_local_or_signal(obj_name);
 
             if let Some(base) = base_val {
-                let w = base.width;
-                let bytes = w / 8;
-                let mut len = 0u64;
-                for b in 0..bytes {
-                    let mut byte_val = 0u8;
-                    for bit in 0..8 {
-                        if base.get_bit((b * 8 + bit) as usize) == LogicBit::One {
-                            byte_val |= 1 << bit;
-                        }
-                    }
-                    if byte_val != 0 {
-                        len += 1;
-                    }
-                }
-                return Some(Value::from_u64(len, 32));
+                return Some(Value::from_u64(base.sv_string_bytes().len() as u64, 32));
             }
             return Some(Value::zero(32));
         }
@@ -33940,11 +34320,14 @@ impl Simulator {
         if mname == "getc" {
             if let Some(idx_arg) = args.get(0) {
                 let idx = self.eval_expr(idx_arg).to_u64().unwrap_or(0) as usize;
-                let s = self
+                // Byte indexing, not UTF-8: a char above 0x7F is one SV byte.
+                let b = self
                     .get_local_or_signal(obj_name)
-                    .map(|v| v.to_sv_string())
-                    .unwrap_or_default();
-                let b = s.as_bytes().get(idx).copied().unwrap_or(0);
+                    .map(|v| v.sv_string_bytes())
+                    .unwrap_or_default()
+                    .get(idx)
+                    .copied()
+                    .unwrap_or(0);
                 return Some(Value::from_u64(b as u64, 8));
             }
             return Some(Value::zero(8));
@@ -36188,23 +36571,10 @@ impl Simulator {
 
             let base = self.eval_expr(expr);
 
-            // Fallback for non-identifier base (e.g. string literals)
+            // Fallback for non-identifier base (e.g. string literals).
+            // Counts content bytes including embedded/trailing NULs.
             if mname == "len" || mname == "size" {
-                let w = base.width;
-                let bytes = w / 8;
-                let mut len = 0u64;
-                for b in 0..bytes {
-                    let mut byte_val = 0u8;
-                    for bit in 0..8 {
-                        if base.get_bit((b * 8 + bit) as usize) == LogicBit::One {
-                            byte_val |= 1 << bit;
-                        }
-                    }
-                    if byte_val != 0 {
-                        len += 1;
-                    }
-                }
-                return Value::from_u64(len, 32);
+                return Value::from_u64(base.sv_string_bytes().len() as u64, 32);
             }
 
             if mname == "get_next_item" && !real_uvm {
@@ -37059,6 +37429,32 @@ impl Simulator {
                     }
                 }
 
+                // §15.3/§15.4: a container reached through a flattened
+                // hierarchical path — `tif.ping_mbox.put(x)` parses as
+                // Ident([tif, ping_mbox, put]) — never matched the
+                // `path[0]`-keyed dispatch below, so the put/get was a
+                // silent no-op (issue #17's interface-mailbox test). Resolve
+                // the FULL receiver prefix; a mailbox/semaphore handle
+                // routes to the handle-based container dispatch. (A blocking
+                // get on an empty mailbox never reaches here — the
+                // statement-level parking path already handles it.)
+                if hier.path.len() >= 3
+                    && matches!(
+                        method_name.as_str(),
+                        "num" | "put" | "get" | "peek" | "try_put" | "try_get" | "try_peek"
+                    )
+                {
+                    let mut head = hier.clone();
+                    head.path.pop();
+                    let recv = Expression::new(ExprKind::Ident(head), func.span);
+                    let handle = self.eval_expr(&recv).to_u64().unwrap_or(0) as usize;
+                    if handle != 0
+                        && (self.mailboxes.contains_key(&handle)
+                            || self.semaphores.contains_key(&handle))
+                    {
+                        return self.exec_method_call(handle, method_name, args);
+                    }
+                }
                 let obj_val = if let Some(locals) = self.local_stack.last() {
                     locals.get(obj_name).cloned()
                 } else {

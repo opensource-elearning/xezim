@@ -91,7 +91,13 @@ fn percent_t_has_no_float_artifact() {
 `timescale 1ns/1ns
 module m; initial begin #42; $display("[%t]", $realtime); end endmodule
 "#);
-    assert!(o.contains("[42]"), "default %t must print a clean 42, not 42.0000...: {}", o);
+    // §21.3.5: with no $timeformat call the %t minimum field width is 20,
+    // so a clean "42" arrives right-justified in a 20-char field.
+    assert!(
+        o.contains(&format!("[{:>20}]", "42")),
+        "default %t must print a clean 42 in a 20-wide field: {}",
+        o
+    );
     assert!(!o.contains("42.0000"), "float artifact leaked: {}", o);
 }
 

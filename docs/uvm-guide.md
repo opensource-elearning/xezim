@@ -1,6 +1,7 @@
 # Running UVM testbenches on xezim
 
-xezim runs **UVM 1800.2-2017** testbenches end-to-end on its event-driven 4-state core:
+xezim runs **UVM 1800.2-2017 and 1800.2-2020.3.1** testbenches end-to-end on its
+event-driven 4-state core:
 build → connect → topology → `run_phase` stimulus → sequencer↔driver TLM handshake →
 packet collection → objection-driven termination → report summary.
 
@@ -61,6 +62,31 @@ If you give only one `-s`, behavior is exactly as before (no wrapper synthesized
 
 ---
 
+## UVM library versions
+
+Both Accellera reference libraries work with the same invocation — just point the
+include dir and `uvm_pkg.sv` at the version you want:
+
+| Library | Status |
+|---|---|
+| **1800.2-2017** | Reference target. 32/35 sv-tests examples; Verilator parity on the worked example (76/76 packets). |
+| **1800.2-2020.3.1** | Green on the worked example — in/out monitors agree (77/77 packets), `UVM_ERROR`/`UVM_FATAL` = 0. (The library's phasing collects one extra packet vs 2017; both runs are internally consistent.) |
+
+Two version-specific notes:
+
+- **UVM-1.2-era testbenches against a 1800.2 library** (e.g. the `1.2/examples/`
+  tree, which the 1800.2 kits don't replicate) reference deprecated-API globals
+  such as `uvm_top` and `uvm_default_printer`. The 1800.2 libraries only compile
+  those under `` `define UVM_ENABLE_DEPRECATED_API ``, so add
+  **`-D UVM_ENABLE_DEPRECATED_API`** — otherwise elaboration fails with
+  `Undeclared identifier 'uvm_top'`. This is a library configuration requirement,
+  not an xezim gap.
+- The 2020 library's inline conditional directives (a `` `ifndef … `endif ``
+  in the middle of a declaration line, §22.6) are handled by the preprocessor —
+  no user action needed.
+
+---
+
 ## What you get
 
 - **Topology** — `this.sprint(printer)` / `print()` renders the component + port tree in
@@ -115,5 +141,6 @@ mechanism works for UVM-side code as for plain SV testbenches.
 | `No test specified` (UVM_FATAL NOTEST) | Add `+UVM_TESTNAME=<name>` or ensure `run_test("<name>")` has an argument. |
 | `Requested test "X" not found` | The test class name doesn't match a compiled class; check spelling and that the file is in the source list. |
 | `unexpected token in class: "("` near a sequencer/sequence | Deprecated UVM-1.0 `` `uvm_*_utils `` macro — out of scope (see limitations). |
+| `Undeclared identifier 'uvm_top'` (or `uvm_default_printer`) at elaboration | A UVM-1.2-era testbench compiled against a 1800.2 library. Add `-D UVM_ENABLE_DEPRECATED_API` (see *UVM library versions*). |
 | Run never terminates (hits `--max-time`) | The test raises no objection (some examples run open-ended). Set `--max-time <N>` to bound it. |
 | Stimulus never flows / monitor collects 0 | Confirm the driver's `seq_item_port` connects to the sequencer in `connect_phase`, and the test starts a sequence on that sequencer. |

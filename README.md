@@ -36,11 +36,13 @@ Current capabilities include:
 * Test execution framework
 * Waveform / trace dumps — VCD (`$dumpfile`/`$dumpvars`), XTrace v1.0 (`--xtrace`,
   optional zstd compression + scope filtering), and AITRACE-T (`--aitrace`)
-* **UVM run-phase execution** (Accellera 1800.2-2017, with `-DUVM_NO_DPI`) — a real
-  UVM testbench runs end-to-end: build → connect → topology → `run_phase` stimulus →
-  sequencer↔driver TLM handshake → packet collection → objection-driven termination →
-  report summary. The reference testbench (GettingVerilatorStartedWithUVM) reaches exact
-  Verilator parity, and 32/35 UVM 1800.2-2017 example testbenches pass. Multiple top
+* **UVM run-phase execution** (Accellera **1800.2-2017 and 1800.2-2020.3.1**, with
+  `-DUVM_NO_DPI`) — a real UVM testbench runs end-to-end: build → connect → topology →
+  `run_phase` stimulus → sequencer↔driver TLM handshake → packet collection →
+  objection-driven termination → report summary. The reference testbench
+  (GettingVerilatorStartedWithUVM) reaches exact Verilator parity on the 2017
+  library and runs green on 2020.3.1, and 32/35 UVM 1800.2-2017 example
+  testbenches pass. Multiple top
   modules (`-s hdl_top -s hvl_top`) and virtual-interface `config_db` are supported.
   See [docs/uvm-guide.md](docs/uvm-guide.md).
 * UVM 1.2 runtime support, also demonstrated by running the `riscv-dv` instruction
@@ -57,29 +59,44 @@ Current capabilities include:
 * **Event-control `iff` guards** (LRM §9.4.2.3) — `@(posedge clk iff rst_n)`
   is honored in both procedural `@` waits and edge-sensitive `always` blocks:
   the process resumes only on an edge where the guard holds.
+* **User-defined nettypes with resolution functions** (LRM §6.6.7) —
+  `nettype T wire_t with resolver;` including Z-skip and built-in resolution.
+* **Per-module timescales** (LRM §3.14, §20.3, §21.3.5) — `$time`/`$realtime`
+  scale to the calling module's time unit; `timeunit`/`timeprecision`
+  declarations scale delays; `$timeformat`/`%t` and `$printtimescale` are
+  honored; precision down to `fs`. Modules without a source-level timescale can
+  be assigned one from the CLI (see
+  [`--module-timescale`](#module-timescale-extension)).
+* **VPI loading** via `--vpi-lib <path>` (`-m`) — classic VPI modules run their
+  `vlog_startup_routines`: system-task/function registration (`vpi_register_systf`)
+  and design iteration (`vpi_iterate`/`vpi_scan`, handle/property access).
 
 ---
 
-# What's new in 0.8.1
+# What's new since 0.8.5
 
-* **Event-control `iff` guards** are now evaluated (`@(posedge clk iff cond)`),
-  in both procedural waits and `always` blocks — previously the guard was
-  parsed but silently dropped, so the block fired on every clock edge.
-* **Wide-value `%0d` printing fixed** — `to_dec_string` no longer overflows for
-  values wider than 128 bits (UVM prints the 4096-bit `uvm_bitstream_t`); it now
-  uses an arbitrary-width decimal conversion.
-* **Duplicate DPI import** of the same foreign function is tolerated when the C
-  binding and property match (LRM §35.5.2), erroring only on a real conflict.
-* **Duplicate same-scope declaration** is now a hard error under strict mode
-  (the default), a warning under `--no-strict`.
-* **`+seed=<n>`** plusarg is documented in `-h` — seeds the RNG for a
-  reproducible run (same seed ⇒ byte-identical output).
-* **Library-directory (`-I`) scan tightened** — `resolve_library_modules` now
-  adopts only the library modules reachable from the compiled design (§23.3.2),
-  instead of every definition in the directory. Fixes typedef/enum leakage from
-  unrelated sibling files; lifted the sv-tests score from 52 % to 91 %.
-* **sv-tests compliance measured** — see [Compliance](#compliance) below and
-  `reports/`.
+* **UVM 1800.2-2020.3.1 runs green** — the reference testbench passes against the
+  2020.3.1 library (`UVM_ERROR : 0` / `UVM_FATAL : 0`, in/out monitors agree).
+  Closing this required a general preprocessor fix (inline
+  `` `ifdef ``/`` `endif `` mid-line, §22.6), class-body `localparam` constants,
+  and sequencer-path fixes (`process::self()`, fork/join_none automatic-variable
+  sharing).
+* **User-defined nettypes** (LRM §6.6.7) — `nettype` declarations with
+  user resolution functions, Z-skip, and built-in resolution.
+* **Per-module timescales** — `$time`/`$realtime` scale to the calling module's
+  unit; `timeunit`/`timeprecision` declarations scale delays; `$timeformat`/`%t`
+  and `$printtimescale` honored; sub-ns precision down to `fs`; new
+  [`--module-timescale`](#module-timescale-extension) CLI extension for
+  legacy RTL with no source-level timescale.
+* **String & aggregate conformance fixes** — `s[i]` read/write on string
+  variables (§11.4.13), `ref`/`output` queue arguments copy back on return
+  (§13.5.2), `%p` renders function-local queues/associative arrays (§21.2.1.7),
+  `foreach` over a string iterates its content length, `q = {}` clears string
+  queues, and a never-touched module-scope queue reports `size() == 0`.
+* **Free functions no longer see the caller's class context** (§13.4) — a bare
+  name in a package/module function that collided with a caller class property
+  used to silently alias the property; queue-property access from outside the
+  class (`obj.q.push_back(x)`, `%p` of `obj.q`) now resolves correctly.
 
 ---
 
@@ -134,11 +151,12 @@ golden expectations:
 | XuanTie C906 | cmark ×1 (INIT_ZERO=1) | 295294 cycles | 714s | **587s** (1.22×) |
 | riscv-dv (UVM 1.2) | `+num_of_tests=10` random RV32IMC | — | — | 10/10 assemble clean |
 
-UVM 1800.2-2017 run-phase (see [docs/uvm-guide.md](docs/uvm-guide.md)):
+UVM run-phase (see [docs/uvm-guide.md](docs/uvm-guide.md)):
 
 | Testbench | Result |
 |---|---|
-| GettingVerilatorStartedWithUVM (`data0`/`data1`/`random`/`many_random`) | 4/4 — exact Verilator parity (monitors agree, `UVM_ERROR`/`UVM_FATAL` = 0) |
+| GettingVerilatorStartedWithUVM vs **1800.2-2017** (`data0`/`data1`/`random`/`many_random`) | 4/4 — exact Verilator parity (monitors agree, `UVM_ERROR`/`UVM_FATAL` = 0) |
+| GettingVerilatorStartedWithUVM vs **1800.2-2020.3.1** | green — in/out monitors agree (77/77 packets), `UVM_ERROR`/`UVM_FATAL` = 0 |
 | sv-tests UVM 1800.2-2017 example suite | 32/35 pass (3 out of scope: deprecated UVM-1.0 macros, DPI backdoor) |
 
 ---

@@ -366,6 +366,51 @@ harness.
 
 ---
 
+## Classic VPI modules (`--vpi-lib`)
+
+Besides serving as a DPI callee, xezim can load a *classic* VPI application —
+one that registers system tasks/functions and walks the design:
+
+```bash
+cc -shared -fPIC -I <xezim_dir> -o my_vpi.so my_vpi.c
+xezim --vpi-lib my_vpi.so design.sv        # alias: -m my_vpi.so
+```
+
+Each library's `vlog_startup_routines` entries run before simulation.
+
+**Supported surface:**
+
+- `vpi_register_systf` — both system **tasks** and system **functions**
+  (`vpiSysFunc` returns what it deposits via `vpi_put_value` on its own call
+  handle; `vpiSizedFunc` gets its width from `sizetf`). A registered name never
+  shadows an xezim builtin.
+- `vpiSysTfCall` / `vpiArgument` — a `$systf` reads its own arguments; a
+  signal-backed argument is writable (so `output` args work), a literal is a
+  read-only `vpiConstant`.
+- Design walk: `vpi_iterate`/`vpi_scan` over `vpiModule`, `vpiNet`, `vpiReg`,
+  `vpiVariables`, `vpiParameter`, `vpiMemory`; `vpi_handle_by_name`,
+  `vpi_get`, `vpi_get_str`, `vpi_get_value`/`vpi_put_value`.
+- `vpi_control(vpiStop/vpiFinish)`, `vpi_chk_error`, `vpi_printf`.
+
+**Semantics notes:**
+
+- `vpi_iterate(vpiInternalScope, mod)` yields the module's child **scopes**,
+  per the standard — *not* its declared nets/variables (a common misuse in
+  the wild). Declared objects come from `vpiNet`/`vpiReg`/`vpiVariables`/
+  `vpiParameter`/`vpiMemory`.
+- `vpi_handle(vpiScope, NULL)` returning the top module is an xezim extension
+  (the standard route is `vpi_scan(vpi_iterate(vpiModule, NULL))`).
+
+**Not implemented** (deliberately *not declared* in `include/vpi_user.h`, so a
+call is a compile error rather than a link surprise):
+`vpi_put_userdata`/`vpi_get_userdata`, `vpi_get_systf_info`,
+`vpi_handle_multi`, `vpiStrengthVal`, and the delay/timing relations.
+
+Worked examples: `tests/dpi/vpi_object_model.{c,sv}`,
+`tests/dpi/vpi_systf.{c,sv}`.
+
+---
+
 ## See also
 
 * [`../dpi/spike/README.md`](../dpi/spike/README.md) — worked example with a real

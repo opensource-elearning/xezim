@@ -2962,6 +2962,19 @@ impl Simulator {
         // Elements the loop above just zero-filled, but which carry a value from
         // elaboration (an unpacked-array PARAMETER, §6.20.2): restore them. Their
         // names were re-pointed at fresh array slots when the array was built.
+        // §6.8: elements of an array with a 2-STATE element type default to
+        // 0, not X — `bit [7:0] mem[4]; mem[i]++` must count. (Scalar decls
+        // already zero via default_value_for_type; the element storage built
+        // above is X-filled.) Runs BEFORE the elaboration-value restore so a
+        // parameter array's real init values still win.
+        for base in module.two_state_signals.iter() {
+            if let Some(&(first_id, lo, hi)) = array_first_id.get(base.as_str()) {
+                let n = (hi - lo + 1).max(0) as usize;
+                for id in first_id..first_id + n {
+                    signal_table[id] = Value::zero(signal_widths_vec[id]);
+                }
+            }
+        }
         for (nm, v) in array_elem_inits {
             if let Some(&id) = signal_name_to_id.get(nm.as_str()) {
                 signal_table[id] = v;
@@ -3013,6 +3026,18 @@ impl Simulator {
                     &mut signal_name_to_id,
                     &mut id_to_name,
                 );
+            }
+        }
+        // §6.8 again for the 2-D / N-D element storage (named slots).
+        for base in module.two_state_signals.iter() {
+            if !module.arrays_2d.contains_key(base) && !module.arrays_nd.contains_key(base) {
+                continue;
+            }
+            let prefix = format!("{}[", base);
+            for (name, &id) in signal_name_to_id.iter() {
+                if name.starts_with(prefix.as_str()) {
+                    signal_table[id] = Value::zero(signal_widths_vec[id]);
+                }
             }
         }
         let arrays_other_ms = phase_arrays_other.elapsed().as_secs_f64() * 1000.0;
@@ -8799,6 +8824,14 @@ impl Simulator {
                 };
                 let pid = self.next_pid;
                 self.next_pid += 1;
+                // A submodule's final must resolve names, %m, and $time/%t
+                // under ITS instance scope, like initial blocks do.
+                if !fb.scope.is_empty() {
+                    self.process_scope_hint.insert(pid, fb.scope.clone());
+                    self.current_scope = fb.scope.clone();
+                } else {
+                    self.current_scope.clear();
+                }
                 self.run_process_stmts(pid, &stmts);
                 // A final block's $finish should NOT stop subsequent finals;
                 // re-clear after each.
@@ -11832,6 +11865,7 @@ impl Simulator {
                     }
                     None
                 };
+                let scope_hint = self.infer_scope_from_rw_sets(&writes, &reads);
                 let wids: Vec<usize> = writes
                     .iter()
                     .filter_map(|w| resolve_one(w.as_str()))
@@ -11842,10 +11876,29 @@ impl Simulator {
                 // cause infinite settle loops (e.g. `for (j = 0; j < N; j++)` in an
                 // always @* block).
                 let sens_reads: HashSet<String> = reads.difference(&writes).cloned().collect();
-                let rids: Vec<usize> = sens_reads
-                    .iter()
-                    .filter_map(|r| resolve_one(r.as_str()))
-                    .collect();
+                // A bare read may resolve BOTH to a top-level signal and to
+                // this block's instance-scoped one ("trig" vs "u_s.trig") —
+                // the bytecode resolves scope-FIRST at runtime, so the dep
+                // graph must include the scoped id or the block fires on the
+                // wrong signal's change and never re-fires when its actual
+                // input (fed by the port's continuous assign) settles later.
+                // Register BOTH: a superset sensitivity is always safe.
+                let mut rids: Vec<usize> = Vec::new();
+                for r in sens_reads.iter() {
+                    if let Some(scope) = &scope_hint {
+                        let q = format!("{}.{}", scope, r);
+                        if let Some(&id) = self.signal_name_to_id.get(q.as_str()) {
+                            if !rids.contains(&id) {
+                                rids.push(id);
+                            }
+                        }
+                    }
+                    if let Some(id) = resolve_one(r.as_str()) {
+                        if !rids.contains(&id) {
+                            rids.push(id);
+                        }
+                    }
+                }
                 // Unresolved reads in always @* are usually parameters, genvars,
                 // typedefs, or loop-local integer variables — none of which change
                 // at runtime. Don't mark the block as has_unresolved_reads for
@@ -11853,7 +11906,6 @@ impl Simulator {
                 // and can produce infinite settle loops when the block itself
                 // writes temporary variables (loop indices, scratch regs).
                 let has_unresolved_reads = false;
-                let scope_hint = self.infer_scope_from_rw_sets(&writes, &reads);
                 // Try bytecode-compiling the comb always block. On success
                 // the settle path skips exec_statement entirely and runs
                 // the flat Insn stream via exec_insns.
@@ -18355,7 +18407,11 @@ impl Simulator {
                     self.settle_prev_values
                         .push((id, self.signal_table[id].clone()));
                 }
+                // $time/%t in the body scales to the BLOCK's module timescale.
+                let saved_ts = self.timescale_scope_override.take();
+                self.timescale_scope_override = scope_hint.clone();
                 self.exec_statement(stmt);
+                self.timescale_scope_override = saved_ts;
                 *self.name_resolve_hint.borrow_mut() = saved_hint;
                 for i in 0..self.settle_prev_values.len() {
                     let (id, ref old_val) = self.settle_prev_values[i];
@@ -18732,7 +18788,12 @@ impl Simulator {
                                 compiled.instructions.len(),
                             )
                         };
+                        // $time/%t in a fallback stmt scales to the BLOCK's
+                        // module timescale (mirrors the edge-block dispatch).
+                        let saved_ts = self.timescale_scope_override.take();
+                        self.timescale_scope_override = entries[eidx].scope_hint.clone();
                         self.exec_insns(insns);
+                        self.timescale_scope_override = saved_ts;
                         self.prof_settle_ab_count += 1;
                     }
                     CombItem::FusedGate { op } => {
@@ -19413,10 +19474,39 @@ impl Simulator {
                         }
                     }
                 }
-                if let ExprKind::Ident(hier) = &expr.kind {
-                    let mut name = self.resolve_hier_name(hier);
+                // The array base may be a flat/hier Ident (`mem[i]`,
+                // rewritten submodule refs) OR a MemberAccess chain
+                // (`u_h.mem[q]` from a parent scope) — the latter never
+                // matched here, so hierarchical element writes were silently
+                // dropped while reads (which go through flat_member_name)
+                // worked.
+                let (base_name, hier_opt): (
+                    Option<String>,
+                    Option<&crate::ast::expr::HierarchicalIdentifier>,
+                ) = match &expr.kind {
+                    ExprKind::Ident(hier) => (Some(self.resolve_hier_name(hier)), Some(hier)),
+                    ExprKind::MemberAccess { .. } => (self.flat_member_name(expr), None),
+                    _ => (None, None),
+                };
+                if let Some(mut name) = base_name {
                     if let Some(scoped) = self.instance_assoc_member(&name) {
                         name = scoped;
+                    }
+                    // A bare name inside a SUBMODULE process resolves under
+                    // the process's instance scope (name_resolve_hint), like
+                    // scalar reads/writes already do.
+                    if !self.module.arrays.contains_key(&name)
+                        && !self.is_associative_array(&name)
+                    {
+                        let hint = self.name_resolve_hint.borrow().clone();
+                        if let Some(h) = hint {
+                            let scoped = format!("{}.{}", h, name);
+                            if self.module.arrays.contains_key(&scoped)
+                                || self.is_associative_array(&scoped)
+                            {
+                                name = scoped;
+                            }
+                        }
                     }
                     let idx_val = self.eval_expr(index);
                     // §7.8.2: an associative index containing x/z is invalid.
@@ -19590,7 +19680,7 @@ impl Simulator {
                     // `bit [7:0] seen; seen[i] = 1'b1;` inside an initial /
                     // task). Locals live in local_stack, not signal_table —
                     // mutate the Value in place.
-                    if !self.local_stack.is_empty() {
+                    if let (false, Some(hier)) = (self.local_stack.is_empty(), hier_opt) {
                         let last_idx = self.local_stack.len() - 1;
                         if let Some(cur) = self.local_stack[last_idx].get(&hier.path[0].name.name) {
                             if idx < cur.width as usize {
@@ -19608,7 +19698,9 @@ impl Simulator {
                         }
                     }
                     // Bit-select on a `this.<prop>` instance field.
-                    if let Some(Some(handle)) = self.this_stack.last().copied() {
+                    if let (Some(Some(handle)), Some(hier)) =
+                        (self.this_stack.last().copied(), hier_opt)
+                    {
                         if hier.path.len() == 1 {
                             let pname = hier.path[0].name.name.clone();
                             if let Some(Some(inst)) = self.heap.get_mut(handle) {
@@ -21496,6 +21588,13 @@ impl Simulator {
                 r
             }
             ExprKind::Index { expr, index } => {
+                if std::env::var("XEZIM_EV_DBG").is_ok() {
+                    eprintln!("[EVDBG] idx-eval base_fmn={:?} qb={:?} ean={:?} nin={:?}",
+                        self.flat_member_name(expr),
+                        self.indexed_queue_base(expr),
+                        self.expr_assoc_name(expr),
+                        self.nested_index_name(expr));
+                }
                 // Element of an unpacked ARRAY OF QUEUES: `q[i][k]` selects
                 // element k of the queue `q[i]` (§7.4.5). Without this the base
                 // resolves to a scalar and `[k]` becomes a bit-select.
@@ -21624,10 +21723,33 @@ impl Simulator {
                     }
                 }
                 // Check if this is an array element access (memory[idx]) vs bit select
-                if let ExprKind::Ident(hier) = &expr.kind {
-                    let mut name = self.resolve_hier_name(hier);
+                // The base may be a flat/hier Ident OR a MemberAccess chain
+                // (`u_h.mem[q]` from a parent scope) — mirror of the same
+                // shape in assign_value.
+                let idx_base_name: Option<String> = match &expr.kind {
+                    ExprKind::Ident(hier) => Some(self.resolve_hier_name(hier)),
+                    ExprKind::MemberAccess { .. } => self.flat_member_name(expr),
+                    _ => None,
+                };
+                if let Some(mut name) = idx_base_name {
                     if let Some(scoped) = self.instance_assoc_member(&name) {
                         name = scoped;
+                    }
+                    // A bare name inside a SUBMODULE process resolves under
+                    // the process's instance scope (name_resolve_hint), like
+                    // scalar reads/writes already do.
+                    if !self.module.arrays.contains_key(&name)
+                        && !self.is_associative_array(&name)
+                    {
+                        let hint = self.name_resolve_hint.borrow().clone();
+                        if let Some(h) = hint {
+                            let scoped = format!("{}.{}", h, name);
+                            if self.module.arrays.contains_key(&scoped)
+                                || self.is_associative_array(&scoped)
+                            {
+                                name = scoped;
+                            }
+                        }
                     }
                     if self.module.arrays.contains_key(&name) || self.is_associative_array(&name) {
                         // Array element access: look up signal "name[idx]"
@@ -25563,6 +25685,34 @@ impl Simulator {
                     if let Some(scoped) = self.instance_assoc_member(&name) {
                         name = scoped;
                     }
+                    // A bare array name inside a SUBMODULE process resolves
+                    // under the process's instance scope ("u_s.mem"), like
+                    // reads/writes already do — otherwise the collection
+                    // lookups all miss and the foreach body never runs.
+                    if !self.module.arrays.contains_key(&name)
+                        && !self.module.arrays_2d.contains_key(&name)
+                        && !self.module.arrays_nd.contains_key(&name)
+                        && !self.module.dynamic_arrays.contains(&name)
+                        && !self.is_associative_array(&name)
+                    {
+                        let hint = self.name_resolve_hint.borrow().clone();
+                        if let Some(h) = hint {
+                            let scoped = format!("{}.{}", h, name);
+                            if self.module.arrays.contains_key(&scoped)
+                                || self.module.arrays_2d.contains_key(&scoped)
+                                || self.module.arrays_nd.contains_key(&scoped)
+                                || self.module.dynamic_arrays.contains(&scoped)
+                                || self.is_associative_array(&scoped)
+                            {
+                                name = scoped;
+                            }
+                        }
+                    }
+                    // The array's instance prefix ("u_s" from "u_s.mem") —
+                    // loop vars are ALSO bound under it (see
+                    // set_loop_var_aliased).
+                    let var_scope: Option<String> =
+                        name.rsplit_once('.').map(|(p, _)| p.to_string());
                     // IEEE 1800-2017 §12.7.3: one loop variable per leading
                     // dimension — `foreach (m[i, j])`. A null entry (`m[, j]`)
                     // skips that dimension. Only `vars[0]` was ever bound, so
@@ -25577,7 +25727,12 @@ impl Simulator {
                                 dims[0] = (0, sz - 1);
                             }
                             if dims.len() >= vars.len() {
-                                self.exec_foreach_nested(&dims[..vars.len()], vars, body);
+                                self.exec_foreach_nested(
+                                    &dims[..vars.len()],
+                                    vars,
+                                    body,
+                                    var_scope.as_deref(),
+                                );
                                 self.restore_loop_vars(&fe_saved);
                                 return;
                             }
@@ -25615,7 +25770,7 @@ impl Simulator {
                                 } else {
                                     Value::from_u64(key.parse::<u64>().unwrap_or(0), 32)
                                 };
-                                self.set_loop_var(&var.name, kv);
+                                self.set_loop_var_aliased(var_scope.as_deref(), &var.name, kv);
                                 self.continue_flag = false;
                                 self.exec_statement(body);
                                 // `continue` is per-iteration (clear it); a
@@ -25633,7 +25788,7 @@ impl Simulator {
                                 if self.finished {
                                     break;
                                 }
-                                self.set_loop_var(&var.name, Value::from_u64(i, 32));
+                                self.set_loop_var_aliased(var_scope.as_deref(), &var.name, Value::from_u64(i, 32));
                                 self.continue_flag = false;
                                 self.exec_statement(body);
                                 // `continue` is per-iteration (clear it); a
@@ -25653,7 +25808,7 @@ impl Simulator {
                                     break;
                                 }
                                 let v = if descending { hi - (idx - lo) } else { idx };
-                                self.set_loop_var(&var.name, Value::from_u64(v as u64, 32));
+                                self.set_loop_var_aliased(var_scope.as_deref(), &var.name, Value::from_u64(v as u64, 32));
                                 self.continue_flag = false;
                                 self.exec_statement(body);
                                 // `continue` is per-iteration (clear it); a
@@ -25676,7 +25831,7 @@ impl Simulator {
                                 if self.finished {
                                     break;
                                 }
-                                self.set_loop_var(&var.name, Value::from_u64(i, 32));
+                                self.set_loop_var_aliased(var_scope.as_deref(), &var.name, Value::from_u64(i, 32));
                                 self.continue_flag = false;
                                 self.exec_statement(body);
                                 if self.break_flag {
@@ -25691,7 +25846,7 @@ impl Simulator {
                                 if self.finished {
                                     break;
                                 }
-                                self.set_loop_var(&var.name, Value::from_u64(i, 32));
+                                self.set_loop_var_aliased(var_scope.as_deref(), &var.name, Value::from_u64(i, 32));
                                 self.continue_flag = false;
                                 self.exec_statement(body);
                                 // `continue` is per-iteration (clear it); a
@@ -26396,6 +26551,49 @@ impl Simulator {
                                 self.module.dynamic_arrays.insert(name.clone());
                                 self.widths.insert(name.clone(), w);
                                 self.set_queue_size(&name, 0);
+                                // §7.4.5: a LOCAL `T a[][16]` / `a[$][16]` —
+                                // dynamic outer with fixed trailing dims —
+                                // registers the 2-D/N-D shape like a module-
+                                // scope one, else the trailing dims are
+                                // dropped and `a[i][j]` misaddresses.
+                                if dims.len() >= 2
+                                    && dims[1..].iter().all(|dm| matches!(
+                                        dm,
+                                        UnpackedDimension::Range { .. }
+                                            | UnpackedDimension::Expression { .. }
+                                    ))
+                                {
+                                    let inner: Option<Vec<(i64, i64)>> = dims[1..]
+                                        .iter()
+                                        .map(|dm| super::elaborate::extract_array_range(
+                                            std::slice::from_ref(dm),
+                                            &self.module.parameters,
+                                        ))
+                                        .collect();
+                                    if let Some(inner) = inner.filter(|sh| {
+                                        sh.iter().all(|&(lo, hi)| hi >= lo && hi - lo < 4096)
+                                    }) {
+                                        self.module.arrays.remove(&name);
+                                        if inner.len() == 1 {
+                                            self.module
+                                                .arrays_2d
+                                                .insert(name.clone(), ((0, 63), inner[0], w));
+                                        } else {
+                                            let mut shape = vec![(0i64, 63i64)];
+                                            shape.extend(inner.iter().cloned());
+                                            self.module.arrays_nd.insert(name.clone(), (shape, w));
+                                        }
+                                        if let crate::ast::types::DataType::TypeReference {
+                                            name: tn, ..
+                                        } = data_type
+                                        {
+                                            self.module.array_elem_class.insert(
+                                                name.clone(),
+                                                tn.name.name.clone(),
+                                            );
+                                        }
+                                    }
+                                }
                                 // A `string q[$]` queue: mark the name so its
                                 // elements are treated as strings (`%p`, `%s`,
                                 // concat) — the element-string check keys off
@@ -31123,6 +31321,18 @@ impl Simulator {
         }
     }
 
+    /// `set_loop_var`, plus a scope-prefixed alias. Inlining rewrites a
+    /// submodule foreach BODY's loop-var references to "u_s.i" but leaves the
+    /// foreach var list's Identifiers bare, so the body's index reads would
+    /// miss the value `set_loop_var("i", ..)` stored. `scope` is the array's
+    /// instance prefix (None at top level, where names already agree).
+    fn set_loop_var_aliased(&mut self, scope: Option<&str>, name: &str, v: Value) {
+        if let Some(p) = scope {
+            self.set_loop_var(&format!("{}.{}", p, name), v.clone());
+        }
+        self.set_loop_var(name, v);
+    }
+
     /// Snapshot loop-index variables' current values (for `foreach` scope
     /// save/restore). A `foreach (arr[i])` index is loop-scoped in SV, so the
     /// outer `i` must be unchanged afterward — riscv-dv's
@@ -31609,6 +31819,7 @@ impl Simulator {
         all_dims: &[(i64, i64)],
         vars: &[Option<crate::ast::Identifier>],
         body: &Statement,
+        scope: Option<&str>,
     ) {
         let iterated: Vec<((i64, i64), &crate::ast::Identifier)> = all_dims
             .iter()
@@ -31629,7 +31840,7 @@ impl Simulator {
                 return;
             }
             for (k, (_, id)) in iterated.iter().enumerate() {
-                self.set_loop_var(&id.name, Value::from_u64(idx[k] as u64, 32));
+                self.set_loop_var_aliased(scope, &id.name, Value::from_u64(idx[k] as u64, 32));
             }
             self.continue_flag = false;
             self.exec_statement(body);
@@ -32730,6 +32941,16 @@ impl Simulator {
             self.copy_unpacked_struct(&dst, &src, &su);
             return;
         }
+        // Queue of FIXED arrays: an element is a whole ROW of `[j]` slots.
+        if let Some(&(_, (jlo, jhi), _)) = self.module.arrays_2d.get(src_obj) {
+            for j in jlo..=jhi {
+                let v = self
+                    .get_signal_value_by_name(&format!("{}[{}]", src, j))
+                    .unwrap_or_else(|| Value::zero(32));
+                self.set_signal_value_by_name(&format!("{}[{}]", dst, j), v);
+            }
+            return;
+        }
         if let Some(v) = self.get_signal_value_by_name(&src) {
             self.set_signal_value_by_name(&dst, v);
         }
@@ -32846,6 +33067,31 @@ impl Simulator {
     /// each member in its own signal, so writing one packed value (what
     /// `push_back` used to do) loses every member.
     fn queue_store_elem(&mut self, obj_name: &str, elem: &str, arg: &Expression) {
+        // §7.4.5: a queue of FIXED arrays (`int q[$][4]`) stores each row's
+        // elements at `q[i][j]` — evaluating the row to one packed value
+        // would land in a phantom scalar `q[i]` that no read ever visits.
+        if let Some(&(_, (jlo, jhi), _)) = self.module.arrays_2d.get(obj_name) {
+            if let Some(src) = self.flat_member_name(arg) {
+                if let Some(&(slo, _, _)) = self.module.arrays.get(&src) {
+                    for (k, j) in (jlo..=jhi).enumerate() {
+                        let v = self
+                            .get_signal_value_by_name(&format!("{}[{}]", src, slo + k as i64))
+                            .unwrap_or_else(|| Value::zero(32));
+                        self.set_signal_value_by_name(&format!("{}[{}]", elem, j), v);
+                    }
+                    return;
+                }
+            }
+            if let ExprKind::AssignmentPattern(items) = &arg.kind {
+                let vals: Vec<Value> =
+                    items.iter().map(|it| self.eval_expr(it.expr())).collect();
+                for (k, j) in (jlo..=jhi).enumerate() {
+                    let v = vals.get(k).cloned().unwrap_or_else(|| Value::zero(32));
+                    self.set_signal_value_by_name(&format!("{}[{}]", elem, j), v);
+                }
+                return;
+            }
+        }
         if let Some(dt) = self.p_elem_type(obj_name) {
             if let DataType::Struct(su) = self.resolve_dt(&dt) {
                 if Self::spreads_member_wise(&su) {
@@ -37410,6 +37656,28 @@ impl Simulator {
                                         return res;
                                     }
                                 }
+                            }
+                        }
+                    }
+                    // A collection reached through a hierarchical path —
+                    // `tif.q.push_back(x)` flattens to Ident([tif, q,
+                    // push_back]); the FULL prefix must be tried BEFORE the
+                    // bare second-to-last segment, else a stale same-named
+                    // local collection (`int q[$]` from another block)
+                    // swallows the call (issue-#17 sibling, same shape as
+                    // the mailbox fix below).
+                    if hier.path.len() >= 3 {
+                        let full = hier.path[..hier.path.len() - 1]
+                            .iter()
+                            .map(|s| s.name.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(".");
+                        if self.module.arrays.contains_key(&full)
+                            || self.module.dynamic_arrays.contains(&full)
+                            || self.is_associative_array(&full)
+                        {
+                            if let Some(res) = self.eval_builtin_method(&full, m, args) {
+                                return res;
                             }
                         }
                     }

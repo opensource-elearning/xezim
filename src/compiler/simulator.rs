@@ -725,6 +725,10 @@ struct EdgeSensitiveBlock {
     resolved_sensitivities: Vec<SensitivityId>,
     stmt: Statement,
     kind: AlwaysKind,
+    /// Instance scope the block was inlined under, empty for top-level.
+    /// Preferred over sensitivity-derived scopes (a port-connected clock's
+    /// sensitivity collapses to the PARENT's signal and yields none).
+    scope: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1810,6 +1814,11 @@ pub struct Simulator {
     /// name-resolution hint so AST-evaluated bare names in a multiply-
     /// instantiated module resolve to THIS instance's signals.
     process_scope_hint: HashMap<usize, String>,
+    /// Instance scope of the edge block currently executing (set around
+    /// dispatch, cleared after). `current_module_def` prefers it over the
+    /// per-pid hint so $time/%t scale to the BLOCK's module timescale, not
+    /// the last scheduled process's.
+    timescale_scope_override: Option<String>,
     /// Stable instance scope of the process currently running (for `%m`).
     /// Unlike `name_resolve_hint`, this is not mutated by name resolution.
     current_scope: String,
@@ -3167,6 +3176,7 @@ impl Simulator {
             process_parents: HashMap::default(),
             process_contexts: HashMap::default(),
             process_scope_hint: HashMap::default(),
+            timescale_scope_override: None,
             current_scope: String::new(),
             return_value: None,
             rng: rand::rngs::StdRng::from_entropy(),
@@ -9141,6 +9151,7 @@ impl Simulator {
                     return Some(AlwaysBlock {
                         kind: ab.kind,
                         stmt: body,
+                        scope: ab.scope,
                     });
                 }
                 let resolved: Vec<SensitivityId> = sens
@@ -9169,12 +9180,14 @@ impl Simulator {
                     resolved_sensitivities: resolved,
                     stmt: body,
                     kind: ab.kind,
+                    scope: ab.scope,
                 });
                 return None;
             }
             return Some(AlwaysBlock {
                 kind: ab.kind,
                 stmt: body,
+                scope: ab.scope,
             });
         }
         if ab.kind == AlwaysKind::Always {
@@ -9258,14 +9271,21 @@ impl Simulator {
         let mut bc_count = 0;
         let mut max_regs: u16 = 0;
         for block in &self.edge_blocks {
-            // Derive a scope hint from the block's first sensitivity signal —
-            // unqualified idents inside the block are resolved under this
-            // parent module scope.
-            let scope_hint = block
-                .resolved_sensitivities
-                .first()
-                .and_then(|sid| self.id_to_name.get(sid.signal_id))
-                .and_then(|full| full.rsplit_once('.').map(|(p, _)| p.to_string()));
+            // Scope hint for unqualified idents inside the block: the
+            // block's own inlining scope when it has one, else derived from
+            // the first sensitivity signal. (Sensitivity-only derivation
+            // fails when a port-connected clock collapses to the parent's
+            // signal — e.g. `always_ff @(posedge clk)` in a submodule whose
+            // clk is the top clock.)
+            let scope_hint = if !block.scope.is_empty() {
+                Some(block.scope.clone())
+            } else {
+                block
+                    .resolved_sensitivities
+                    .first()
+                    .and_then(|sid| self.id_to_name.get(sid.signal_id))
+                    .and_then(|full| full.rsplit_once('.').map(|(p, _)| p.to_string()))
+            };
             let mut compiler = BytecodeCompiler::new(
                 &self.signal_name_to_id,
                 &self.signal_signed,
@@ -9559,12 +9579,17 @@ impl Simulator {
             // Non-compiled blocks (AST-only) always need hint.
             self.edge_block_needs_hint
                 .push(has_fallback || cb.is_none());
-            let scope = self
-                .edge_blocks
-                .get(idx)
-                .and_then(|b| b.resolved_sensitivities.first())
-                .and_then(|sid| self.id_to_name.get(sid.signal_id))
-                .and_then(|full| full.rsplit_once('.').map(|(p, _)| p.to_string()));
+            // Prefer the block's own inlining scope (see compile_edge_blocks).
+            let scope = self.edge_blocks.get(idx).and_then(|b| {
+                if !b.scope.is_empty() {
+                    Some(b.scope.clone())
+                } else {
+                    b.resolved_sensitivities
+                        .first()
+                        .and_then(|sid| self.id_to_name.get(sid.signal_id))
+                        .and_then(|full| full.rsplit_once('.').map(|(p, _)| p.to_string()))
+                }
+            });
             self.edge_block_scope.push(scope);
         }
         sim_dbg_eprintln!(
@@ -17121,10 +17146,14 @@ impl Simulator {
                     let saved_hint = self.name_resolve_hint.borrow().clone();
                     if let Some(scope) = self.edge_block_scope.get(bi).and_then(|s| s.as_ref()) {
                         *self.name_resolve_hint.borrow_mut() = Some(scope.clone());
+                        // $time/%t in the fallback body must scale to THIS
+                        // block's module timescale (see current_module_def).
+                        self.timescale_scope_override = Some(scope.clone());
                     }
                     if !self.exec_bytecode(bi) {
                         self.exec_statement(&blocks[bi].stmt);
                     }
+                    self.timescale_scope_override = None;
                     *self.name_resolve_hint.borrow_mut() = saved_hint;
                 } else {
                     self.exec_bytecode(bi);
@@ -32141,7 +32170,17 @@ impl Simulator {
     /// instance-scope hint. The top module's own definition when there is no
     /// hint (the process runs in the top scope).
     fn current_module_def(&self) -> &str {
-        match self.process_scope_hint.get(&self.current_pid) {
+        // An edge block executes outside any scheduled process, so
+        // `current_pid` is whatever ran last — its module's timescale would
+        // leak into this block's $time/%t (issue seen with --module-timescale
+        // on a hierarchical design: the first clock edge in a scaled
+        // submodule printed the TOP-scaled time). The dispatcher installs the
+        // block's own instance scope here for the duration.
+        match self
+            .timescale_scope_override
+            .as_ref()
+            .or_else(|| self.process_scope_hint.get(&self.current_pid))
+        {
             Some(s) if !s.is_empty() => {
                 let rel = s.strip_prefix(&format!("{}.", self.module.name)).unwrap_or(s);
                 self.module

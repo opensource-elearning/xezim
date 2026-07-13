@@ -12,8 +12,13 @@
 use std::process::Command;
 
 fn run(args: &[&str], src: &str) -> (String, bool) {
+    // Unique per call — tests run in parallel, and a name keyed on the arg
+    // length alone collides (two tests with same-length args race on the
+    // same file).
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = std::env::temp_dir();
-    let path = dir.join(format!("mts_{}_{}.sv", std::process::id(), args.join("_").len()));
+    let path = dir.join(format!("mts_{}_{}.sv", std::process::id(), n));
     std::fs::write(&path, src).unwrap();
     let bin = env!("CARGO_BIN_EXE_xezim");
     let mut cmd = Command::new(bin);
@@ -160,4 +165,64 @@ module top; peripheral u0(); peripheral u1(); endmodule
     assert!(ok, "{}", o);
     // Both instances read 1 (their shared 10ns unit).
     assert_eq!(o.matches("P=1").count(), 2, "both instances should read 1: {}", o);
+}
+
+#[test]
+fn an_edge_block_in_a_scaled_submodule_reads_time_in_its_own_unit() {
+    // The always_ff's $realtime must scale to COUNTER's 10ns unit on EVERY
+    // fire. It used to inherit whatever process ran last (the first edge
+    // printed top-scaled time), because the edge block's timescale scope was
+    // derived from its sensitivity signal — which, for a port-connected
+    // clock, collapses to the PARENT's `clk` and yields no scope.
+    let (o, ok) = run(
+        &["--module-timescale", "counter=10ns/1ns"],
+        r#"
+module counter (input logic clk);
+  bit [7:0] cnt;
+  always_ff @(posedge clk) begin
+    cnt++;
+    if (cnt <= 2) $display("EDGE%0d rt=%0.3f", cnt, $realtime);
+  end
+endmodule
+module top;
+  bit clk = 0;
+  always #2 clk = ~clk;   // posedges at 2ns, 6ns, ...
+  counter u_cnt (.clk(clk));
+  initial begin #10; $finish; end
+endmodule
+"#,
+    );
+    assert!(ok, "{}", o);
+    assert!(o.contains("EDGE1 rt=0.200"), "first edge must be 0.2 (own 10ns unit): {}", o);
+    assert!(o.contains("EDGE2 rt=0.600"), "second edge must be 0.6: {}", o);
+}
+
+#[test]
+fn nested_hierarchy_levels_each_scale_to_their_own_unit() {
+    // top(1ns) -> mid(10ns via CLI) -> leaf(100ns via CLI): `#1` and $time
+    // scale per level, at any depth.
+    let (o, ok) = run(
+        &["--module-timescale", "mid=10ns/1ns", "--module-timescale", "leaf=100ns/1ns"],
+        r#"
+module leaf;
+  initial begin #1; $display("LEAF t=%0d rt=%0.3f", $time, $realtime); end
+endmodule
+module mid;
+  leaf u_leaf ();
+  initial begin #1; $display("MID t=%0d rt=%0.3f", $time, $realtime); end
+endmodule
+`timescale 1ns/1ns
+module top;
+  mid u_mid ();
+  initial begin #150; $display("TOP@150"); $finish; end
+endmodule
+"#,
+    );
+    assert!(ok, "{}", o);
+    assert!(o.contains("MID t=1 rt=1.000"), "mid #1 = 10ns, reads 1 in its unit: {}", o);
+    assert!(o.contains("LEAF t=1 rt=1.000"), "leaf #1 = 100ns, reads 1 in its unit: {}", o);
+    // Ordering proves the absolute times differ: MID (10ns) before LEAF (100ns).
+    let m = o.find("MID t=1").unwrap();
+    let l = o.find("LEAF t=1").unwrap();
+    assert!(m < l, "mid fires before leaf: {}", o);
 }

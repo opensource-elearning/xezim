@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the synthetic xezim benchmark designs (B2, B3, B4, B5).
+"""Generate the synthetic xezim benchmark designs (B2, B3, B5).
 
 Each design is self-contained SystemVerilog with a fixed amount of work, so
 that ns_per_insn / insns-per-second are comparable across machines. Work is
@@ -131,43 +131,6 @@ def mem_sweep(log2_depth, cycles=100_000):
     write(f"b3_mem_sweep_{log2_depth}.sv", "\n".join(L) + "\n")
 
 
-# ---------------------------------------------------------------- B4
-def parallel(n_units=32, cycles=100_000):
-    """N independent state machines with no cross-talk: the ideal case for
-    parallel edge dispatch. Any flattening of the speedup curve is xezim's
-    merge/atomics cost, not the workload's."""
-    L = []
-    L.append(f"// B4 parallel-scaling: {n_units} independent units")
-    L.append("module unit #(parameter int ID = 0) (input logic clk, output logic [31:0] out);")
-    L.append("  logic [31:0] a, b, c;")
-    L.append("  always_ff @(posedge clk) begin")
-    L.append("    a <= a + 32'd1 + ID;")
-    L.append("    b <= b ^ (a << 3);")
-    L.append("    c <= c + (b >> 2) + a;")
-    L.append("  end")
-    L.append("  assign out = c;")
-    L.append("endmodule")
-    L.append("module bench_parallel;")
-    L.append("  bit clk = 0;")
-    L.append(f"  logic [31:0] outs [{n_units}];")
-    L.append("  int cyc = 0;")
-    L.append("  always #1 clk = ~clk;")
-    L.append("  genvar g;")
-    L.append("  generate")
-    L.append(f"    for (g = 0; g < {n_units}; g++) begin : u")
-    L.append("      unit #(.ID(g)) inst (.clk(clk), .out(outs[g]));")
-    L.append("    end")
-    L.append("  endgenerate")
-    L.append("  always_ff @(posedge clk) cyc <= cyc + 1;")
-    L.append(f"  initial begin")
-    L.append(f"    #({2*cycles});")
-    L.append(f"    $display(\"BENCH_DONE cycles=%0d checksum=%0d\", cyc, outs[0] + outs[{n_units-1}]);")
-    L.append("    $finish;")
-    L.append("  end")
-    L.append("endmodule")
-    write("b4_parallel.sv", "\n".join(L) + "\n")
-
-
 # ---------------------------------------------------------------- B5
 def constraint_rand(iters=20_000):
     """Randomization throughput: dist + foreach + unique + inline constraints.
@@ -206,6 +169,5 @@ if __name__ == "__main__":
     vm_dispatch_branchy()
     for n in (10, 12, 14, 16, 18, 20, 22):
         mem_sweep(n)
-    parallel()
     constraint_rand()
     print("done.")

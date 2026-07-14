@@ -1,6 +1,6 @@
 # xezim cross-platform benchmarks
 
-Five benchmarks chosen so that each stresses a **different hardware axis**.
+Four benchmarks chosen so that each stresses a **different hardware axis**.
 The point is not a single score — it is that when AMD / Intel / Graviton
 diverge, you can attribute *why*.
 
@@ -11,7 +11,6 @@ diverge, you can attribute *why*.
 | B2b | `dispatch_branchy` | interpreter rate, data-dependent path (sequential) | **indirect-branch prediction** |
 | B2c | `dispatch_branchy_par` | same design under xezim's auto-parallel dispatch | **thread fork/join + sync cost** |
 | B3 | `mem-sweep` | ns/cycle as the working set walks L1 → LLC → DRAM | cache hierarchy, memory latency/bandwidth, TLB |
-| B4 | `parallel-scaling` | edge-dispatch parallelism (`XEZIM_DISPATCHER`) | atomics, false sharing, core count vs SMT |
 | B5 | `constraint-rand` | `randomize()` throughput (dist/foreach/unique) | branchy code, allocation, hashing, **i128 math** |
 
 `B1 ÷ B2` tells you how much of xezim's real-world cost is memory versus
@@ -22,7 +21,7 @@ exact arithmetic added for §18, which lowers very differently on aarch64.
 
 ```bash
 python3 bench/gen_designs.py          # generate the synthetic designs
-./bench/run_bench.sh                  # B2..B5, 5 reps, writes bench_<host>_<arch>.csv
+./bench/run_bench.sh                  # B2, B3, B5 — 5 reps; writes bench_<host>_<arch>.csv
 ./bench/run_bench.sh -b B1,B2 -r 9    # pick benchmarks / reps
 ./bench/summarize.py results/*.csv    # compare hosts side by side
 ```
@@ -40,7 +39,7 @@ can simply be concatenated and fed to `summarize.py`.
   will just rank clock speeds.
 * **Same toolchain on all three hosts** (identical rustc/LLVM). Report both
   stock and `RUSTFLAGS="-C target-cpu=native"`; on Graviton confirm LSE atomics
-  are enabled, since B4 depends on them.
+  are enabled, since B2c depends on them.
 * **Pin cores, ≥5 reps, use the median.** `summarize.py` flags any row whose
   spread across reps exceeds 10% (`!`) — do not draw conclusions from those.
 * **Keep the `[PROF]` split.** Each row records `settle / edges / nba /
@@ -72,11 +71,7 @@ memory story. Without counters you can only observe the gap.
 
 * **`--threads n` is not parallel simulation.** Per `--help` it only offloads
   stdout writes to a background thread. Parallel edge dispatch is selected with
-  `XEZIM_DISPATCHER=pdes|perlp`, which is what B4 sweeps.
-* On this dev box (6-core Intel i7-9800X), B4 showed **no speedup** from any
-  dispatcher, and 4× the independent work produced only ~1.5× more unit-updates
-  per second. If that reproduces on the other platforms, the limit is xezim's
-  NBA merge, not the hardware — which is precisely what B4 exists to find.
+  xezim's own calibration (see below), or forced with `XEZIM_FORCE_PARALLEL=1`.
 * B3 already shows a clean knee on this box: ~537k cycles/s at a 4 KiB working
   set → ~279k at 16 MiB.
 * **The original B2 was not branch-bound.** With a block order that repeats
@@ -115,7 +110,8 @@ memory story. Without counters you can only observe the gap.
 
   On this box calibration picks SEQUENTIAL for every design in the suite,
   including the one shape parallelism should suit (8 blocks x ~6k insns) — so
-  xezim's parallel edge path is currently not profitable here at all. Whether
-  that holds on many-core Graviton is exactly what B2c/B4 are for.
+  xezim's parallel edge path is currently not profitable here at all. B2c
+  (forced parallel) is what tells you whether that also holds on the other
+  machines.
 * For contrast, B5 (the constraint solver) runs at IPC 2.25 with a 1.1%
   branch-miss rate: it *is* the branchy, unpredictable workload of the set.

@@ -9,7 +9,7 @@ set -uo pipefail
 
 REPS=5
 OUT="bench_$(hostname -s)_$(uname -m).csv"
-BENCHES="B2,B3,B4,B5"          # B1 (c910) is opt-in: needs the external RTL
+BENCHES="B2,B3,B5"          # B1 (c910) is opt-in: needs the external RTL
 XEZIM="./target/release/xezim"
 GEN="$(dirname "$0")/gen"
 
@@ -114,7 +114,7 @@ run() {
       continue
     fi
 
-    # The primary rate for each bench: simulated cycles/sec (B2/B3/B4) or
+    # The primary rate for each bench: simulated cycles/sec (B2/B3) or
     # randomizations/sec (B5). ns_per_insn only covers bytecode-executed
     # work, so it reads 0 for the solver benchmark.
     local items rate
@@ -169,25 +169,6 @@ if have B3; then
     kib=$(( (1 << n) * 4 / 1024 ))
     run B3 "ws_${kib}KiB" 1 "$kib" "$GEN/b3_mem_sweep_${n}.sv" --max-time 250000
   done
-fi
-
-# ---------------------------------------------------------------- B4
-if have B4; then
-  echo "== B4 parallel-scaling (dispatcher sweep)"
-  # NOTE: `--threads n` only offloads stdout writes — it is NOT parallel
-  # simulation. Parallel edge dispatch is selected with XEZIM_DISPATCHER
-  # (the default path already threads when a tick has enough independent
-  # blocks), so the sweep is over the dispatcher, not over --threads.
-  # This is the benchmark that measures xezim's parallelism, so it is also
-  # the one most likely to expose a scaling limit in xezim rather than in
-  # the hardware.
-  ( unset XEZIM_DISPATCHER; run B4 "disp_default" 1 32 "$GEN/b4_parallel.sv" --max-time 250000 )
-  for d in pdes perlp; do
-    XEZIM_DISPATCHER="$d" run B4 "disp_${d}" 1 32 "$GEN/b4_parallel.sv" --max-time 250000
-  done
-  # Same design, more independent units: if the speedup is real it should grow
-  # with available parallel work; if it is flat, the limit is the NBA merge.
-  XEZIM_DISPATCHER=pdes run B4 "disp_pdes_wide" 1 128 "$GEN/b4_parallel_wide.sv" --max-time 250000
 fi
 
 # ---------------------------------------------------------------- B5

@@ -1159,6 +1159,12 @@ fn main() {
             std::process::exit(1);
         }
 
+        // §9.4.5 intra-assignment delay canonicalization — keep the compiled
+        // artifact consistent with the simulate path (see xezim::intra_delay).
+        let sources: Vec<String> = sources
+            .iter()
+            .map(|s| xezim::intra_delay::rewrite_intra_assignment_delays(s))
+            .collect();
         match xezim::parse_and_elaborate_multi(
             &sources,
             top_module.as_deref(),
@@ -1178,6 +1184,10 @@ fn main() {
                     std::process::exit(1);
                 }
                 println!("Elaboration successful");
+                // §6.21: keep compiled artifacts consistent with the simulate
+                // path — re-issue static initializers that call simulation-time
+                // system functions as time-0 assignments (issue #26).
+                xezim::defer_static_syscall_inits(&_defs, &mut elab);
                 if let Some(ref out) = _output_file {
                     // The serialized artifact format flattens always_blocks /
                     // initial_blocks / continuous_assigns; pending_* are

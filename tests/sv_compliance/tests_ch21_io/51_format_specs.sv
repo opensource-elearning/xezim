@@ -56,7 +56,7 @@ module test_format_specs;
     // ---- decimal: %0d == %d (no full-width default) ----
     s = $sformatf("%d", 32'd255);         check(s, "       255", "%d default");
     s = $sformatf("%0d", 32'd255);        check(s, "255", "%0d");
-    s = $sformatf("%05d", 32'd42);        check(s, "   42", "%05d (LRM: decimal space-padded)");
+    s = $sformatf("%05d", 32'd42);        check(s, "00042", "%05d zero-padded decimal");
     s = $sformatf("%5d", 32'd42);         check(s, "   42", "%5d space-pad");
 
     // ---- .N precision on real ----

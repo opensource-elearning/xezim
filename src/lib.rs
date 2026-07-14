@@ -7,8 +7,11 @@
 //! For ahead-of-time native compilation, use the `xezim-b` crate.
 
 pub mod compiler;
+pub mod intra_delay;
 pub mod multikernel;
 pub mod should_fail_lint;
+
+use xezim_core::elaborate;
 
 // Re-export xezim-core surface so existing `xezim::...` paths keep working.
 pub use xezim_core::{
@@ -17,6 +20,239 @@ pub use xezim_core::{
     tokenize_file, write_compiled, ModuleTimescaleCli, ParseResult, SourceDefinition,
     XEZIM_BYTECODE_MAGIC,
 };
+
+// ---------------------------------------------------------------------------
+// Static variable initializers that call simulation-time system functions
+// (issue #26).
+//
+// IEEE 1800-2017 §6.21 / §10.5: a static variable's initializer is evaluated
+// once at simulation start, as if the assignment were made from an `initial`
+// block — so it may legally call system functions such as $urandom_range,
+// $sformatf("%m"), $test$plusargs or $sqrt whose results only exist at run
+// time.
+//
+// xezim-core's elaboration classifies ANY system call with constant arguments
+// as a constant expression (so the §13.4.3 elaboration constants — $clog2,
+// $bits, … — still fold in generate conditions and widths), but its
+// const-eval implements only that elaboration-constant subset; every other
+// system function silently folds to 0/"" and the initializer expression is
+// then discarded. Rather than change core's classification, re-scan the
+// parsed AST here and re-issue those initializers as synthetic time-0
+// assignments in `static_init_blocks`, which the simulator schedules ahead of
+// every user `initial` block — giving them the runtime evaluation §6.21
+// requires.
+
+/// System functions xezim-core's elaboration const-eval genuinely implements
+/// (see `eval_const_expr_val` in xezim-core/src/elaborate.rs). Initializers
+/// whose only calls are these keep their elaboration-time folded value.
+const ELAB_CONST_SYSFUNCS: &[&str] = &[
+    "$clog2",
+    "$bits",
+    "$unsigned",
+    "$signed",
+    "$countones",
+    "$onehot",
+    "$onehot0",
+    "$isunknown",
+    "$countbits",
+    "$size",
+    "$left",
+    "$right",
+    "$high",
+    "$low",
+    "$dimensions",
+];
+
+/// Does the expression contain a system call that elaboration-time const-eval
+/// cannot actually evaluate (i.e. one that needs simulation-time state)?
+fn contains_simtime_syscall(e: &ast::expr::Expression) -> bool {
+    use ast::expr::ExprKind;
+    match &e.kind {
+        ExprKind::SystemCall { name, args } => {
+            !ELAB_CONST_SYSFUNCS.contains(&name.as_str())
+                || args.iter().any(contains_simtime_syscall)
+        }
+        ExprKind::Unary { operand, .. } => contains_simtime_syscall(operand),
+        ExprKind::Binary { left, right, .. } => {
+            contains_simtime_syscall(left) || contains_simtime_syscall(right)
+        }
+        ExprKind::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            contains_simtime_syscall(condition)
+                || contains_simtime_syscall(then_expr)
+                || contains_simtime_syscall(else_expr)
+        }
+        ExprKind::Concatenation(parts) => parts.iter().any(contains_simtime_syscall),
+        ExprKind::Paren(inner) => contains_simtime_syscall(inner),
+        ExprKind::MemberAccess { expr, .. } => contains_simtime_syscall(expr),
+        ExprKind::Index { expr, index } => {
+            contains_simtime_syscall(expr) || contains_simtime_syscall(index)
+        }
+        _ => false,
+    }
+}
+
+/// Mirror of xezim-core's `is_const_expr` classification (elaborate.rs,
+/// read-only there): true iff elaboration treated `e` as a constant and
+/// FOLDED it (discarding the expression). Initializers classified non-const
+/// already get a synthetic initial-block assignment from elaboration, so
+/// re-issuing those here would run their side effects twice.
+fn elab_classifies_const(
+    e: &ast::expr::Expression,
+    elab: &elaborate::ElaboratedModule,
+    scope: &str,
+) -> bool {
+    use ast::expr::ExprKind;
+    // Child-instance parameters are merged into the top table under their
+    // instance path ("u1.P"), so check both the bare and scoped names.
+    let has_param = |n: &str| -> bool {
+        elab.parameters.contains_key(n)
+            || (!scope.is_empty() && elab.parameters.contains_key(&format!("{}.{}", scope, n)))
+    };
+    match &e.kind {
+        ExprKind::Number(_) | ExprKind::StringLiteral(_) => true,
+        ExprKind::Ident(hier) => {
+            let last = hier.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
+            let base = hier.path.first().map(|s| s.name.name.as_str()).unwrap_or("");
+            has_param(last) || (hier.path.len() > 1 && has_param(base))
+        }
+        ExprKind::Unary { operand, .. } => elab_classifies_const(operand, elab, scope),
+        ExprKind::Binary { left, right, .. } => {
+            elab_classifies_const(left, elab, scope) && elab_classifies_const(right, elab, scope)
+        }
+        ExprKind::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            elab_classifies_const(condition, elab, scope)
+                && elab_classifies_const(then_expr, elab, scope)
+                && elab_classifies_const(else_expr, elab, scope)
+        }
+        ExprKind::Concatenation(parts) => {
+            parts.iter().all(|p| elab_classifies_const(p, elab, scope))
+        }
+        ExprKind::Paren(inner) => elab_classifies_const(inner, elab, scope),
+        ExprKind::MemberAccess { expr, member } => {
+            elab_classifies_const(expr, elab, scope) || has_param(&member.name)
+        }
+        ExprKind::Index { expr, index } => {
+            elab_classifies_const(expr, elab, scope) && elab_classifies_const(index, elab, scope)
+        }
+        ExprKind::SystemCall { args, .. } => {
+            args.iter().all(|a| elab_classifies_const(a, elab, scope))
+        }
+        _ => false,
+    }
+}
+
+fn make_bare_ident(name: &str, span: ast::Span) -> ast::expr::Expression {
+    use ast::expr::{ExprKind, Expression, HierPathSegment, HierarchicalIdentifier};
+    Expression::new(
+        ExprKind::Ident(HierarchicalIdentifier {
+            root: None,
+            path: vec![HierPathSegment {
+                name: ast::Identifier {
+                    name: name.to_string(),
+                    span,
+                },
+                selects: Vec::new(),
+            }],
+            span,
+            cached_signal_id: std::cell::Cell::new(None),
+            cached_resolved_name: std::cell::OnceCell::new(),
+        }),
+        span,
+    )
+}
+
+fn walk_module_static_inits(
+    items: &[ast::decl::ModuleItem],
+    defs: &xezim_core::hasher::HashMap<String, SourceDefinition>,
+    elab: &elaborate::ElaboratedModule,
+    scope: &str,
+    depth: u32,
+    out: &mut Vec<elaborate::InitialBlock>,
+) {
+    use ast::decl::ModuleItem;
+    use ast::stmt::{Statement, StatementKind};
+    if depth > 64 {
+        return; // defensive recursion cap
+    }
+    for item in items {
+        match item {
+            ModuleItem::DataDeclaration(dd) => {
+                for d in &dd.declarators {
+                    // Unpacked-array declarators take elaboration's
+                    // assignment-pattern path (always procedural) — skip.
+                    if !d.dimensions.is_empty() {
+                        continue;
+                    }
+                    let Some(init) = &d.init else { continue };
+                    if contains_simtime_syscall(init) && elab_classifies_const(init, elab, scope)
+                    {
+                        out.push(elaborate::InitialBlock {
+                            stmt: Statement::new(
+                                StatementKind::BlockingAssign {
+                                    lvalue: make_bare_ident(&d.name.name, d.name.span),
+                                    rvalue: init.clone(),
+                                },
+                                d.name.span,
+                            ),
+                            scope: scope.to_string(),
+                        });
+                    }
+                }
+            }
+            // Unconditional `generate ... endgenerate` region — same scope.
+            ModuleItem::GenerateRegion(gr) => {
+                walk_module_static_inits(&gr.items, defs, elab, scope, depth + 1, out);
+            }
+            ModuleItem::ModuleInstantiation(mi) => {
+                if let Some(SourceDefinition::Module(child)) = defs.get(&mi.module_name.name) {
+                    for inst in &mi.instances {
+                        // Instance arrays get per-element scopes ("u[i]") —
+                        // out of scope here; leave elaboration behavior.
+                        if !inst.dimensions.is_empty() {
+                            continue;
+                        }
+                        let child_scope = if scope.is_empty() {
+                            inst.name.name.clone()
+                        } else {
+                            format!("{}.{}", scope, inst.name.name)
+                        };
+                        walk_module_static_inits(
+                            &child.items,
+                            defs,
+                            elab,
+                            &child_scope,
+                            depth + 1,
+                            out,
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Re-issue module-scope static variable initializers that call
+/// simulation-time system functions (which elaboration const-folded to
+/// 0/"") as time-0 `static_init_blocks` assignments — IEEE 1800-2017 §6.21.
+pub fn defer_static_syscall_inits(
+    defs: &xezim_core::hasher::HashMap<String, SourceDefinition>,
+    elab: &mut elaborate::ElaboratedModule,
+) {
+    let mut out: Vec<elaborate::InitialBlock> = Vec::new();
+    if let Some(SourceDefinition::Module(top)) = defs.get(&elab.name) {
+        walk_module_static_inits(&top.items, defs, elab, "", 0, &mut out);
+    }
+    elab.static_init_blocks.extend(out);
+}
 
 /// Simulate a single source string.
 pub fn simulate(source: &str, max_time: u64) -> Result<compiler::Simulator, String> {
@@ -76,8 +312,15 @@ pub fn simulate_multi(
 ) -> Result<compiler::Simulator, String> {
     let total_start = std::time::Instant::now();
     let compilation_start = std::time::Instant::now();
-    let (definitions, elab) = parse_and_elaborate_multi(
-        sources,
+    // IEEE 1800-2017 §9.4.5: the parser discards intra-assignment delays
+    // (`lhs = #d rhs`); canonicalize them into a marker call the simulator
+    // implements (see `intra_delay`) before parsing.
+    let sources: Vec<String> = sources
+        .iter()
+        .map(|s| intra_delay::rewrite_intra_assignment_delays(s))
+        .collect();
+    let (definitions, mut elab) = parse_and_elaborate_multi(
+        &sources,
         top_module_name,
         include_dirs,
         source_paths,
@@ -95,6 +338,11 @@ pub fn simulate_multi(
             return Err(lint.join("; "));
         }
     }
+
+    // §6.21: static initializers calling simulation-time system functions
+    // were const-folded to garbage by elaboration — re-issue them as time-0
+    // static-init assignments before the AST is dropped (issue #26).
+    defer_static_syscall_inits(&definitions, &mut elab);
 
     // Drop the parsed-AST table now that elaborate has produced ElaboratedModule.
     // Nothing downstream (Simulator::new, sim.run, SDF parse) needs it. Without

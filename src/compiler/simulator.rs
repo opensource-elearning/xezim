@@ -16055,6 +16055,9 @@ impl Simulator {
             // inside a begin-block it must route through the suspend-aware
             // runner (the plain exec arm is a no-op).
             StatementKind::WaitFork => true,
+            StatementKind::RandCase { items } => {
+                items.iter().any(|(_, s)| self.stmt_is_blocking(s))
+            }
             // §9.4.5 intra-assignment delay suspends the process for `#d`.
             StatementKind::BlockingAssign { rvalue, .. } => {
                 Self::intra_delay_marker(rvalue).is_some()
@@ -27391,6 +27394,36 @@ impl Simulator {
                     self.dirty_any = true;
                 }
             },
+            StatementKind::RandCase { items } => {
+                // §18.16/§18.17.1: draw one branch with probability
+                // weight_i / sum(weights). Zero-weight branches are never
+                // taken; an all-zero (or empty) list executes nothing.
+                use rand::Rng;
+                let weights: Vec<u64> = items
+                    .iter()
+                    .map(|(w, _)| self.eval_expr(w).to_u64().unwrap_or(0))
+                    .collect();
+                let total: u64 = weights.iter().sum();
+                if total == 0 {
+                    return;
+                }
+                let mut draw = self.cur_rng().gen_range(0..total);
+                let mut chosen = None;
+                for (i, w) in weights.iter().enumerate() {
+                    if *w == 0 {
+                        continue;
+                    }
+                    if draw < *w {
+                        chosen = Some(i);
+                        break;
+                    }
+                    draw -= *w;
+                }
+                if let Some(i) = chosen {
+                    let stmt = items[i].1.clone();
+                    self.exec_statement(&stmt);
+                }
+            }
             StatementKind::Typedef(td) => {
                 // §6.18: a block-local typedef registers its width and
                 // underlying type so later declarations in this process

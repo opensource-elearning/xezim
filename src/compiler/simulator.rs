@@ -57,6 +57,12 @@ pub struct SvRng {
 }
 
 impl SvRng {
+    /// The seed a run uses when it does not ask for another one. Fixed, not
+    /// drawn from entropy, so that two runs of the same design are identical
+    /// and a failing random test can be re-run and debugged. `+seed=<n>`
+    /// picks a different stream; `+seed=random` opts into entropy.
+    const DEFAULT_SEED: u64 = 1;
+
     /// §18.14: seeding is deterministic — equal seeds yield equal sequences.
     fn from_seed(seed: u64) -> Self {
         SvRng {
@@ -64,8 +70,9 @@ impl SvRng {
         }
     }
 
-    /// Non-reproducible stream for an unseeded run (the default `$urandom`
-    /// source, which must vary from run to run).
+    /// Non-reproducible stream, used only when the run explicitly asks for one
+    /// with `+seed=random`. It is NOT the default: a run whose seed varies with
+    /// each launch cannot be replayed, so a random failure cannot be debugged.
     fn from_entropy() -> Self {
         use rand::Rng;
         SvRng::from_seed(rand::rngs::StdRng::from_entropy().gen::<u64>())
@@ -1550,6 +1557,35 @@ enum RandMemberTarget {
     Sub(usize, String),
 }
 
+/// IEEE 1800-2017 §21.7.2.1 `var_type` of a dumped object. Every `$var` used to
+/// be hardcoded `wire`, which mislabels every variable in the design and hides
+/// `event` semantics from the viewer entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VcdVarKind {
+    Wire,
+    Reg,
+    Integer,
+    Time,
+    Real,
+    Event,
+    Parameter,
+}
+
+impl VcdVarKind {
+    /// The §21.7.2.1 `var_type` keyword.
+    fn keyword(self) -> &'static str {
+        match self {
+            VcdVarKind::Wire => "wire",
+            VcdVarKind::Reg => "reg",
+            VcdVarKind::Integer => "integer",
+            VcdVarKind::Time => "time",
+            VcdVarKind::Real => "real",
+            VcdVarKind::Event => "event",
+            VcdVarKind::Parameter => "parameter",
+        }
+    }
+}
+
 pub struct Simulator {
     pub signals: HashMap<String, Value>,
     /// Signals currently under force/release control (LRM §9.3.1).
@@ -2241,9 +2277,27 @@ pub struct Simulator {
     /// A plain Vec<Value> — no duplicated name strings, no hashing.
     vcd_prev_signals: Vec<Value>,
     /// Optional scope/signal-name filters captured from `$dumpvars(level, sig...)`.
-    /// When non-empty, only signals whose hierarchical name starts with one of
-    /// these strings (or matches exactly) are emitted to the VCD.
+    /// When non-empty, only signals whose hierarchical name matches one of these
+    /// scopes (or is a signal name given exactly) are emitted to the VCD. The
+    /// strings are ABSOLUTE (they include the top module); `dump_filter_prefixes`
+    /// rewrites them to the top-RELATIVE form the signal table uses.
     vcd_filter_scopes: Vec<String>,
+    /// §21.7.1.4 `$dumpvars` depth argument: 0 = every level below the given
+    /// scope, N = N levels starting at it.
+    vcd_dump_depth: u32,
+    /// §21.7.2.1 var type per `vcd_trace` entry (parallel vector). Drives both
+    /// the `$var` declaration and the runtime record shape (an `event` emits a
+    /// bare `1<id>` pulse, a `real` an `r<decimal>` record).
+    vcd_var_kinds: Vec<VcdVarKind>,
+    /// Last sim time at which each `vcd_trace` entry that is an `event` emitted
+    /// its trigger pulse — dedups repeat triggers inside one time slot.
+    vcd_event_last: Vec<u64>,
+    /// §21.7.1.8 `$dumplimit`: byte budget for the dump, and the running
+    /// (approximate) count of bytes handed to the sink. `vcd_limit_hit` latches
+    /// once the budget is spent and permanently stops the dump.
+    vcd_limit: Option<u64>,
+    vcd_bytes: u64,
+    vcd_limit_hit: bool,
     /// Worker-thread count. >=2 routes VCD dumps through a
     /// background writer thread (see vcd_sink::VcdSink).
     threads: usize,
@@ -3607,7 +3661,7 @@ impl Simulator {
             pending_ret_collection: None,
             current_scope: String::new(),
             return_value: None,
-            rng: SvRng::from_entropy(),
+            rng: SvRng::from_seed(SvRng::DEFAULT_SEED),
             proc_rng: HashMap::default(),
             obj_rng: HashMap::default(),
             obj_rng_stack: Vec::new(),
@@ -3684,6 +3738,12 @@ impl Simulator {
             vcd_last_time: u64::MAX,
             vcd_prev_signals: Vec::new(),
             vcd_filter_scopes: Vec::new(),
+            vcd_dump_depth: 0,
+            vcd_var_kinds: Vec::new(),
+            vcd_event_last: Vec::new(),
+            vcd_limit: None,
+            vcd_bytes: 0,
+            vcd_limit_hit: false,
             threads: 1,
             pdes_worker_pool: None,
             perlp_settle_prefix: None,
@@ -3886,14 +3946,23 @@ impl Simulator {
     pub fn set_plusargs(&mut self, plusargs: &[String]) {
         self.plusargs = plusargs.to_vec();
         sim_dbg_eprintln!("[DEBUG] plusargs set: {:?}", self.plusargs);
-        // `+seed=<n>` makes the run reproducible: deterministically seed the
-        // RNG (same seed → byte-identical output) instead of pulling fresh
-        // system entropy each launch. Mirrors the standard simulator knob a
-        // verification flow uses to replay a failing random test bit-for-bit.
+        // Seeding. The default is SvRng::DEFAULT_SEED — a run is reproducible
+        // unless it asks not to be, so a failing random test can be re-run
+        // bit-for-bit. `+seed=<n>` selects another stream; `+seed=random` draws
+        // one from system entropy and PRINTS it, since a seed you cannot see is
+        // a run you cannot replay.
         for a in &self.plusargs {
             if let Some(v) = a.strip_prefix("seed=").or_else(|| a.strip_prefix("+seed=")) {
-                if let Ok(seed) = v.trim().parse::<u64>() {
+                let v = v.trim();
+                if v.eq_ignore_ascii_case("random") {
+                    use rand::Rng;
+                    let seed = rand::rngs::StdRng::from_entropy().gen::<u64>();
+                    eprintln!("[xezim] random seed: {} (replay with +seed={})", seed, seed);
                     self.rng = SvRng::from_seed(seed);
+                } else if let Ok(seed) = v.parse::<u64>() {
+                    self.rng = SvRng::from_seed(seed);
+                } else {
+                    eprintln!("[xezim][warning] ignoring malformed +seed={} (want an integer or 'random')", v);
                 }
             }
         }
@@ -31927,8 +31996,265 @@ impl Simulator {
         std::env::var_os("XEZIM_DUMP_INLINE").is_none()
     }
 
+    // ── $dumpvars scope/name filtering (IEEE 1800-2017 §21.7.1.4) ──────
+    //
+    // The signal table names every object RELATIVE to the top module (`clk`,
+    // `u_sub.c`), but a `$dumpvars` scope argument resolves through
+    // `resolve_hier_name` to an ABSOLUTE path that INCLUDES the top (`top`,
+    // `top.u_sub`). Comparing the two directly never matches, so the extremely
+    // common `$dumpvars(0, top);` selected zero signals and produced an empty
+    // dump. The same copy-pasted filter backed the FST and XTrace dumps.
+
+    /// Rewrite dump scope arguments into the top-relative form the signal table
+    /// uses. `None` means "no filter" — either no arguments at all, or an
+    /// argument naming the top module itself (everything lives under it).
+    fn dump_filter_prefixes(top: &str, scopes: &[String]) -> Option<Vec<String>> {
+        if scopes.is_empty() {
+            return None;
+        }
+        let top_dot = format!("{}.", top);
+        let mut out = Vec::with_capacity(scopes.len());
+        for s in scopes {
+            if s == top {
+                return None;
+            }
+            out.push(
+                s.strip_prefix(top_dot.as_str())
+                    .unwrap_or(s.as_str())
+                    .to_string(),
+            );
+        }
+        Some(out)
+    }
+
+    /// Whether a top-relative signal name is selected by a normalized filter
+    /// list and the `$dumpvars` depth (§21.7.1.4: 0 = all levels below the
+    /// scope, N = N levels starting at the scope; a filter that names a SIGNAL
+    /// rather than a scope always matches exactly).
+    fn dump_name_selected(name: &str, filters: Option<&[String]>, depth: u32) -> bool {
+        // `rest` is the name relative to the selected scope: no dot = level 1.
+        let level_ok = |rest: &str| depth == 0 || (rest.matches('.').count() as u32) < depth;
+        match filters {
+            None => level_ok(name),
+            Some(fs) => fs.iter().any(|f| {
+                if name == f.as_str() {
+                    return true;
+                }
+                match name
+                    .strip_prefix(f.as_str())
+                    .and_then(|r| r.strip_prefix('.'))
+                {
+                    Some(rest) => level_ok(rest),
+                    None => false,
+                }
+            }),
+        }
+    }
+
+    /// The objects a dump should carry, enumerated from the REAL signal table
+    /// (`id_to_name`) rather than the lazily-synced `self.signals` mirror. That
+    /// mirror is only filled by `sync_table_to_hashmap()` when `table_modified`
+    /// is set, so a purely behavioral design (nothing marks the table dirty
+    /// before `$dumpvars`) dumped NOTHING at all.
+    ///
+    /// §21.7.2.1 admits only nets and variables, so the entries that are not
+    /// objects are dropped here: module/interface INSTANCE handles and UNPACKED
+    /// STRUCT aggregates (both of which are really SCOPES and were emitted as
+    /// stuck-at-x 1-bit wires beside their own scope), enum LITERALS (which
+    /// `elaborate` registers as signals), and the base name of an unpacked array
+    /// whose elements are dumped individually.
+    fn dump_signal_names(&self, scopes: &[String], depth: u32) -> Vec<String> {
+        let filters = Self::dump_filter_prefixes(&self.module.name, scopes);
+
+        // Enum literals (`RED`/`GRN`/`BLU`) are registered as signals by
+        // `elaborate::register_*_enum_members` — they are constants, not objects.
+        let mut enum_lits: HashSet<&str> = HashSet::default();
+        for members in self.module.enum_members.values() {
+            for (nm, _) in members {
+                enum_lits.insert(nm.as_str());
+            }
+        }
+
+        let n = self.id_to_name.len().min(self.signal_table.len());
+        let mut names: Vec<&str> = Vec::with_capacity(n);
+        for id in 0..n {
+            let name = self.id_to_name[id].as_ref();
+            if name.is_empty() || enum_lits.contains(name) {
+                continue;
+            }
+            if !Self::dump_name_selected(name, filters.as_deref(), depth) {
+                continue;
+            }
+            names.push(name);
+        }
+
+        // Every dotted prefix of a selected name is a SCOPE. A same-named table
+        // entry is the instance handle / struct aggregate, not an object.
+        // A PACKED struct is exempt: there the aggregate IS the storage (its
+        // flattened members are slices of it), so it stays in the dump.
+        let mut scope_names: HashSet<&str> = HashSet::default();
+        // Bases of unpacked arrays that are dumped element-wise (`mem[0]`…).
+        let mut expanded_bases: HashSet<&str> = HashSet::default();
+        for name in &names {
+            let mut cut = 0usize;
+            while let Some(p) = name[cut..].find('.') {
+                let end = cut + p;
+                if !self.module.packed_struct_fields.contains_key(&name[..end]) {
+                    scope_names.insert(&name[..end]);
+                }
+                cut = end + 1;
+            }
+            if let Some(p) = name.find('[') {
+                expanded_bases.insert(&name[..p]);
+            }
+        }
+
+        let mut out: Vec<String> = names
+            .iter()
+            .filter(|n| !scope_names.contains(*n) && !expanded_bases.contains(*n))
+            .map(|n| n.to_string())
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// §21.7.2.1 `var_type` of a dumped object. Every `$var` used to be
+    /// hardcoded `wire`.
+    fn dump_var_kind(&self, name: &str, id: usize) -> VcdVarKind {
+        if self.module.events.contains(name) {
+            return VcdVarKind::Event;
+        }
+        if self.signal_real.get(id).copied().unwrap_or(false) {
+            return VcdVarKind::Real;
+        }
+        // An array element (`mem[0]`) inherits its base's declared type.
+        let base = match name.find('[') {
+            Some(p) => &name[..p],
+            None => name,
+        };
+        match self.module.var_decl_types.get(base) {
+            Some(DataType::Real { .. }) => return VcdVarKind::Real,
+            Some(DataType::IntegerAtom {
+                kind: IntegerAtomType::Integer,
+                ..
+            }) => return VcdVarKind::Integer,
+            Some(DataType::IntegerAtom {
+                kind: IntegerAtomType::Time,
+                ..
+            }) => return VcdVarKind::Time,
+            Some(DataType::Simple {
+                kind: crate::ast::types::SimpleType::Event,
+                ..
+            }) => return VcdVarKind::Event,
+            _ => {}
+        }
+        if self.module.nets.contains(base) {
+            return VcdVarKind::Wire;
+        }
+        if self.module.parameters.contains_key(base)
+            && self
+                .module
+                .var_decl_types
+                .get(base)
+                .is_none()
+        {
+            return VcdVarKind::Parameter;
+        }
+        VcdVarKind::Reg
+    }
+
+    /// §21.7.2.1 optional bit range on a `$var` reference
+    /// (`$var wire 8 ( hi [15:8] $end`). Without it a `logic [15:8]` shows as
+    /// `[7:0]` in a viewer, and an ascending `logic [0:7]` loses its bit order.
+    fn dump_var_range(&self, name: &str, width: u32) -> Option<(i64, i64)> {
+        // Scalars have no range; an array element's index is already part of its
+        // reference name, and a second `[msb:lsb]` there would be ambiguous.
+        if width <= 1 || name.ends_with(']') {
+            return None;
+        }
+        let base = match name.find('[') {
+            Some(p) => &name[..p],
+            None => name,
+        };
+        let dims = match self.module.var_decl_types.get(base) {
+            Some(DataType::IntegerVector { dimensions, .. })
+            | Some(DataType::Implicit { dimensions, .. })
+            | Some(DataType::TypeReference { dimensions, .. }) => Some(dimensions),
+            _ => None,
+        };
+        if let Some(dims) = dims {
+            if dims.len() == 1 {
+                if let crate::ast::types::PackedDimension::Range { left, right, .. } = &dims[0] {
+                    let params = Some(&self.module.parameters);
+                    if let (Some(l), Some(r)) = (
+                        super::elaborate::const_eval_i64_with_params(left, params),
+                        super::elaborate::const_eval_i64_with_params(right, params),
+                    ) {
+                        if (l - r).unsigned_abs() + 1 == width as u64 {
+                            return Some((l, r));
+                        }
+                    }
+                }
+            }
+        }
+        if self.module.ascending_packed.contains_key(base) {
+            Some((0, width as i64 - 1))
+        } else {
+            Some((width as i64 - 1, 0))
+        }
+    }
+
+    /// The value to dump for a signal-table id, with `is_real` forced from the
+    /// declaration so a `real` always formats as an `r<decimal>` record even if
+    /// the stored `Value` lost its flag along the way.
+    fn dump_value(&self, id: usize) -> Value {
+        let mut v = self.signal_table[id].clone();
+        if self.signal_real.get(id).copied().unwrap_or(false) {
+            v.is_real = true;
+        }
+        v
+    }
+
+    /// `$date` content. The header used to carry no date at all.
+    fn vcd_date_string() -> String {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let (days, tod) = ((secs / 86_400) as i64, secs % 86_400);
+        // civil_from_days (Howard Hinnant's algorithm), no calendar crate needed.
+        let z = days + 719_468;
+        let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = if m <= 2 { y + 1 } else { y };
+        format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+            y,
+            m,
+            d,
+            tod / 3600,
+            (tod % 3600) / 60,
+            tod % 60
+        )
+    }
+
     /// Start VCD dumping: open file, write header, record initial values
     fn vcd_start_dump(&mut self) {
+        // §21.7.1.2: a repeat `$dumpvars` must NOT re-create the file. The old
+        // sink's background thread is still draining into the same path, so a
+        // second `File::create` interleaves two byte streams into one file and
+        // corrupts it. A second call is a checkpoint of the running dump.
+        if self.vcd_writer.is_some() {
+            self.vcd_dump_all();
+            return;
+        }
         self.sync_table_to_hashmap();
         let filename = self
             .vcd_file
@@ -31948,7 +32274,11 @@ impl Simulator {
         } else {
             None
         };
-        let mut w = match super::vcd_sink::VcdSink::open_file(file, self.dump_writer_threaded(), zstd_level) {
+        let mut w = match super::vcd_sink::VcdSink::open_file(
+            file,
+            self.dump_writer_threaded(),
+            zstd_level,
+        ) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("Warning: cannot create VCD writer for '{}': {}", filename, e);
@@ -31956,32 +32286,13 @@ impl Simulator {
             }
         };
 
-        // Collect and sort signal names for deterministic output.
-        // If `vcd_filter_scopes` is non-empty, only include signals whose
-        // hierarchical name matches one of the scopes (exact match or
-        // prefix match for scope arguments to $dumpvars).
-        let mut sig_names: Vec<String> = if self.vcd_filter_scopes.is_empty() {
-            self.signals.keys().cloned().collect()
-        } else {
-            // Precompute each scope's "<scope>." prefix once (see XTrace note).
-            let filters: Vec<(&str, String)> = self
-                .vcd_filter_scopes
-                .iter()
-                .map(|f| (f.as_str(), format!("{}.", f)))
-                .collect();
-            self.signals
-                .keys()
-                .filter(|name| {
-                    filters
-                        .iter()
-                        .any(|(f, fdot)| name.as_str() == *f || name.starts_with(fdot.as_str()))
-                })
-                .cloned()
-                .collect()
-        };
-        sig_names.sort();
-        eprintln!("[VCD] dumping {} signals (filter_scopes={})",
-                  sig_names.len(), self.vcd_filter_scopes.len());
+        let sig_names = self.dump_signal_names(&self.vcd_filter_scopes, self.vcd_dump_depth);
+        eprintln!(
+            "[VCD] dumping {} signals (filter_scopes={}, depth={})",
+            sig_names.len(),
+            self.vcd_filter_scopes.len(),
+            self.vcd_dump_depth
+        );
 
         // Assign VCD identifier codes. Codes are Arc<str> so the per-change
         // clone in vcd_write_changes is a refcount bump, not a heap alloc.
@@ -31993,10 +32304,11 @@ impl Simulator {
         // Write VCD header. The timescale is derived from the sim's actual
         // finest precision (tick_s), not hardcoded — a fixed "1ns" mislabels
         // designs with finer precision (e.g. c910 runs at 100ps).
-        let _ = writeln!(w, "$date\n  Simulation generated by xezim\n$end");
-        let _ = writeln!(w, "$version\n  xezim 0.1\n$end");
+        let mut hdr: Vec<u8> = Vec::with_capacity(4096);
+        let _ = writeln!(hdr, "$date\n  {}\n$end", Self::vcd_date_string());
+        let _ = writeln!(hdr, "$version\n  xezim {}\n$end", env!("CARGO_PKG_VERSION"));
         let _ = writeln!(
-            w,
+            hdr,
             "$timescale\n  {}\n$end",
             Self::xtrace_timescale_str(self.module.tick_s)
         );
@@ -32006,9 +32318,16 @@ impl Simulator {
         // Signal "clk" → hierarchy [], leaf "clk"
         // Signal "uut.cpuregs[5]" → hierarchy ["uut"], leaf "cpuregs[5]"
         use std::collections::BTreeMap;
+        struct VcdVar {
+            leaf: String,
+            width: u32,
+            id: Arc<str>,
+            kind: VcdVarKind,
+            range: Option<(i64, i64)>,
+        }
         struct ScopeNode {
             children: BTreeMap<String, ScopeNode>,
-            signals: Vec<(String, u32, Arc<str>)>, // (leaf_name, width, vcd_id)
+            signals: Vec<VcdVar>,
         }
         impl ScopeNode {
             fn new() -> Self {
@@ -32021,7 +32340,18 @@ impl Simulator {
 
         let mut root = ScopeNode::new();
         for name in &sig_names {
+            let tbl_id = match self.signal_name_to_id.get(name.as_str()) {
+                Some(&i) if i < self.signal_table.len() => i,
+                _ => continue,
+            };
             let width = self.lookup_signal_width(name).unwrap_or(1);
+            let kind = self.dump_var_kind(name, tbl_id);
+            let range = match kind {
+                // A `real` is always declared 64 bits wide with no range, and an
+                // `event` is a 1-bit pulse.
+                VcdVarKind::Real | VcdVarKind::Event => None,
+                _ => self.dump_var_range(name, width),
+            };
             let id = id_map[name].clone();
             // Split into hierarchy parts
             let parts: Vec<&str> = name.split('.').collect();
@@ -32038,17 +32368,57 @@ impl Simulator {
                     .entry(part.to_string())
                     .or_insert_with(ScopeNode::new);
             }
-            node.signals.push((leaf.to_string(), width, id));
+            node.signals.push(VcdVar {
+                leaf: leaf.to_string(),
+                width,
+                id,
+                kind,
+                range,
+            });
+        }
+
+        // §21.7.2.1 declaration of one object.
+        fn emit_var(w: &mut impl Write, v: &VcdVar) {
+            match v.kind {
+                VcdVarKind::Real => {
+                    let _ = writeln!(w, "$var real 64 {} {} $end", v.id, v.leaf);
+                }
+                VcdVarKind::Event => {
+                    let _ = writeln!(w, "$var event 1 {} {} $end", v.id, v.leaf);
+                }
+                k => match v.range {
+                    Some((l, r)) => {
+                        let _ = writeln!(
+                            w,
+                            "$var {} {} {} {} [{}:{}] $end",
+                            k.keyword(),
+                            v.width,
+                            v.id,
+                            v.leaf,
+                            l,
+                            r
+                        );
+                    }
+                    None => {
+                        let _ = writeln!(
+                            w,
+                            "$var {} {} {} {} $end",
+                            k.keyword(),
+                            v.width,
+                            v.id,
+                            v.leaf
+                        );
+                    }
+                },
+            }
         }
 
         // Emit VCD scopes recursively
         fn emit_scope(w: &mut impl Write, name: &str, node: &ScopeNode) {
             let _ = writeln!(w, "$scope module {} $end", name);
-            // Emit signals at this level
-            for (leaf, width, id) in &node.signals {
-                let _ = writeln!(w, "$var wire {} {} {} $end", width, id, leaf);
+            for v in &node.signals {
+                emit_var(w, v);
             }
-            // Emit child scopes
             for (child_name, child_node) in &node.children {
                 emit_scope(w, child_name, child_node);
             }
@@ -32056,113 +32426,158 @@ impl Simulator {
         }
 
         // Use actual top module name
-        let top_name = &self.module.name;
-        let _ = writeln!(w, "$scope module {} $end", top_name);
-        // Emit top-level signals (no dot prefix)
-        for (leaf, width, id) in &root.signals {
-            let _ = writeln!(w, "$var wire {} {} {} $end", width, id, leaf);
+        let top_name = self.module.name.clone();
+        let _ = writeln!(hdr, "$scope module {} $end", top_name);
+        for v in &root.signals {
+            emit_var(&mut hdr, v);
         }
-        // Emit sub-module scopes
         for (child_name, child_node) in &root.children {
-            emit_scope(&mut w, child_name, child_node);
+            emit_scope(&mut hdr, child_name, child_node);
         }
-        let _ = writeln!(w, "$upscope $end");
-
-        let _ = writeln!(w, "$enddefinitions $end");
+        let _ = writeln!(hdr, "$upscope $end");
+        let _ = writeln!(hdr, "$enddefinitions $end");
 
         // Build the compact per-cycle trace table: (signal_table index, code).
         // Initial values are written below and seeded into vcd_prev_signals so
         // the first vcd_write_changes only emits actual transitions.
         let mut trace: Vec<(usize, Arc<str>)> = Vec::with_capacity(sig_names.len());
+        let mut kinds: Vec<VcdVarKind> = Vec::with_capacity(sig_names.len());
         let mut prev: Vec<Value> = Vec::with_capacity(sig_names.len());
 
-        // Write initial values
-        let _ = writeln!(w, "$dumpvars");
+        // §21.7.1.4: the `$dumpvars` checkpoint is the state at the CURRENT sim
+        // time. Without the `#t` marker a dump started mid-run (e.g. at t=23) is
+        // placed at t=0 by every viewer.
+        let _ = writeln!(hdr, "#{}", self.time);
+        let _ = writeln!(hdr, "$dumpvars");
         for name in &sig_names {
-            let id = match self.signal_name_to_id.get(name.as_str()) {
+            let sid = match self.signal_name_to_id.get(name.as_str()) {
                 Some(&i) if i < self.signal_table.len() => i,
                 _ => continue,
             };
-            let val = self.signal_table[id].clone();
+            let kind = self.dump_var_kind(name, sid);
             let code = id_map[name].clone();
-            Self::vcd_write_value(&mut w, &val, &code);
-            prev.push(val);
-            trace.push((id, code));
+            // An `event` has no level, so it contributes no checkpoint record —
+            // it only ever emits a `1<id>` pulse when triggered.
+            if kind != VcdVarKind::Event {
+                let val = self.dump_value(sid);
+                super::vcd_sink::write_vcd_value(&mut hdr, &val, &code);
+            }
+            prev.push(self.signal_table[sid].clone());
+            kinds.push(kind);
+            trace.push((sid, code));
         }
-        let _ = writeln!(w, "$end");
+        let _ = writeln!(hdr, "$end");
 
+        let nbytes = hdr.len() as u64;
+        let _ = w.write_all(&hdr);
+
+        self.vcd_event_last = vec![u64::MAX; trace.len()];
         self.vcd_trace = trace;
+        self.vcd_var_kinds = kinds;
         self.vcd_prev_signals = prev;
         self.vcd_writer = Some(w);
         self.vcd_enabled = true;
+        self.vcd_bytes = 0;
+        self.vcd_limit_hit = false;
         self.vcd_last_time = self.time;
+        self.vcd_account_bytes(nbytes);
     }
 
-    /// Write a single value to VCD
+    /// Write a single value to VCD. Delegates to the one shared formatter in
+    /// `vcd_sink` — this used to be a second, divergent copy that disagreed with
+    /// the sink about `real` and about leading-zero suppression.
     fn vcd_write_value(w: &mut impl Write, val: &Value, id: &str) {
-        if val.width == 1 {
-            // Scalar: single char + id
-            let ch = match val.bits_first() {
-                LogicBit::Zero => '0',
-                LogicBit::One => '1',
-                LogicBit::X => 'x',
-                LogicBit::Z => 'z',
-            };
-            let _ = writeln!(w, "{}{}", ch, id);
+        super::vcd_sink::write_vcd_value(w, val, id);
+    }
+
+    /// Byte length of the value-change record the sink will format for `val`.
+    /// The sink formats batched changes on its own thread, so `$dumplimit`
+    /// sizes them here instead of materializing them.
+    fn vcd_record_len(val: &Value, code: &str) -> u64 {
+        let body = if val.is_real {
+            22 // "r" + decimal + " "
+        } else if val.width == 1 {
+            1
         } else {
-            // Vector: b<bits> <id>
-            let mut s = String::with_capacity(val.width as usize + 2);
-            s.push('b');
-            let mut all_zero = true;
-            for i in (0..val.width as usize).rev() {
-                let ch = match val.get_bit(i) {
-                    LogicBit::Zero => {
-                        if !all_zero {
-                            s.push('0');
-                        }
-                        '0'
-                    }
-                    LogicBit::One => {
-                        all_zero = false;
-                        s.push('1');
-                        '1'
-                    }
-                    LogicBit::X => {
-                        all_zero = false;
-                        s.push('x');
-                        'x'
-                    }
-                    LogicBit::Z => {
-                        all_zero = false;
-                        s.push('z');
-                        'z'
-                    }
-                };
-                let _ = ch;
-            }
-            if all_zero {
-                s.push('0');
-            }
-            let _ = writeln!(w, "{} {}", s, id);
+            2 + val.width as u64 // "b" + bits + " "
+        };
+        body + code.len() as u64 + 1 // + '\n'
+    }
+
+    /// §21.7.1.8 `$dumplimit(n)`: stop dumping once the file reaches `n` bytes.
+    fn vcd_account_bytes(&mut self, n: u64) {
+        if self.vcd_limit_hit {
+            return;
         }
+        self.vcd_bytes += n;
+        let limit = match self.vcd_limit {
+            Some(l) => l,
+            None => return,
+        };
+        if self.vcd_bytes >= limit {
+            self.vcd_limit_hit = true;
+            if let Some(w) = self.vcd_writer.as_mut() {
+                let _ = writeln!(
+                    w,
+                    "$comment $dumplimit of {} bytes reached — dumping stopped $end",
+                    limit
+                );
+                let _ = w.flush();
+            }
+        }
+    }
+
+    /// Hand a fully formatted record block to the sink and bill it to the limit.
+    fn vcd_emit(&mut self, buf: Vec<u8>) {
+        if self.vcd_limit_hit {
+            return;
+        }
+        if let Some(w) = self.vcd_writer.as_mut() {
+            let _ = w.write_all(&buf);
+        }
+        self.vcd_account_bytes(buf.len() as u64);
     }
 
     /// Write VCD value changes for the current timestep
     fn vcd_write_changes(&mut self) {
-        if !self.vcd_enabled || self.vcd_writer.is_none() {
+        if !self.vcd_enabled || self.vcd_writer.is_none() || self.vcd_limit_hit {
             return;
         }
 
         // Walk the compact trace table directly: no name hashing, and
         // vcd_prev_signals is a parallel Vec<Value> (index == position in
         // vcd_trace), so change detection is a single indexed compare.
+        let now = self.time;
         let mut changes: Vec<(Arc<str>, Value)> = Vec::new();
         for idx in 0..self.vcd_trace.len() {
             let id = self.vcd_trace[idx].0;
+            if self.vcd_var_kinds[idx] == VcdVarKind::Event {
+                // §21.7.2.1: an event has no level — it emits a bare `1<id>`
+                // record at EVERY trigger. Treating it as a level signal with
+                // prev!=cur dedup drops a repeat `->ev` whose 0→1→0 toggle
+                // cancels inside one time slot.
+                let fired = self
+                    .id_to_name
+                    .get(id)
+                    .and_then(|n| self.event_triggered_time.get(n.as_ref()))
+                    .copied()
+                    == Some(now);
+                if fired && self.vcd_event_last[idx] != now {
+                    self.vcd_event_last[idx] = now;
+                    changes.push((self.vcd_trace[idx].1.clone(), Value::ones(1)));
+                }
+                // Keep the level mirror in step so the toggle never leaks out.
+                self.vcd_prev_signals[idx] = self.signal_table[id].clone();
+                continue;
+            }
             let val = &self.signal_table[id];
             if self.vcd_prev_signals[idx] != *val {
-                changes.push((self.vcd_trace[idx].1.clone(), val.clone()));
+                let mut out = val.clone();
+                if self.signal_real.get(id).copied().unwrap_or(false) {
+                    out.is_real = true;
+                }
                 self.vcd_prev_signals[idx] = val.clone();
+                changes.push((self.vcd_trace[idx].1.clone(), out));
             }
         }
 
@@ -32177,13 +32592,112 @@ impl Simulator {
             None
         };
 
+        let mut nbytes = if time_marker.is_some() { 12 } else { 0 };
+        for (code, val) in &changes {
+            nbytes += Self::vcd_record_len(val, code);
+        }
+
         if let Some(sink) = self.vcd_writer.as_mut() {
             sink.post_vcd_changes(time_marker, changes);
         }
+        self.vcd_account_bytes(nbytes);
+    }
+
+    /// Emit a `$dumpall` / `$dumpon` checkpoint (§21.7.1.5, §21.7.1.7): the
+    /// CURRENT value of every dumped variable, bracketed by the keyword and
+    /// `$end` and stamped with the current time.
+    fn vcd_checkpoint(&mut self, keyword: &str) {
+        if self.vcd_writer.is_none() || self.vcd_limit_hit {
+            return;
+        }
+        let mut buf: Vec<u8> = Vec::new();
+        let _ = writeln!(buf, "#{}", self.time);
+        let _ = writeln!(buf, "{}", keyword);
+        for idx in 0..self.vcd_trace.len() {
+            // An event has no level to check-point.
+            if self.vcd_var_kinds[idx] == VcdVarKind::Event {
+                continue;
+            }
+            let sid = self.vcd_trace[idx].0;
+            let val = self.dump_value(sid);
+            let code = self.vcd_trace[idx].1.clone();
+            super::vcd_sink::write_vcd_value(&mut buf, &val, &code);
+            self.vcd_prev_signals[idx] = self.signal_table[sid].clone();
+        }
+        let _ = writeln!(buf, "$end");
+        self.vcd_last_time = self.time;
+        self.vcd_emit(buf);
+    }
+
+    /// §21.7.1.5 `$dumpall` — checkpoint every dumped variable.
+    fn vcd_dump_all(&mut self) {
+        if !self.vcd_enabled {
+            return;
+        }
+        self.vcd_write_changes();
+        self.vcd_checkpoint("$dumpall");
+    }
+
+    /// §21.7.1.6 `$dumpoff` — suspend dumping. The suspended window must be
+    /// marked: every dumped variable goes to x (a `real` to z), so a viewer
+    /// paints the window as unknown instead of holding a stale, false level.
+    /// Merely flipping a bool (the old behaviour) leaves the last value on
+    /// screen across the whole off-window.
+    fn vcd_dump_off(&mut self) {
+        if self.vcd_writer.is_none() || !self.vcd_enabled || self.vcd_limit_hit {
+            return;
+        }
+        // Flush anything that changed at this time before freezing.
+        self.vcd_write_changes();
+        let mut buf: Vec<u8> = Vec::new();
+        let _ = writeln!(buf, "#{}", self.time);
+        let _ = writeln!(buf, "$dumpoff");
+        for idx in 0..self.vcd_trace.len() {
+            let code = self.vcd_trace[idx].1.clone();
+            match self.vcd_var_kinds[idx] {
+                VcdVarKind::Event => {}
+                VcdVarKind::Real => {
+                    let _ = writeln!(buf, "z{}", code);
+                }
+                _ => {
+                    let width = self.signal_table[self.vcd_trace[idx].0].width;
+                    if width == 1 {
+                        let _ = writeln!(buf, "x{}", code);
+                    } else {
+                        let _ = writeln!(buf, "bx {}", code);
+                    }
+                }
+            }
+        }
+        let _ = writeln!(buf, "$end");
+        self.vcd_last_time = self.time;
+        self.vcd_emit(buf);
+        self.vcd_enabled = false;
+    }
+
+    /// §21.7.1.7 `$dumpon` — resume dumping, re-stating the current value of
+    /// every dumped variable so the viewer recovers from the x window.
+    fn vcd_dump_on(&mut self) {
+        if self.vcd_writer.is_none() || self.vcd_enabled || self.vcd_limit_hit {
+            return;
+        }
+        self.vcd_enabled = true;
+        self.vcd_checkpoint("$dumpon");
     }
 
     /// Flush and close VCD file
     fn vcd_finish(&mut self) {
+        if self.vcd_writer.is_some() {
+            self.vcd_write_changes();
+            // Close the wave window at the final simulation time: without a
+            // trailing `#t` a viewer stops at the last TRANSITION, so the tail
+            // of the run is missing from the waveform.
+            if self.time > self.vcd_last_time && !self.vcd_limit_hit {
+                let t = self.time;
+                self.vcd_emit(format!("#{}\n", t).into_bytes());
+                self.vcd_last_time = t;
+            }
+        }
         if let Some(ref mut w) = self.vcd_writer {
             let _ = w.flush();
         }

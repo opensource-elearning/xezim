@@ -100,7 +100,9 @@ fn print_usage() {
     eprintln!("  -Ifoo, -DNAME=V  Accepted");
     eprintln!("  +incdir+dir1+dir2 / +define+FOO=1+BAR Accepted");
     eprintln!("  +NAME / +NAME=VALUE passed to $test$plusargs/$value$plusargs");
-    eprintln!("  +seed=<n>        Seed the RNG for reproducible randomization");
+    eprintln!("  +seed=<n>        Seed the RNG (default: 1, so runs are reproducible)");
+    eprintln!("  +seed=random     Draw a seed from entropy; the seed is printed so the");
+    eprintln!("                   run can be replayed with +seed=<that value>");
     eprintln!("                   (same seed -> byte-identical run; affects e.g. the");
     eprintln!("                   number of packets a random UVM test collects)");
     eprintln!("  -f/-c filelist   Recursive; options inside filelist are supported");

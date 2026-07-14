@@ -16,7 +16,7 @@ use xezim_core::elaborate;
 // Re-export xezim-core surface so existing `xezim::...` paths keep working.
 pub use xezim_core::{
     ast, diagnostics, lexer, log_eprintln, log_println, parse, parse_and_elaborate_multi,
-    parse_str, preprocessor, read_compiled, set_log_file, set_module_timescale_cli, sv_parser,
+    parse_str, preprocessor, read_compiled, set_module_timescale_cli, sv_parser,
     tokenize_file, write_compiled, ModuleTimescaleCli, ParseResult, SourceDefinition,
     XEZIM_BYTECODE_MAGIC,
 };
@@ -600,7 +600,9 @@ pub fn simulate_multi(
         total_elapsed.as_secs_f64() * 1000.0
     );
     eprintln!("------------------------------");
-    eprintln!("Simulation finished at time {}", sim.time);
+    // The result line itself is the CLI's to print, on stdout (main.rs). Printing
+    // it here too put it on BOTH streams, so it appeared twice in any terminal
+    // or merged log.
     Ok(sim)
 }
 

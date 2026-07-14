@@ -82,6 +82,7 @@ fn print_usage() {
     eprintln!("                     overrides a `timeunit`/`timeprecision` decl or an active `timescale.");
     eprintln!("  --threads <n>    Worker threads (default: 1 = single-thread).");
     eprintln!("                   n>=2 offloads stdout writes to a background thread.");
+    eprintln!("  -l, --log <file> Redirect all stdout/stderr (including DPI output) to <file>");
     eprintln!("  --xtrace <file>  Emit XTrace v1.0 dump to <file>");
     eprintln!("                   (minimal profile: dictionary + signal deltas).");
     eprintln!("                   A '.zst'/'.zstd' suffix zstd-compresses the stream.");
@@ -462,6 +463,43 @@ fn process_command_file(
     Ok(())
 }
 
+/// `-l <file>` / `--log <file>`: send everything the run prints to `file`.
+///
+/// Done at the file-descriptor level rather than by swapping in a Rust writer,
+/// because that is the only thing that catches ALL of it: the simulator prints
+/// through `println!`, and a DPI/VPI C model's `printf()` writes straight to
+/// fd 1 — a writer-based logger would silently miss both.
+#[cfg(unix)]
+fn redirect_stdio_to_log(path: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::io::AsRawFd;
+
+    let f = std::fs::File::create(path)?;
+    // Flush first, so anything already buffered goes to the real terminal
+    // rather than turning up at the head of the log.
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    unsafe {
+        if libc::dup2(f.as_raw_fd(), libc::STDOUT_FILENO) < 0
+            || libc::dup2(f.as_raw_fd(), libc::STDERR_FILENO) < 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    // fds 1 and 2 now own the file; dropping `f` would close it under them.
+    std::mem::forget(f);
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn redirect_stdio_to_log(path: &str) -> std::io::Result<()> {
+    let _ = path;
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "-l/--log is only supported on unix",
+    ))
+}
+
 fn main() {
     spawn_memory_watchdog();
 
@@ -562,11 +600,14 @@ fn main() {
             _ if arg.starts_with("-o") && arg.len() > 2 => {
                 _output_file = Some(arg[2..].to_string());
             }
-            "-l" => {
+            "-l" | "--log" => {
                 i += 1;
                 if i < args.len() {
                     log_file = Some(args[i].clone());
                 }
+            }
+            _ if arg.starts_with("--log=") => {
+                log_file = Some(arg["--log=".len()..].to_string());
             }
             _ if arg.starts_with("-l") && arg.len() > 2 => {
                 log_file = Some(arg[2..].to_string());
@@ -926,7 +967,7 @@ fn main() {
     }
 
     if let Some(ref path) = log_file {
-        if let Err(e) = xezim::set_log_file(path) {
+        if let Err(e) = redirect_stdio_to_log(path) {
             eprintln!("Error: cannot open log file '{}': {}", path, e);
             std::process::exit(1);
         }

@@ -261,6 +261,7 @@ Common options:
 | `+seed=<n>` | Seed the RNG for a reproducible run (same seed ⇒ byte-identical output; affects e.g. the number of packets a random UVM test collects) |
 | `--sdf <file>` `--sdf-{min,typ,max}` | Annotate standard delays |
 | `--sim_debug` | Print `[DEBUG]` / `[OPT]` diagnostics |
+| `-l`, `--log <file>` | Redirect all stdout/stderr — including DPI/VPI C output — to a log file |
 | `--xtrace <file>` | Emit an XTrace v1.0 dump (`.zst`/`.zstd` ⇒ zstd-compressed) |
 | `--xtrace-scope <hier>` | Restrict the XTrace dump to signals under `<hier>` (repeatable) |
 

@@ -23451,6 +23451,73 @@ impl Simulator {
                         32,
                     )
                 }
+                // §6.24.1 TYPE cast `int'(x)` / `real'(x)` — lowered by the
+                // parser. A real → integral cast ROUNDS (§6.12.2); an integral
+                // → real cast widens; otherwise resize to the type's width and
+                // stamp its signedness.
+                "$__xz_type_cast" => {
+                    let Some(ExprKind::TypeLiteral(dt)) = args.first().map(|a| &a.kind) else {
+                        return args
+                            .get(1)
+                            .map(|a| self.eval_expr(a))
+                            .unwrap_or_else(|| Value::zero(1));
+                    };
+                    let dt = dt.clone();
+                    let v = args
+                        .get(1)
+                        .map(|a| self.eval_expr(a))
+                        .unwrap_or_else(|| Value::zero(1));
+                    if super::elaborate::is_type_real(&dt) {
+                        return Value::from_f64(v.to_f64());
+                    }
+                    let w = super::elaborate::resolve_type_width(
+                        &dt,
+                        Some(&self.module.parameters),
+                        Some(&self.module.typedefs),
+                    )
+                    .max(1);
+                    let mut out = if v.is_real {
+                        Self::real_to_int(v.to_f64(), w)
+                    } else {
+                        v.resize(w)
+                    };
+                    out.is_signed = super::elaborate::is_type_signed(&dt);
+                    out
+                }
+                // §20.8.2 real math library.
+                "$sin" | "$cos" | "$tan" | "$asin" | "$acos" | "$atan"
+                | "$sinh" | "$cosh" | "$tanh" | "$asinh" | "$acosh" | "$atanh" => {
+                    let x = args
+                        .first()
+                        .map(|a| self.eval_expr(a).to_f64())
+                        .unwrap_or(0.0);
+                    let r = match name.as_str() {
+                        "$sin" => x.sin(),
+                        "$cos" => x.cos(),
+                        "$tan" => x.tan(),
+                        "$asin" => x.asin(),
+                        "$acos" => x.acos(),
+                        "$atan" => x.atan(),
+                        "$sinh" => x.sinh(),
+                        "$cosh" => x.cosh(),
+                        "$tanh" => x.tanh(),
+                        "$asinh" => x.asinh(),
+                        "$acosh" => x.acosh(),
+                        _ => x.atanh(),
+                    };
+                    Value::from_f64(r)
+                }
+                "$atan2" | "$hypot" => {
+                    let x = args
+                        .first()
+                        .map(|a| self.eval_expr(a).to_f64())
+                        .unwrap_or(0.0);
+                    let y = args
+                        .get(1)
+                        .map(|a| self.eval_expr(a).to_f64())
+                        .unwrap_or(0.0);
+                    Value::from_f64(if name == "$atan2" { x.atan2(y) } else { x.hypot(y) })
+                }
                 // §6.24.1 literal size cast `N'(x)` — lowered by the parser.
                 "$__xz_size_cast" => {
                     let n = args

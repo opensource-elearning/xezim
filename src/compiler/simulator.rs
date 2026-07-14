@@ -1525,6 +1525,31 @@ impl Phase2Profile {
     }
 }
 
+/// IEEE 1800-2017 §18.4: where a member of an aggregate (struct/union) CLASS
+/// property actually lives. Class properties are cells in `heap[h].properties`,
+/// not signals, so member access has to be routed here rather than through the
+/// flat-signal struct paths.
+#[derive(Debug, Clone)]
+enum ClassAggRef {
+    /// Member of a PACKED struct/union — a bit slice `[off +: w]` of the
+    /// property's raw `total`-bit integral value. Union members all sit at
+    /// `off == 0` and therefore alias one another (§7.3.1).
+    Packed { handle: usize, prop: String, off: u32, w: u32, total: u32 },
+    /// Member of an UNPACKED struct — its own cell, keyed `<prop>.<member>`.
+    Unpacked { handle: usize, key: String, w: u32 },
+}
+
+/// IEEE 1800-2017 §18.4: a constraint target that is not a bare rand property
+/// of the object being solved.
+#[derive(Debug, Clone)]
+enum RandMemberTarget {
+    /// A member of an aggregate (struct/union) rand property.
+    Agg(ClassAggRef),
+    /// A property of a `rand` OBJECT HANDLE — solved concurrently with the
+    /// enclosing object (the handle itself is never written).
+    Sub(usize, String),
+}
+
 pub struct Simulator {
     pub signals: HashMap<String, Value>,
     /// Signals currently under force/release control (LRM §9.3.1).
@@ -19497,6 +19522,17 @@ impl Simulator {
     }
 
     fn assign_value(&mut self, lhs: &Expression, val: &Value) -> bool {
+        // §18.4: writing a member of a struct/union CLASS property goes to the
+        // aggregate's own storage — for a packed struct/union that means
+        // splicing the member's bits into the property's raw integral value, so
+        // the whole/field views (and a union's overlaid members) stay coherent.
+        // Both parse shapes (`MemberAccess` and a flattened `Ident([a, b])`)
+        // route here, so this sits ahead of the per-kind arms.
+        if matches!(lhs.kind, ExprKind::MemberAccess { .. } | ExprKind::Ident(_)) {
+            if let Some(r) = self.class_agg_member(lhs) {
+                return self.write_class_agg(&r, val);
+            }
+        }
         match &lhs.kind {
             ExprKind::Ident(hier) => {
                 // LRM §25.9: virtual-interface alias (task/function
@@ -21255,6 +21291,14 @@ impl Simulator {
                 val
             }
             ExprKind::Ident(hier) => {
+                // §18.4: `<obj>.<agg_prop>.<member>` / `<agg_prop>.<member>`
+                // that parsed as a FLAT hier ident — same aggregate-class-
+                // property storage as the `MemberAccess` shape (see there).
+                if hier.path.len() >= 2 && !self.heap.is_empty() {
+                    if let Some(r) = self.class_agg_member(expr) {
+                        return self.read_class_agg(&r);
+                    }
+                }
                 // §7.3.2 tagged-union member read (`t.Valid`).
                 if hier.path.len() == 2 {
                     let base = hier.path[0].name.name.as_str();
@@ -21942,8 +21986,21 @@ impl Simulator {
                 } else {
                     ctx_width
                 };
-                let l = self.eval_expr_ctx(left, self_det_w);
-                let r = self.eval_expr_ctx(right, self_det_w);
+                let mut l = self.eval_expr_ctx(left, self_det_w);
+                let mut r = self.eval_expr_ctx(right, self_det_w);
+                // IEEE 1800-2017 §11.8.1/§11.8.2: an expression is UNSIGNED as
+                // soon as ANY operand is unsigned, and §11.8.2 step 2 converts
+                // every operand to the EXPRESSION's signedness BEFORE it is
+                // extended to the result width. So a signed operand sitting in
+                // an unsigned expression is ZERO-extended, not sign-extended:
+                //   `$signed(8'hFF) + 32'd1` == 32'd256, not 32'd0.
+                // This is the "operands follow normal expression rules" clause
+                // that §18.5.12 defers to for constraint expressions, so the
+                // constraint evaluator (which routes through here) inherits it.
+                if is_arith_or_bitwise && !(l.is_signed && r.is_signed) {
+                    l.is_signed = false;
+                    r.is_signed = false;
+                }
                 let max_w = l.width.max(r.width).max(self_det_w);
                 let wl = if is_arith_or_bitwise && max_w > l.width {
                     l.resize(max_w)
@@ -23310,9 +23367,43 @@ impl Simulator {
                         .get(1)
                         .map(|a| self.eval_expr(a).to_u64().unwrap_or(1))
                         .unwrap_or(1) as usize;
+                    // §20.7 / §7.5: on a DYNAMIC array or queue the query
+                    // functions report the CURRENT element count, not a static
+                    // packed width — `$size(d)` == `d.size()`. The declared-dims
+                    // table below only knows fixed arrays, so a dynamic array
+                    // fell through to the "packed vector" branch and reported
+                    // its element width (or 0). `array_operand_name` also lifts
+                    // a class member (`dyn_array` inside a constraint, `o.q`
+                    // from outside) to its instance-scoped storage, which is
+                    // what §18.5.12 needs for `array_size == $size(dyn_array)`.
+                    if dim <= 1 {
+                        if let Some(arg) = args.first() {
+                            if let Some(nm) = self.array_operand_name(arg) {
+                                if self.module.dynamic_arrays.contains(&nm) {
+                                    let size = self.get_queue_size(&nm);
+                                    let hi = size as i64 - 1;
+                                    let r = match sn.as_str() {
+                                        "$size" => size,
+                                        "$left" | "$low" => 0,
+                                        "$right" | "$high" => hi.max(0) as u64,
+                                        "$increment" => 0u64.wrapping_sub(1),
+                                        _ => 0,
+                                    };
+                                    return Value::from_u64(r, 32);
+                                }
+                            }
+                        }
+                    }
                     if let Some(arg) = args.first() {
                         if let ExprKind::Ident(hier) = &arg.kind {
-                            let aname = self.resolve_hier_name(hier);
+                            let mut aname = self.resolve_hier_name(hier);
+                            // A fixed-size ARRAY class member lives at
+                            // `<handle>#<member>`; the bare name has no dims.
+                            if let Some(scoped) = self.instance_assoc_member(&aname) {
+                                if self.module.arrays.contains_key(&scoped) {
+                                    aname = scoped;
+                                }
+                            }
                             // Every unpacked dimension, outermost first. Only the
                             // 1-D table was consulted, so `$size(m, 2)` — and even
                             // `$size(m)` on a 2-D/N-D array — returned 0.
@@ -23536,6 +23627,14 @@ impl Simulator {
                 }
             }
             ExprKind::MemberAccess { expr, member } => {
+                // §18.4: member of a struct/union CLASS property — read through
+                // the aggregate's storage (a bit slice for a packed struct/
+                // union, so a union's members alias). Must precede the flat
+                // signal paths below: a stale `<obj>.<prop>.<field>` leaf could
+                // otherwise shadow the aliased view.
+                if let Some(r) = self.class_agg_member_parts(expr, &member.name) {
+                    return self.read_class_agg(&r);
+                }
                 // §7.3.2 tagged-union member read (`t.Valid`).
                 if let ExprKind::Ident(h) = &expr.kind {
                     if h.path.len() == 1 && self.active_union_tag.contains_key(&h.path[0].name.name)
@@ -33120,12 +33219,33 @@ impl Simulator {
                     // std::randomize(vars) with {...}
                     if let ExprKind::Ident(h) = &expr.kind {
                         if h.path.len() == 1 && h.path[0].name.name == "std" {
+                            // §18.12 / §18.11.1: `std::randomize()` with an EMPTY
+                            // variable list solves nothing — every name in the
+                            // `with` block is a state variable, so the call is a
+                            // pure CHECKER. It must report 0 when the constraint
+                            // set does not hold under the current state (it
+                            // unconditionally reported success before).
+                            if args.is_empty() {
+                                let ok = self.inline_constraints_satisfied(constraints);
+                                return Value::from_u64(if ok { 1 } else { 0 }, 32);
+                            }
                             self.exec_std_randomize(args);
                             // Collect the randomize target lvalues by name. A
                             // struct arg expands to its per-field lvalues so
                             // field-level constraints (`pkt.f < N`) match.
                             let mut targets: Vec<(String, Expression)> = Vec::new();
                             for a in args {
+                                // §18.4: a PACKED struct/union is a raw integral
+                                // type — it is also a target in its own right, so
+                                // a whole-aggregate constraint (`p_struct ==
+                                // 8'hA5`) binds and drives every field through the
+                                // packed layout. Its fields stay targets too, so
+                                // field-level constraints keep working.
+                                if self.is_packed_struct_var(a) {
+                                    if let ExprKind::Ident(hh) = &a.kind {
+                                        targets.push((self.resolve_hier_name(hh), a.clone()));
+                                    }
+                                }
                                 if let Some(fields) = self.expand_struct_target(a) {
                                     targets.extend(fields);
                                 } else if let ExprKind::Ident(hh) = &a.kind {
@@ -33185,6 +33305,11 @@ impl Simulator {
                                         self.apply_inline_constraint(c, &targets);
                                     }
                                 }
+                                // §18.5.5: enforce `unique {arr}` LAST — the
+                                // per-element `inside` picks above are what
+                                // define each element's legal domain, and the
+                                // repair draws the replacement from it.
+                                self.enforce_inline_unique(constraints);
                                 // §18.5.7/§18.3 backstop: keep the assignment
                                 // only when every MODELED constraint holds —
                                 // the per-element repair can dead-end (e.g. an
@@ -33599,6 +33724,17 @@ impl Simulator {
                     if let Some(lv) = self.target_for(left, targets) {
                         let v = self.eval_expr(right);
                         self.assign_value(&lv, &v);
+                    } else if self.is_select_of_target(left, targets) {
+                        // §18.3/§11.5.1: the constrained term may be a BIT or
+                        // PART SELECT of a target (`scalar_addr[1:0] == 2'b0`,
+                        // a word-alignment constraint). Solve it by writing the
+                        // value straight through the select — leaving it to a
+                        // lucky reseed made the whole call flaky.
+                        let v = self.eval_expr(right);
+                        self.assign_value(left, &v);
+                    } else if self.is_select_of_target(right, targets) {
+                        let v = self.eval_expr(left);
+                        self.assign_value(right, &v);
                     }
                 }
                 ExprKind::Inside { expr: inner, ranges } => {
@@ -33700,6 +33836,220 @@ impl Simulator {
             }
             _ => {}
         }
+    }
+
+    /// §18.3: true when `e` is a BIT or PART select of one of the scope-randomize
+    /// targets (`scalar_addr[1:0]`, `data[7:4]`). Such a term is solvable — the
+    /// value is written straight through the select — but it is not a target in
+    /// its own right, so `target_for` (which matches whole variables) misses it.
+    fn is_select_of_target(
+        &mut self,
+        e: &Expression,
+        targets: &[(String, Expression)],
+    ) -> bool {
+        let base = match &e.kind {
+            ExprKind::Index { expr, .. } => expr,
+            ExprKind::RangeSelect { expr, .. } => expr,
+            _ => return false,
+        };
+        // An ARRAY element is not a select of a scalar target — its own
+        // per-element machinery (foreach / unique) owns it.
+        if self.array_operand_name(base).is_some() {
+            return false;
+        }
+        match self.constraint_operand_name(base) {
+            Some(n) => targets.iter().any(|(tn, _)| *tn == n),
+            None => false,
+        }
+    }
+
+    /// §18.5.5 `unique { arr }` over scope-randomize targets: make the elements
+    /// of each listed array/queue pairwise distinct. A duplicate is re-picked
+    /// from the element's OWN allowed domain — the `foreach (arr[i]) arr[i]
+    /// inside {…}` item in the same constraint set — so the repair can never
+    /// break the range constraint it shares the block with. Without this the
+    /// scope path enforced nothing and simply hoped the random draw came out
+    /// distinct.
+    fn enforce_inline_unique(&mut self, constraints: &[crate::ast::decl::ConstraintItem]) {
+        for e in self.collect_unique_operands(constraints) {
+            let Some(arr) = self.array_operand_name(&e) else { continue };
+            let size = self.get_queue_size(&arr);
+            if size == 0 {
+                continue;
+            }
+            let w = self
+                .module
+                .arrays
+                .get(&arr)
+                .map(|t| t.2)
+                .unwrap_or(32)
+                .max(1);
+            let ranges = self.inline_elem_ranges(constraints, &arr);
+            let mut used: HashSet<u64> = HashSet::default();
+            for i in 0..size {
+                let key = format!("{}[{}]", arr, i);
+                let cur = self.get_signal_value_by_name(&key).and_then(|v| v.to_u64());
+                let in_domain = |v: u64| {
+                    ranges.is_empty() || ranges.iter().any(|(lo, hi)| v >= *lo && v <= *hi)
+                };
+                if let Some(c) = cur {
+                    if !used.contains(&c) && in_domain(c) {
+                        used.insert(c);
+                        continue;
+                    }
+                }
+                if let Some(v) = self.pick_unused_in_ranges(&ranges, w, &used) {
+                    used.insert(v);
+                    self.set_signal_value_by_name(&key, Value::from_u64(v, w));
+                }
+            }
+        }
+    }
+
+    /// The array operands of every `unique {…}` item in a constraint set.
+    fn collect_unique_operands(
+        &self,
+        constraints: &[crate::ast::decl::ConstraintItem],
+    ) -> Vec<Expression> {
+        use crate::ast::decl::ConstraintItem as CI;
+        fn walk(item: &CI, out: &mut Vec<Expression>) {
+            match item {
+                CI::Unique { exprs, .. } => out.extend(exprs.iter().cloned()),
+                CI::Block(items) => {
+                    for it in items {
+                        walk(it, out);
+                    }
+                }
+                CI::Soft(inner) => walk(inner, out),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for c in constraints {
+            walk(c, &mut out);
+        }
+        out
+    }
+
+    /// §18.5.7: the `(lo, hi)` value ranges a constraint set imposes on the
+    /// ELEMENTS of `arr` — the `inside` list inside its `foreach` body. Empty
+    /// when the elements are unconstrained.
+    fn inline_elem_ranges(
+        &mut self,
+        constraints: &[crate::ast::decl::ConstraintItem],
+        arr: &str,
+    ) -> Vec<(u64, u64)> {
+        let mut out = Vec::new();
+        for c in constraints {
+            self.collect_elem_ranges(c, arr, &mut out);
+        }
+        out
+    }
+
+    fn collect_elem_ranges(
+        &mut self,
+        item: &crate::ast::decl::ConstraintItem,
+        arr: &str,
+        out: &mut Vec<(u64, u64)>,
+    ) {
+        use crate::ast::decl::ConstraintItem as CI;
+        match item {
+            CI::Expr(e) => {
+                if let ExprKind::Inside { expr, ranges } = &e.kind {
+                    if self.is_elem_of(expr, arr) {
+                        for r in ranges {
+                            if let ExprKind::Range(lo, hi) = &r.kind {
+                                let l = self.eval_expr(lo).to_u64().unwrap_or(0);
+                                let h = self.eval_expr(hi).to_u64().unwrap_or(0);
+                                out.push((l, h));
+                            } else {
+                                let v = self.eval_expr(r).to_u64().unwrap_or(0);
+                                out.push((v, v));
+                            }
+                        }
+                    }
+                }
+            }
+            CI::Inside { expr, range, .. } => {
+                if self.is_elem_of(expr, arr) {
+                    for r in range {
+                        match r {
+                            ConstraintRange::Range { lo, hi } => {
+                                let l = self.eval_expr(lo).to_u64().unwrap_or(0);
+                                let h = self.eval_expr(hi).to_u64().unwrap_or(0);
+                                out.push((l, h));
+                            }
+                            ConstraintRange::Value(v) => {
+                                let v = self.eval_expr(v).to_u64().unwrap_or(0);
+                                out.push((v, v));
+                            }
+                        }
+                    }
+                }
+            }
+            CI::Foreach { item, .. } => self.collect_elem_ranges(item, arr, out),
+            CI::Block(items) => {
+                for it in items {
+                    self.collect_elem_ranges(it, arr, out);
+                }
+            }
+            CI::Soft(inner) => self.collect_elem_ranges(inner, arr, out),
+            _ => {}
+        }
+    }
+
+    /// True when `e` indexes into `arr` (`arr[i]`), whatever the index is.
+    fn is_elem_of(&mut self, e: &Expression, arr: &str) -> bool {
+        let e = match &e.kind {
+            ExprKind::Paren(inner) => inner.as_ref(),
+            _ => e,
+        };
+        match &e.kind {
+            ExprKind::Index { expr: base, .. } => {
+                self.array_operand_name(base).as_deref() == Some(arr)
+            }
+            _ => false,
+        }
+    }
+
+    /// Pick a value inside `ranges` (or the full `w`-bit domain when empty) that
+    /// is not already in `used`. Random draws first, then an exhaustive scan so a
+    /// tight domain still resolves deterministically.
+    fn pick_unused_in_ranges(
+        &mut self,
+        ranges: &[(u64, u64)],
+        w: u32,
+        used: &HashSet<u64>,
+    ) -> Option<u64> {
+        use rand::Rng;
+        let full: Vec<(u64, u64)> = if ranges.is_empty() {
+            let max = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+            vec![(0, max)]
+        } else {
+            ranges.to_vec()
+        };
+        for _ in 0..64 {
+            let (lo, hi) = full[self.rng.gen_range(0..full.len())];
+            if hi < lo {
+                continue;
+            }
+            let v = if lo == hi { lo } else { self.rng.gen_range(lo..=hi) };
+            if !used.contains(&v) {
+                return Some(v);
+            }
+        }
+        for (lo, hi) in &full {
+            let span = hi.saturating_sub(*lo);
+            if span > (1 << 20) {
+                continue;
+            }
+            for v in *lo..=*hi {
+                if !used.contains(&v) {
+                    return Some(v);
+                }
+            }
+        }
+        None
     }
 
     /// Narrow the [lo, hi] interval for randomize target `name` using the
@@ -34081,6 +34431,29 @@ impl Simulator {
         use crate::ast::decl::ConstraintItem as CI;
         match item {
             CI::Soft(_) => true, // §18.5.14: soft constraints never fail the check
+            // §18.5.5: the scope path DOES model `unique {arr}` (see
+            // `enforce_inline_unique`), so check it rather than treating it as
+            // unmodeled — otherwise a residual collision never triggered a
+            // retry and the call silently returned a non-unique array.
+            CI::Unique { exprs, .. } => {
+                for e in exprs {
+                    let Some(arr) = self.array_operand_name(e) else { continue };
+                    let size = self.get_queue_size(&arr);
+                    let mut seen: HashSet<u64> = HashSet::default();
+                    for i in 0..size {
+                        let Some(v) = self
+                            .get_signal_value_by_name(&format!("{}[{}]", arr, i))
+                            .and_then(|v| v.to_u64())
+                        else {
+                            continue;
+                        };
+                        if !seen.insert(v) {
+                            return false;
+                        }
+                    }
+                }
+                true
+            }
             CI::Foreach { array, vars, item: body, .. } => {
                 if Self::constraint_unmodeled(body) {
                     return true;
@@ -34973,6 +35346,248 @@ impl Simulator {
             return;
         }
         self.set_signal_value_by_name(flat, val);
+    }
+
+    // =====================================================================
+    // IEEE 1800-2017 §18.4 — aggregate CLASS properties
+    //
+    // A class property whose type is a struct/union needs its members to be
+    // reachable both from OUTSIDE (`bus.packed_struct_inst.payload`) and from
+    // INSIDE the class (a bare `packed_struct_inst.payload` in a constraint).
+    // Class properties live in `heap[h].properties` (a name → Value map), not
+    // in the signal table, so the ordinary struct paths — which key off flat
+    // signal names — never reached them: reads returned X and the constraint
+    // solver had nothing to pin.
+    //
+    // §18.4 also fixes the SEMANTICS: a packed struct/union is a raw integral
+    // type, so its members alias bit slices of ONE value (a union's members
+    // all alias offset 0), and "the rules in 18.3 restricting the random
+    // values of an enum variable shall not apply" to an enum member of one.
+    // An UNPACKED struct is solved member by member, each member its own cell.
+    // =====================================================================
+
+    /// Split `e` into its receiver expression and trailing member name,
+    /// accepting BOTH parse shapes: `MemberAccess{Ident(a), b}` (what a
+    /// constraint body produces) and a flattened `Ident([a, b])`.
+    fn split_trailing_member(e: &Expression) -> Option<(Expression, String)> {
+        match &e.kind {
+            ExprKind::MemberAccess { expr, member } => {
+                Some(((**expr).clone(), member.name.clone()))
+            }
+            ExprKind::Ident(h) if h.path.len() >= 2 => {
+                if h.path.iter().any(|s| !s.selects.is_empty()) {
+                    return None;
+                }
+                let mut base = h.clone();
+                let last = base.path.pop()?;
+                base.cached_signal_id = std::cell::Cell::new(None);
+                base.cached_resolved_name = std::cell::OnceCell::new();
+                Some((
+                    Expression { kind: ExprKind::Ident(base), span: e.span },
+                    last.name.name,
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// Resolve a receiver expression to the `(handle, property)` pair it names:
+    /// a bare `prop` inside a class method/constraint (implicit `this`), or an
+    /// `<obj>.prop` access from outside.
+    fn class_prop_receiver(&mut self, base: &Expression) -> Option<(usize, String)> {
+        if let Some((obj, prop)) = Self::split_trailing_member(base) {
+            let h = self.eval_expr(&obj).to_u64()? as usize;
+            if h == 0 || self.heap.get(h).and_then(|o| o.as_ref()).is_none() {
+                return None;
+            }
+            return Some((h, prop));
+        }
+        let ExprKind::Ident(h) = &base.kind else { return None };
+        if h.path.len() != 1 || !h.path[0].selects.is_empty() {
+            return None;
+        }
+        // A local of the same name shadows the property (§8.10).
+        let nm = &h.path[0].name.name;
+        if self.local_stack.last().map_or(false, |l| l.contains_key(nm)) {
+            return None;
+        }
+        let handle = self.this_stack.last().copied().flatten()?;
+        if handle == 0 {
+            return None;
+        }
+        Some((handle, nm.clone()))
+    }
+
+    /// The declared struct/union type of class property `prop` on `handle`.
+    fn class_prop_struct(
+        &self,
+        handle: usize,
+        prop: &str,
+    ) -> Option<crate::ast::types::StructUnionType> {
+        let inst = self.heap.get(handle)?.as_ref()?;
+        let mut cur = Some(inst.class_name.clone());
+        while let Some(cn) = cur {
+            let cd = self.module.classes.get(&cn)?;
+            if let Some(sig) = cd.properties.get(prop) {
+                let tn = sig.type_name.as_ref()?;
+                let dt = self.module.typedef_types.get(tn.as_str())?;
+                return match Self::resolve_type_ref(dt, &self.module.typedef_types) {
+                    DataType::Struct(su) => Some(su),
+                    _ => None,
+                };
+            }
+            cur = cd.extends.clone();
+        }
+        None
+    }
+
+    /// §18.4 / §7.2.1: bit layout of a PACKED aggregate — `(member, offset,
+    /// width)` plus the aggregate's total width. A packed STRUCT lays its LAST
+    /// member at the LSB; a packed UNION overlays every member at offset 0 and
+    /// is as wide as its widest member (§7.3.1).
+    fn packed_agg_layout(
+        &self,
+        su: &crate::ast::types::StructUnionType,
+    ) -> (Vec<(String, u32, u32)>, u32) {
+        use crate::ast::types::StructUnionKind;
+        let is_union = matches!(su.kind, StructUnionKind::Union);
+        let mut fields: Vec<(String, u32, u32)> = Vec::new();
+        let mut offset: u32 = 0;
+        let mut widest: u32 = 0;
+        let members: Vec<&crate::ast::types::StructMember> = if is_union {
+            su.members.iter().collect()
+        } else {
+            su.members.iter().rev().collect()
+        };
+        for m in members {
+            let fw = resolve_type_width(
+                &m.data_type,
+                Some(&self.module.parameters),
+                Some(&self.module.typedefs),
+            )
+            .max(1);
+            for d in &m.declarators {
+                if is_union {
+                    fields.push((d.name.name.clone(), 0, fw));
+                    widest = widest.max(fw);
+                } else {
+                    fields.push((d.name.name.clone(), offset, fw));
+                    offset += fw;
+                }
+            }
+        }
+        (fields, if is_union { widest.max(1) } else { offset.max(1) })
+    }
+
+    /// §18.4: resolve `e` — `<agg_prop>.<member>` on a class object, in either
+    /// parse shape — to the storage it aliases. `None` when `e` is not an
+    /// aggregate class-property member.
+    fn class_agg_member(&mut self, e: &Expression) -> Option<ClassAggRef> {
+        if self.heap.is_empty() {
+            return None;
+        }
+        let (base, field) = Self::split_trailing_member(e)?;
+        self.class_agg_member_parts(&base, &field)
+    }
+
+    /// `class_agg_member` for an already-split `<base>.<field>`.
+    fn class_agg_member_parts(&mut self, base: &Expression, field: &str) -> Option<ClassAggRef> {
+        if self.heap.is_empty() {
+            return None;
+        }
+        let (handle, prop) = self.class_prop_receiver(base)?;
+        let su = self.class_prop_struct(handle, &prop)?;
+        if Self::spreads_member_wise(&su) {
+            // §18.4: unpacked struct — one cell per member, keyed
+            // `<prop>.<member>` in the instance's property map.
+            let w = su
+                .members
+                .iter()
+                .find(|m| m.declarators.iter().any(|d| d.name.name == field))
+                .map(|m| {
+                    resolve_type_width(
+                        &m.data_type,
+                        Some(&self.module.parameters),
+                        Some(&self.module.typedefs),
+                    )
+                    .max(1)
+                })?;
+            return Some(ClassAggRef::Unpacked {
+                handle,
+                key: format!("{}.{}", prop, field),
+                w,
+            });
+        }
+        let (fields, total) = self.packed_agg_layout(&su);
+        let (_, off, w) = fields.iter().find(|(n, _, _)| *n == field).cloned()?;
+        Some(ClassAggRef::Packed { handle, prop, off, w, total })
+    }
+
+    /// Read the value an aggregate class-property member aliases.
+    fn read_class_agg(&self, r: &ClassAggRef) -> Value {
+        match r {
+            ClassAggRef::Packed { handle, prop, off, w, total } => {
+                let whole = self
+                    .heap
+                    .get(*handle)
+                    .and_then(|o| o.as_ref())
+                    .and_then(|i| i.properties.get(prop))
+                    .cloned()
+                    .unwrap_or_else(|| Value::zero(*total));
+                let mut out = Value::zero((*w).max(1));
+                for i in 0..*w {
+                    out.set_bit(i as usize, whole.get_bit((off + i) as usize));
+                }
+                out
+            }
+            ClassAggRef::Unpacked { handle, key, w } => self
+                .heap
+                .get(*handle)
+                .and_then(|o| o.as_ref())
+                .and_then(|i| i.properties.get(key))
+                .cloned()
+                .unwrap_or_else(|| Value::zero((*w).max(1))),
+        }
+    }
+
+    /// Write through an aggregate class-property member. For a PACKED aggregate
+    /// this splices the member's bits into the property's raw integral value —
+    /// which is what makes a union's members alias each other (§7.3.1) and a
+    /// packed struct's whole/field views stay consistent (§18.4).
+    /// Returns whether the stored value changed.
+    fn write_class_agg(&mut self, r: &ClassAggRef, val: &Value) -> bool {
+        match r {
+            ClassAggRef::Packed { handle, prop, off, w, total } => {
+                let mut whole = self
+                    .heap
+                    .get(*handle)
+                    .and_then(|o| o.as_ref())
+                    .and_then(|i| i.properties.get(prop))
+                    .cloned()
+                    .unwrap_or_else(|| Value::zero(*total));
+                if whole.width != *total {
+                    whole = whole.resize(*total);
+                }
+                let before = whole.clone();
+                for i in 0..*w {
+                    whole.set_bit((off + i) as usize, val.get_bit(i as usize));
+                }
+                let changed = whole != before;
+                if let Some(Some(inst)) = self.heap.get_mut(*handle) {
+                    inst.properties.insert(prop.clone(), whole);
+                }
+                changed
+            }
+            ClassAggRef::Unpacked { handle, key, w } => {
+                let nv = val.resize((*w).max(1));
+                if let Some(Some(inst)) = self.heap.get_mut(*handle) {
+                    let changed = inst.properties.get(key) != Some(&nv);
+                    inst.properties.insert(key.clone(), nv);
+                    return changed;
+                }
+                false
+            }
+        }
     }
 
     /// Whether an aggregate keeps each member in its OWN signal, so an
@@ -36095,6 +36710,27 @@ impl Simulator {
     /// per field. It also lets field-level inline constraints (`pkt.f < N`)
     /// match, since each field target resolves to the same name the constraint
     /// LHS does.
+    /// §18.4: true when `a` names a variable whose type is a PACKED struct or
+    /// (untagged) union — an integral type that can be constrained/randomized
+    /// as one raw value, with its fields aliasing slices of that value.
+    fn is_packed_struct_var(&self, a: &Expression) -> bool {
+        let ExprKind::Ident(h) = &a.kind else { return false };
+        if h.path.len() != 1 {
+            return false;
+        }
+        let vname = &h.path[0].name.name;
+        if self.module.arrays.contains_key(vname)
+            || self.module.dynamic_arrays.contains(vname)
+            || self.module.associative_arrays.contains_key(vname)
+        {
+            return false;
+        }
+        self.module
+            .packed_struct_fields
+            .get(vname)
+            .map_or(false, |f| !f.is_empty())
+    }
+
     fn expand_struct_target(&self, a: &Expression) -> Option<Vec<(String, Expression)>> {
         let ExprKind::Ident(h) = &a.kind else { return None };
         if h.path.len() != 1 {
@@ -40598,7 +41234,15 @@ impl Simulator {
             _ => return None,
         };
         let ExprKind::Ident(h) = &arg.kind else { return None };
-        let caller = self.resolve_hier_name(h);
+        let mut caller = self.resolve_hier_name(h);
+        // §18.5.12 / §13.5.2: the actual may be a fixed-array CLASS member
+        // (`calculate_array_parity(payload_bytes)` inside a constraint), whose
+        // storage lives at `<handle>#<member>`, not under the bare name.
+        if !self.module.arrays.contains_key(&caller) {
+            if let Some(scoped) = self.instance_assoc_member(&caller) {
+                caller = scoped;
+            }
+        }
         if !self.module.arrays.contains_key(&caller) {
             return None;
         }
@@ -44465,6 +45109,9 @@ impl Simulator {
         // elem_width, enum_type). Randomized element-by-element after the scalar
         // fields they may exclude (sp/tp/scratch_reg) are solved.
         let mut rand_arrays: Vec<(String, String, i64, i64, u32, Option<String>)> = Vec::new();
+        // §18.4 classification input: rand prop -> its declared type name.
+        let mut prop_type_names: HashMap<String, String> = HashMap::default();
+
         // §18.5.9/§18.6 — rand class-handle members (`rand SubObject sub_inst`).
         // A rand handle is NOT a random value: the object it points at is
         // randomized recursively, and the enclosing object's constraints may
@@ -44522,6 +45169,9 @@ impl Simulator {
                             if let Some(tn) = enum_t {
                                 enum_prop_types.insert(prop.clone(), tn);
                             }
+                        }
+                        if let Some(tn) = &sig.type_name {
+                            prop_type_names.insert(prop.clone(), tn.clone());
                         }
                     }
                     if class_def.randc_properties.contains(prop) {
@@ -44619,11 +45269,83 @@ impl Simulator {
             out
         };
 
+        // ---- IEEE 1800-2017 §18.4: classify the non-scalar rand properties ----
+        // An OBJECT HANDLE declared `rand` is randomized RECURSIVELY — the
+        // handle itself is never modified ("the object handle is not changed by
+        // randomize()"), and its class's constraints are solved CONCURRENTLY
+        // with this object's. Treating it as a plain integral (which is what the
+        // scalar path did) overwrote the handle with a random number, orphaning
+        // the object.
+        //
+        // A PACKED struct/union is a raw integral type: randomize its whole bit
+        // pattern at the aggregate's true width, with no enum-member restriction
+        // on any enum-typed member ("the rules in 18.3 restricting the random
+        // values of an enum variable shall not apply to that member").
+        //
+        // An UNPACKED struct is solved MEMBER BY MEMBER — only members carrying
+        // `rand`/`randc` participate, and an enum member there DOES follow §18.3.
+        let mut rand_obj_props: Vec<String> = Vec::new();
+        // prop -> total packed width.
+        let mut packed_agg_props: HashMap<String, u32> = HashMap::default();
+        // prop -> [(member, width, is_randc, enum_type)] for the rand members.
+        let mut unpacked_agg_props: Vec<(String, Vec<(String, u32, bool, Option<String>)>)> =
+            Vec::new();
+        for (prop, tn) in &prop_type_names {
+            if self.module.classes.contains_key(tn) {
+                rand_obj_props.push(prop.clone());
+                continue;
+            }
+            let Some(dt) = self.module.typedef_types.get(tn.as_str()) else { continue };
+            let DataType::Struct(su) = Self::resolve_type_ref(dt, &self.module.typedef_types)
+            else {
+                continue;
+            };
+            if Self::spreads_member_wise(&su) {
+                let mut members = Vec::new();
+                for m in &su.members {
+                    let Some(rq) = &m.rand_qualifier else { continue };
+                    let is_randc =
+                        matches!(rq, crate::ast::types::RandQualifier::Randc);
+                    let w = resolve_type_width(
+                        &m.data_type,
+                        Some(&self.module.parameters),
+                        Some(&self.module.typedefs),
+                    )
+                    .max(1);
+                    let et = if let DataType::TypeReference { name, .. } = &m.data_type {
+                        Some(name.name.name.clone())
+                            .filter(|n| self.module.enum_members.contains_key(n))
+                    } else {
+                        None
+                    };
+                    for d in &m.declarators {
+                        members.push((d.name.name.clone(), w, is_randc, et.clone()));
+                    }
+                }
+                unpacked_agg_props.push((prop.clone(), members));
+            } else {
+                let (_, total) = self.packed_agg_layout(&su);
+                packed_agg_props.insert(prop.clone(), total);
+            }
+        }
+        // Object handles and unpacked structs leave the scalar rand list; a
+        // packed aggregate stays but at its TRUE width (elaboration records a
+        // union's width as the default 32).
+        let unpacked_names: HashSet<String> =
+            unpacked_agg_props.iter().map(|(p, _)| p.clone()).collect();
+        rand_props.retain(|(n, _)| !rand_obj_props.contains(n) && !unpacked_names.contains(n));
+        for (n, w) in rand_props.iter_mut() {
+            if let Some(tw) = packed_agg_props.get(n) {
+                *w = *tw;
+            }
+        }
         self.this_stack.push(Some(handle));
-        // Constraint expressions reference collection members by their BARE
-        // name (`dyn_arr[i]`), which only resolves to the instance-scoped
-        // storage when a class context is active — push one for the whole
-        // solve, exactly as a method call would.
+        // §18.5.12: a constraint body is evaluated in the CLASS's scope, so an
+        // unqualified call in a constraint (`user_func_res == calc_hash(a, b)`)
+        // must resolve to a method of this class — and a bare collection member
+        // (`$size(dyn_array)`) to its instance-scoped storage. Both look at
+        // `class_context_stack`; without pushing it the call fell through to the
+        // "unknown name" path and silently yielded 0.
         self.class_context_stack.push(Some(class_name.clone()));
         // SV semantics: randomize() calls pre_randomize() before solving.
         if self.class_has_method(&class_name, "pre_randomize") {
@@ -44714,6 +45436,59 @@ impl Simulator {
             self.dist_picked_once.clear();
             let mut solved_props: HashMap<String, Value> = HashMap::default();
             let mut backup = HashMap::default();
+
+            // §18.4: recursively randomize every `rand` OBJECT HANDLE, so the
+            // sub-object's own constraints hold before this object's fixpoint
+            // runs (`leaf_inst.leaf_val` may then be re-pinned by a cross-object
+            // constraint here, and the concurrent check below re-validates the
+            // sub-object's constraints against the final assignment). The handle
+            // value itself is left untouched.
+            for p in &rand_obj_props {
+                let sub = self
+                    .heap
+                    .get(handle)
+                    .and_then(|o| o.as_ref())
+                    .and_then(|i| i.properties.get(p))
+                    .and_then(|v| v.to_u64())
+                    .unwrap_or(0) as usize;
+                if sub != 0 && self.heap.get(sub).and_then(|o| o.as_ref()).is_some() {
+                    self.exec_randomize(sub);
+                }
+            }
+
+            // §18.4: an UNPACKED struct member is solved member by member; only
+            // `rand`/`randc` members participate. An enum member here DOES obey
+            // §18.3 (valid members only) — unlike one inside a packed struct.
+            for (p, members) in &unpacked_agg_props {
+                for (m, w, is_randc, et) in members {
+                    let key = format!("{}.{}", p, m);
+                    let v = if *is_randc {
+                        let domain = self.randc_domain(&key, *w, et.as_deref(), None);
+                        if domain.is_empty() {
+                            Value::from_u64(self.rng.gen::<u64>(), *w)
+                        } else {
+                            let pick = self.pick_randc(handle, &key, &domain);
+                            Value::from_u64(pick, *w)
+                        }
+                    } else if let Some(members) =
+                        et.as_ref().and_then(|t| self.module.enum_members.get(t.as_str()))
+                    {
+                        let n = members.len();
+                        if n == 0 {
+                            Value::zero(*w)
+                        } else {
+                            let mv = members[self.rng.gen_range(0..n)].1;
+                            Value::from_u64(mv, *w)
+                        }
+                    } else if *w <= 64 {
+                        Value::from_u64(self.rng.gen::<u64>(), *w)
+                    } else {
+                        Value::zero(*w)
+                    };
+                    let r = ClassAggRef::Unpacked { handle, key, w: *w };
+                    self.write_class_agg(&r, &v);
+                }
+            }
 
             // First pass: identify simple range constraints for each property
             let mut prop_allowed_ranges: HashMap<String, Vec<(u64, u64)>> = HashMap::default();
@@ -45125,8 +45900,17 @@ impl Simulator {
             // (init_privileged_mode != MACHINE_MODE) ...` converge over a few
             // passes. This is what lets riscv-dv's tightly-coupled config
             // constraints be satisfied without relying on random luck.
-            let rand_set: HashSet<String> =
-                rand_props.iter().map(|(n, _)| n.clone()).collect();
+            // §18.4: `rand` OBJECT HANDLES and UNPACKED-struct properties left
+            // the scalar list (they are not solved as integrals) but they are
+            // still rand — a constraint may target their MEMBERS
+            // (`leaf_inst.leaf_val`, `unpacked_struct_inst.unpacked_rand_val`),
+            // and `rand_member_target` gates on the receiver being rand here.
+            let rand_set: HashSet<String> = rand_props
+                .iter()
+                .map(|(n, _)| n.clone())
+                .chain(rand_obj_props.iter().cloned())
+                .chain(unpacked_agg_props.iter().map(|(p, _)| p.clone()))
+                .collect();
             // LRM §18.5.14: a `soft` constraint is overridden by any
             // hard constraint on the same variable. Collect the set of
             // variables targeted by HARD (non-soft) constraint items so
@@ -45455,6 +46239,17 @@ impl Simulator {
                 }
             }
 
+            // §18.4 concurrent solve: a `rand` object handle's OWN constraints
+            // are part of this randomize()'s problem. A cross-object constraint
+            // here (`leaf_inst.leaf_val == packed_struct_inst.payload + 10`)
+            // re-pins the sub-object's variable, so its class constraints
+            // (`leaf_val > 50`) must be re-validated against the FINAL
+            // assignment — otherwise a trial that quietly violated them would be
+            // accepted. Failing here retries the whole trial with a fresh draw.
+            if all_ok && !rand_obj_props.is_empty() {
+                all_ok = self.sub_object_constraints_ok(handle, &rand_obj_props);
+            }
+
             if all_ok {
                 // SV semantics: randomize() calls post_randomize() on success
                 // (e.g. riscv_instr builds its imm_str / formats operands here).
@@ -45543,6 +46338,118 @@ impl Simulator {
             }
         }
         None
+    }
+
+    /// §18.4: a constraint LHS that is not a bare rand property but is still a
+    /// solvable target of THIS randomize(): a member of an aggregate rand
+    /// property (`packed_struct_inst.payload`, `packed_union_inst.union_enum`)
+    /// or a property of a `rand` OBJECT HANDLE (`leaf_inst.leaf_val`), which is
+    /// solved concurrently with the enclosing object.
+    fn rand_member_target(
+        &mut self,
+        expr: &Expression,
+        rand_set: &HashSet<String>,
+    ) -> Option<RandMemberTarget> {
+        let (base, field) = Self::split_trailing_member(expr)?;
+        // The receiver must be a `rand` property of the object being solved.
+        let ExprKind::Ident(bh) = &base.kind else { return None };
+        if bh.path.len() != 1 || !rand_set.contains(&bh.path[0].name.name) {
+            return None;
+        }
+        if let Some(r) = self.class_agg_member_parts(&base, &field) {
+            return Some(RandMemberTarget::Agg(r));
+        }
+        // `rand` object handle: resolve it and target the sub-object's property.
+        let sub = self.eval_expr(&base).to_u64()? as usize;
+        let sub_class = self
+            .heap
+            .get(sub)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.class_name.clone())?;
+        let mut cur = Some(sub_class);
+        while let Some(cn) = cur {
+            let cd = self.module.classes.get(&cn)?;
+            if cd.properties.contains_key(&field) {
+                return Some(RandMemberTarget::Sub(sub, field));
+            }
+            cur = cd.extends.clone();
+        }
+        None
+    }
+
+    /// Write a `RandMemberTarget`; reports whether the stored value changed.
+    fn set_rand_member(&mut self, t: &RandMemberTarget, val: Value) -> bool {
+        match t {
+            RandMemberTarget::Agg(r) => self.write_class_agg(r, &val),
+            RandMemberTarget::Sub(h, prop) => {
+                let w = self.class_prop_width_of(*h, prop).unwrap_or(val.width).max(1);
+                self.set_prop_if_changed(*h, prop, val.resize(w))
+            }
+        }
+    }
+
+    /// Declared width of `prop` on the object `handle` points at (class chain).
+    fn class_prop_width_of(&self, handle: usize, prop: &str) -> Option<u32> {
+        let cn = self.heap.get(handle)?.as_ref()?.class_name.clone();
+        self.class_prop_width(&cn, prop)
+    }
+
+    /// §18.4: re-validate the constraints declared inside every `rand` object
+    /// handle of `handle` against the current (post-fixpoint) assignment.
+    fn sub_object_constraints_ok(&mut self, handle: usize, obj_props: &[String]) -> bool {
+        for p in obj_props {
+            let sub = self
+                .heap
+                .get(handle)
+                .and_then(|o| o.as_ref())
+                .and_then(|i| i.properties.get(p))
+                .and_then(|v| v.to_u64())
+                .unwrap_or(0) as usize;
+            let Some(sub_class) = self
+                .heap
+                .get(sub)
+                .and_then(|o| o.as_ref())
+                .map(|i| i.class_name.clone())
+            else {
+                continue;
+            };
+            let mut items: Vec<ConstraintItem> = Vec::new();
+            let mut seen: HashSet<String> = HashSet::default();
+            let disabled = self.constraint_mode_disabled.get(&sub).cloned().unwrap_or_default();
+            let mut cur = Some(sub_class);
+            while let Some(cn) = cur {
+                let Some(cd) = self.module.classes.get(&cn) else { break };
+                for (name, con) in cd.constraints.iter() {
+                    if !seen.insert(name.clone()) || disabled.contains("*") || disabled.contains(name)
+                    {
+                        continue;
+                    }
+                    items.extend(con.items.iter().cloned());
+                }
+                cur = cd.extends.clone();
+            }
+            self.class_context_stack.push(
+                self.heap
+                    .get(sub)
+                    .and_then(|o| o.as_ref())
+                    .map(|i| i.class_name.clone()),
+            );
+            let mut ok = true;
+            for item in &items {
+                if Self::constraint_unmodeled(item) {
+                    continue;
+                }
+                if !self.check_constraint_item(sub, item) {
+                    ok = false;
+                    break;
+                }
+            }
+            self.class_context_stack.pop();
+            if !ok {
+                return false;
+            }
+        }
+        true
     }
 
     /// Set property `name` on `handle` to `val`, returning whether the value
@@ -45866,6 +46773,17 @@ impl Simulator {
                     if let Some(v) = self.rand_lvalue_name(right, rand_set) {
                         let val = self.eval_expr(left);
                         return self.set_prop_if_changed(handle, &v, val);
+                    }
+                    // §18.4: the target may be a member of an aggregate rand
+                    // property, or a property of a `rand` object handle solved
+                    // concurrently with this one.
+                    if let Some(t) = self.rand_member_target(left, rand_set) {
+                        let val = self.eval_expr(right);
+                        return self.set_rand_member(&t, val);
+                    }
+                    if let Some(t) = self.rand_member_target(right, rand_set) {
+                        let val = self.eval_expr(left);
+                        return self.set_rand_member(&t, val);
                     }
                     // §18.5.9 global (cross-object) constraint: the lvalue is a
                     // rand member of a class-handle member of `this`
@@ -46707,6 +47625,7 @@ impl Simulator {
                     // instr, …)` writing the picked instruction to `instr_list[i]`).
                     let mut output_bindings: Vec<(String, Expression)> = Vec::new();
                     let mut queue_writebacks: Vec<(String, String)> = Vec::new();
+                    let mut array_writebacks: Vec<(String, String, i64, i64)> = Vec::new();
                     for (i, port) in ports.iter().enumerate() {
                         if matches!(
                             port.direction,
@@ -46767,6 +47686,21 @@ impl Simulator {
                                 );
                                 if is_out && !caller.is_empty() {
                                     queue_writebacks.push((port.name.name.clone(), caller));
+                                }
+                                continue;
+                            }
+                            // §13.5.2 / §18.5.12: a FIXED unpacked-array formal
+                            // (`function bit [7:0] parity(bit [7:0] a[4])`) is
+                            // passed BY VALUE. Only the free-function path bound
+                            // one; a class method bound it as a scalar, so the
+                            // body read X and a user function taking an array —
+                            // legal in a constraint — always returned 0.
+                            if let Some(info) = self.bind_array_arg(port, &args[i]) {
+                                if matches!(
+                                    port.direction,
+                                    PortDirection::Output | PortDirection::Inout | PortDirection::Ref
+                                ) {
+                                    array_writebacks.push(info);
                                 }
                                 continue;
                             }
@@ -46970,6 +47904,13 @@ impl Simulator {
                     self.pop_and_restore_queue_frame();
                     for (param, caller) in &queue_writebacks {
                         self.writeback_queue_param(param, caller);
+                    }
+                    // §13.5.2: copy `output`/`inout`/`ref` fixed-array formals
+                    // back onto the caller's array (a plain `input` formal is
+                    // by value and must NOT write back — §18.5.12 relies on
+                    // that for array args to constraint functions).
+                    if !array_writebacks.is_empty() {
+                        self.writeback_array_args(&array_writebacks);
                     }
                     for (v, caller) in writebacks {
                         self.assign_value(&caller, &v);

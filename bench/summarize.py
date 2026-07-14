@@ -75,6 +75,30 @@ def main(paths):
     print("\nunits: items/sec (simulated cycles/sec; randomizations/sec for B5)")
     print("'!' = >10% spread across reps on that host — rerun before trusting it")
 
+    # Hardware counters: this is what tells you WHY a platform differs.
+    # Rates, not raw counts — they stay meaningful across clock speeds.
+    has_perf = any(float(r.get("ipc") or 0) > 0 for r in rows)
+    if has_perf:
+        print("\nhardware counters (median)")
+        hw = defaultdict(lambda: defaultdict(list))
+        for r in rows:
+            if float(r.get("ipc") or 0) > 0:
+                hw[key(r)][r["host"]].append((
+                    float(r["ipc"]),
+                    float(r.get("branch_miss_pct") or 0),
+                    float(r.get("cache_miss_pct") or 0),
+                ))
+        print(f"  {'benchmark':{w}s}{'host':12s}{'IPC':>7s}{'br-miss%':>10s}{'cache-miss%':>13s}")
+        for k in sorted(hw):
+            for h in hosts:
+                v = hw[k].get(h) or []
+                if not v:
+                    continue
+                ipc = med([x[0] for x in v])
+                brm = med([x[1] for x in v])
+                cms = med([x[2] for x in v])
+                print(f"  {k[0]+' '+k[1]:{w}s}{h:12s}{ipc:>7.2f}{brm:>10.2f}{cms:>13.2f}")
+
     if len(hosts) > 1:
         print("\nsubsystem split (median ms: settle / edges / nba / process)")
         for k in sorted(prof):

@@ -47,6 +47,25 @@ can simply be concatenated and fed to `summarize.py`.
 * **Watch `fallbacks`.** If one platform shows more AST fallbacks, the runs are
   not doing the same work and are not comparable.
 
+## Hardware counters
+
+The runner wraps each run in `perf stat` when it is available and permitted,
+recording **rates, not raw counts** (`ipc`, `branch_miss_pct`,
+`cache_miss_pct`), because rates stay meaningful across machines with different
+clock speeds and core counts. Only the *generic* perf events are used
+(`cycles,instructions,branches,branch-misses,cache-references,cache-misses`) —
+the kernel maps these on Neoverse/Graviton exactly as on x86, so the columns are
+directly comparable. Arch-specific events (`LLC-load-misses` and friends) are
+deliberately avoided.
+
+If `perf` is missing or `perf_event_paranoid` is too high, the benchmarks still
+run and those columns read 0.
+
+Counters are how you answer *why* a platform is slower. A B2 that regresses on
+Graviton with a **higher branch-miss rate** is an indirect-predictor story; the
+same regression with a flat branch-miss rate but **higher cache-miss rate** is a
+memory story. Without counters you can only observe the gap.
+
 ## Gotchas discovered while building this
 
 * **`--threads n` is not parallel simulation.** Per `--help` it only offloads
@@ -58,3 +77,14 @@ can simply be concatenated and fed to `summarize.py`.
   NBA merge, not the hardware — which is precisely what B4 exists to find.
 * B3 already shows a clean knee on this box: ~537k cycles/s at a 4 KiB working
   set → ~279k at 16 MiB.
+* **B2 is not branch-bound — my original hypothesis was wrong.** On the i7-9800X
+  it runs at **IPC 3.09 with a 0.04% branch-miss rate**: the interpreter's
+  indirect dispatch is predicting almost perfectly, because the block-execution
+  order repeats every cycle. So B2 currently measures *cache-resident execution
+  throughput*, not branch prediction. That is still a useful axis, but if you
+  specifically want to stress the indirect predictor, the design needs an
+  irregular, data-dependent block order (e.g. randomized enables so a different
+  subset of blocks fires each cycle). Kept as-is and documented rather than
+  quietly relabelled — the counters are what caught it.
+* For contrast, B5 (the constraint solver) runs at IPC 2.25 with a 1.1%
+  branch-miss rate: it *is* the branchy, unpredictable workload of the set.

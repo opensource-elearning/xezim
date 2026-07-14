@@ -39,9 +39,22 @@ CPU=${CPU:-unknown}
 NCORE=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 0)
 XVER=$("$XEZIM" --version 2>/dev/null | head -1 || echo unknown)
 
-echo "host=$HOST arch=$ARCH cpu='$CPU' cores=$NCORE xezim='$XVER' reps=$REPS"
+# ---- optional hardware counters. Only the GENERIC perf events are used:
+# they are PMU-independent and the kernel maps them on Neoverse/Graviton the
+# same as on x86, so the columns stay comparable across platforms. Anything
+# arch-specific (LLC-load-misses etc.) is deliberately avoided.
+PERF_EVENTS="task-clock,cycles,instructions,branches,branch-misses,cache-references,cache-misses"
+PERF=""
+if command -v perf >/dev/null 2>&1 && perf stat -x, -e "$PERF_EVENTS" true >/dev/null 2>&1; then
+  PERF="yes"
+else
+  echo "note: perf counters unavailable (missing perf, or perf_event_paranoid too high)."
+  echo "      benchmarks still run; the ipc/branch_miss/cache_miss columns will be 0."
+fi
 
-echo "host,arch,cpu,cores,xezim,bench,variant,threads,rep,wall_ms,items,items_per_sec,insns,ns_per_insn,edges_fired,settle_ms,edges_ms,nba_ms,process_ms,fallbacks,work,work_units" > "$OUT"
+echo "host=$HOST arch=$ARCH cpu='$CPU' cores=$NCORE xezim='$XVER' reps=$REPS perf=${PERF:-no}"
+
+echo "host,arch,cpu,cores,xezim,bench,variant,threads,rep,wall_ms,items,items_per_sec,ipc,branch_miss_pct,cache_miss_pct,hw_cycles,hw_instructions,insns,ns_per_insn,edges_fired,settle_ms,edges_ms,nba_ms,process_ms,fallbacks,work,work_units" > "$OUT"
 
 # Microsecond clock: bash 5's EPOCHREALTIME, expanded INLINE. Reading it
 # through a $( ) subshell returned a stale value (the dynamic variable is
@@ -53,11 +66,35 @@ run() {
   local bench="$1" variant="$2" threads="$3" units="$4" file="$5"; shift 5
   for rep in $(seq 1 "$REPS"); do
     local t0 t1 wall log
+    local perf_csv=""
     t0=${EPOCHREALTIME/[.,]/}
-    log=$("$XEZIM" --threads "$threads" "$@" "$file" 2>&1)
+    if [[ -n "$PERF" ]]; then
+      perf_csv=$(mktemp)
+      log=$(perf stat -x, -o "$perf_csv" -e "$PERF_EVENTS" \
+              "$XEZIM" --threads "$threads" "$@" "$file" 2>&1)
+    else
+      log=$("$XEZIM" --threads "$threads" "$@" "$file" 2>&1)
+    fi
     t1=${EPOCHREALTIME/[.,]/}
     wall=$(( (t1 - t0) / 1000 ))
     (( wall < 0 )) && wall=0
+
+    # Derive IPC and the two miss RATES (not raw counts): rates are what stay
+    # meaningful when the machines run different clock speeds and core counts.
+    local hw_cyc=0 hw_ins=0 hw_br=0 hw_brm=0 hw_cref=0 hw_cmis=0
+    local ipc=0 brmiss=0 cmiss=0
+    if [[ -n "$perf_csv" && -r "$perf_csv" ]]; then
+      pget() { awk -F, -v e="$1" '$3 ~ e && $1 ~ /^[0-9.]+$/ {print int($1); exit}' "$perf_csv"; }
+      hw_cyc=$(pget '^cycles');            hw_ins=$(pget '^instructions')
+      hw_br=$(pget '^branches');           hw_brm=$(pget '^branch-misses')
+      hw_cref=$(pget '^cache-references'); hw_cmis=$(pget '^cache-misses')
+      hw_cyc=${hw_cyc:-0}; hw_ins=${hw_ins:-0}; hw_br=${hw_br:-0}
+      hw_brm=${hw_brm:-0}; hw_cref=${hw_cref:-0}; hw_cmis=${hw_cmis:-0}
+      (( hw_cyc  > 0 )) && ipc=$(awk -v a="$hw_ins"  -v b="$hw_cyc"  'BEGIN{printf "%.3f", a/b}')
+      (( hw_br   > 0 )) && brmiss=$(awk -v a="$hw_brm" -v b="$hw_br" 'BEGIN{printf "%.2f", 100*a/b}')
+      (( hw_cref > 0 )) && cmiss=$(awk -v a="$hw_cmis" -v b="$hw_cref" 'BEGIN{printf "%.2f", 100*a/b}')
+      rm -f "$perf_csv"
+    fi
 
     # xezim's own counters: attribute a platform delta to a subsystem
     local insns nspi edges settle edg nba proc fb work
@@ -88,15 +125,16 @@ run() {
     else
       rate=0
     fi
-    printf '%s,%s,"%s",%s,"%s",%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"%s",%s\n' \
+    printf '%s,%s,"%s",%s,"%s",%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"%s",%s\n' \
       "$HOST" "$ARCH" "$CPU" "$NCORE" "$XVER" \
       "$bench" "$variant" "$threads" "$rep" "$wall" \
       "$items" "$rate" \
+      "$ipc" "$brmiss" "$cmiss" "$hw_cyc" "$hw_ins" \
       "${insns:-0}" "${nspi:-0}" "${edges:-0}" \
       "${settle:-0}" "${edg:-0}" "${nba:-0}" "${proc:-0}" "${fb:-0}" \
       "$work" "$units" >> "$OUT"
-    printf '  %-16s %-12s t=%-2s rep%-2s %6s ms  %10s items/s  ns/insn=%s\n' \
-      "$bench" "$variant" "$threads" "$rep" "$wall" "$rate" "${nspi:-n/a}"
+    printf '  %-16s %-12s t=%-2s rep%-2s %6s ms  %10s items/s  ipc=%-5s brmiss=%-5s%% cmiss=%-5s%%\n' \
+      "$bench" "$variant" "$threads" "$rep" "$wall" "$rate" "$ipc" "$brmiss" "$cmiss"
   done
 }
 

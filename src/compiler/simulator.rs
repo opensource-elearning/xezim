@@ -32572,51 +32572,66 @@ impl Simulator {
                                     targets.push((self.resolve_hier_name(hh), a.clone()));
                                 }
                             }
-                            // Relational items (`t > e`, `t <= e`, …): narrow a
-                            // [lo, hi] interval per target across the WHOLE
-                            // constraint set, then pick uniformly inside it.
-                            // Item-at-a-time re-picking would ping-pong between
-                            // `a > 100` and `a < 200`; interval narrowing
-                            // converges in one shot (same approach as the
-                            // real-rand bounds scan in exec_randomize).
-                            for (name, lv) in &targets {
-                                let cur = self.eval_expr(lv);
-                                let width = cur.width.max(1);
-                                let signed = cur.is_signed;
-                                let (mut lo, mut hi): (i64, i64) = if signed {
-                                    if width >= 64 {
-                                        (i64::MIN, i64::MAX)
-                                    } else {
-                                        (-(1i64 << (width - 1)), (1i64 << (width - 1)) - 1)
-                                    }
-                                } else if width >= 63 {
-                                    (0, i64::MAX)
-                                } else {
-                                    (0, (1i64 << width) - 1)
-                                };
-                                let mut any = false;
-                                for c in constraints {
-                                    self.narrow_relational_bounds(
-                                        c, name, &targets, &mut lo, &mut hi, &mut any,
-                                    );
+                            for attempt in 0..10 {
+                                if attempt > 0 {
+                                    // Previous attempt left a (modeled)
+                                    // constraint violated — reseed and retry.
+                                    self.exec_std_randomize(args);
                                 }
-                                if any && lo <= hi {
-                                    use rand::Rng;
-                                    let pick =
-                                        if lo == hi { lo } else { self.rng.gen_range(lo..=hi) };
-                                    let masked = if width >= 64 {
-                                        pick as u64
+                                // Relational items (`t > e`, `t <= e`, …): narrow a
+                                // [lo, hi] interval per target across the WHOLE
+                                // constraint set, then pick uniformly inside it.
+                                // Item-at-a-time re-picking would ping-pong between
+                                // `a > 100` and `a < 200`; interval narrowing
+                                // converges in one shot (same approach as the
+                                // real-rand bounds scan in exec_randomize).
+                                for (name, lv) in &targets {
+                                    let cur = self.eval_expr(lv);
+                                    let width = cur.width.max(1);
+                                    let signed = cur.is_signed;
+                                    let (mut lo, mut hi): (i64, i64) = if signed {
+                                        if width >= 64 {
+                                            (i64::MIN, i64::MAX)
+                                        } else {
+                                            (-(1i64 << (width - 1)), (1i64 << (width - 1)) - 1)
+                                        }
+                                    } else if width >= 63 {
+                                        (0, i64::MAX)
                                     } else {
-                                        (pick as u64) & ((1u64 << width) - 1)
+                                        (0, (1i64 << width) - 1)
                                     };
-                                    let mut v = Value::from_u64(masked, width);
-                                    v.is_signed = signed;
-                                    self.assign_value(lv, &v);
+                                    let mut any = false;
+                                    for c in constraints {
+                                        self.narrow_relational_bounds(
+                                            c, name, &targets, &mut lo, &mut hi, &mut any,
+                                        );
+                                    }
+                                    if any && lo <= hi {
+                                        use rand::Rng;
+                                        let pick =
+                                            if lo == hi { lo } else { self.rng.gen_range(lo..=hi) };
+                                        let masked = if width >= 64 {
+                                            pick as u64
+                                        } else {
+                                            (pick as u64) & ((1u64 << width) - 1)
+                                        };
+                                        let mut v = Value::from_u64(masked, width);
+                                        v.is_signed = signed;
+                                        self.assign_value(lv, &v);
+                                    }
                                 }
-                            }
-                            for _ in 0..8 {
-                                for c in constraints {
-                                    self.apply_inline_constraint(c, &targets);
+                                for _ in 0..8 {
+                                    for c in constraints {
+                                        self.apply_inline_constraint(c, &targets);
+                                    }
+                                }
+                                // §18.5.7/§18.3 backstop: keep the assignment
+                                // only when every MODELED constraint holds —
+                                // the per-element repair can dead-end (e.g. an
+                                // ascending cross-element chain that exhausts
+                                // its headroom); a fresh seed usually escapes.
+                                if self.inline_constraints_satisfied(constraints) {
+                                    break;
                                 }
                             }
                             return Value::from_u64(1, 32);
@@ -32878,48 +32893,48 @@ impl Simulator {
                 }
             }
             CI::Soft(inner) => self.apply_inline_constraint(inner, targets),
-            // `foreach (arr[i]) arr[i] inside {ranges}` — set every element of
-            // the rand array to a value picked from the per-element range
-            // (e.g. riscv-dv `branch_idx[i] inside {[1:max_branch_step]}`).
-            CI::Foreach { array, item, .. } => {
-                if let Some(arr_name) = self.array_operand_name(array) {
-                    // Extract the `inside {ranges}` constraint on the element.
-                    fn find_inside(it: &CI) -> Option<Vec<Expression>> {
-                        match it {
-                            CI::Expr(e) => match &e.kind {
-                                ExprKind::Inside { ranges, .. } => Some(ranges.clone()),
-                                _ => None,
-                            },
-                            CI::Inside { range, .. } => Some(
-                                range
-                                    .iter()
-                                    .map(|r| match r {
-                                        ConstraintRange::Value(e) => e.clone(),
-                                        ConstraintRange::Range { lo, hi } => Expression::new(
-                                            ExprKind::Range(
-                                                Box::new(lo.clone()),
-                                                Box::new(hi.clone()),
-                                            ),
-                                            lo.span,
-                                        ),
-                                    })
-                                    .collect(),
-                            ),
-                            CI::Block(items) => items.iter().find_map(find_inside),
-                            CI::Soft(inner) => find_inside(inner),
-                            _ => None,
+            // IEEE 1800-2017 §18.5.7 iterative (foreach) constraints:
+            // `foreach (arr[i]) <body>` constrains every element of the rand
+            // array, with the loop variable `i` bound to each valid index.
+            // The body is solved per element: equality pins (issue #28's
+            // `arr[i] == i + 5`), `inside`/`dist` picks (riscv-dv's
+            // `branch_idx[i] inside {[1:max_branch_step]}`), relational
+            // narrowing, and conditional shapes.
+            CI::Foreach { array, vars, item, .. } => {
+                // `foreach (arr[i])` carries the loop vars separately, so
+                // `array` is normally a bare identifier; unwrap an Index
+                // shape too for robustness.
+                let base = match &array.kind {
+                    ExprKind::Index { expr: b, .. } => b.as_ref(),
+                    _ => array,
+                };
+                if let Some(arr_name) = self.array_operand_name(base) {
+                    // Index range: declared bounds for fixed arrays,
+                    // 0..size-1 for queues / dynamic arrays.
+                    let (lo, hi) = self
+                        .foreach_dims(&arr_name)
+                        .and_then(|d| d.first().copied())
+                        .unwrap_or_else(|| (0, self.get_queue_size(&arr_name) as i64 - 1));
+                    let elem_w = self
+                        .module
+                        .arrays
+                        .get(&arr_name)
+                        .map(|t| t.2)
+                        .unwrap_or(32)
+                        .max(1);
+                    let idx_var: Option<String> =
+                        vars.first().and_then(|v| v.as_ref().map(|id| id.name.clone()));
+                    for i in lo..=hi {
+                        // §18.5.7.1: bind the index variable so body
+                        // expressions (`arr[i]`, `i + 5`) see the concrete
+                        // index value.
+                        let mut frame: HashMap<String, Value> = HashMap::default();
+                        if let Some(iv) = &idx_var {
+                            frame.insert(iv.clone(), Value::from_u64(i as u64, 32));
                         }
-                    }
-                    if let Some(rs) = find_inside(item) {
-                        let size = self.get_queue_size(&arr_name);
-                        for i in 0..size {
-                            if let Some(v) = self.pick_inside_value(&rs) {
-                                self.set_signal_value_by_name(
-                                    &format!("{}[{}]", arr_name, i),
-                                    v,
-                                );
-                            }
-                        }
+                        self.local_stack.push(frame);
+                        self.solve_inline_foreach_elem(item, &arr_name, i, elem_w);
+                        self.local_stack.pop();
                     }
                 }
             }
@@ -32951,46 +32966,64 @@ impl Simulator {
                     ) {
                         return;
                     }
-                    let on_left = self.constraint_operand_name(left).as_deref() == Some(name);
-                    let on_right = self.constraint_operand_name(right).as_deref() == Some(name);
-                    if on_left == on_right {
+                    // §18.3: decompose each side as an affine function of the
+                    // target (`ls*t + lc REL rs*t + rc`), seeing through
+                    // §6.24.1 size casts / type casts. This subsumes the
+                    // plain `t REL bound` shape (scale 1 / scale 0) and also
+                    // solves cast-wrapped compounds like `32'(A * B) < 1000`
+                    // (issue #29: A known 8-bit, B the target → B <= 999/A).
+                    let Some((ls, lc)) = self.affine_in_target(left, name, targets) else {
                         return;
-                    }
-                    let bound_side = if on_left { right } else { left };
-                    let mut ids = HashSet::default();
-                    self.collect_expr_idents(bound_side, &mut ids);
-                    if targets.iter().any(|(n, _)| ids.contains(n)) {
+                    };
+                    let Some((rs, rc)) = self.affine_in_target(right, name, targets) else {
                         return;
+                    };
+                    // Rearrange to `s*t REL c`.
+                    let (Some(s), Some(c)) = (ls.checked_sub(rs), rc.checked_sub(lc)) else {
+                        return;
+                    };
+                    if s == 0 {
+                        return; // target cancelled out — nothing to narrow
                     }
-                    let b = self.eval_expr(bound_side).to_i64().unwrap_or(0);
-                    // Normalize to `name REL bound` (swap when name is on
-                    // the right: `100 < a` means `a > 100`).
-                    let eff = if on_right {
-                        match op {
+                    // Normalize to positive scale (dividing an inequality by
+                    // a negative flips it).
+                    let (s, c, eff) = if s < 0 {
+                        let flipped = match op {
                             BinaryOp::Lt => BinaryOp::Gt,
                             BinaryOp::Gt => BinaryOp::Lt,
                             BinaryOp::Leq => BinaryOp::Geq,
                             BinaryOp::Geq => BinaryOp::Leq,
                             other => *other,
-                        }
+                        };
+                        (-s, c.checked_neg().unwrap_or(i64::MAX), flipped)
                     } else {
-                        *op
+                        (s, c, *op)
                     };
+                    // Integer bounds on t for `s*t REL c`, s > 0 (floor/ceil
+                    // division keeps them exact for non-unit scales).
+                    let div_floor = |a: i64, b: i64| a.div_euclid(b);
+                    let div_ceil =
+                        |a: i64, b: i64| a.checked_add(b - 1).map(|x| x.div_euclid(b));
                     match eff {
                         BinaryOp::Gt => {
-                            *lo = (*lo).max(b.saturating_add(1));
+                            // s*t > c  →  t >= floor(c/s) + 1
+                            *lo = (*lo).max(div_floor(c, s).saturating_add(1));
                             *any = true;
                         }
                         BinaryOp::Geq => {
+                            // s*t >= c →  t >= ceil(c/s)
+                            let Some(b) = div_ceil(c, s) else { return };
                             *lo = (*lo).max(b);
                             *any = true;
                         }
                         BinaryOp::Lt => {
-                            *hi = (*hi).min(b.saturating_sub(1));
+                            // s*t < c  →  t <= floor((c-1)/s)
+                            *hi = (*hi).min(div_floor(c.saturating_sub(1), s));
                             *any = true;
                         }
                         BinaryOp::Leq => {
-                            *hi = (*hi).min(b);
+                            // s*t <= c →  t <= floor(c/s)
+                            *hi = (*hi).min(div_floor(c, s));
                             *any = true;
                         }
                         _ => {}
@@ -33007,6 +33040,412 @@ impl Simulator {
             }
             _ => {}
         }
+    }
+
+    /// True when `e` names element `idx` of array `arr` — i.e. an inline
+    /// `foreach` body operand `arr[i]` with the loop var currently bound so
+    /// its index expression evaluates to `idx` (§18.5.7).
+    fn inline_foreach_elem_ref(&mut self, e: &Expression, arr: &str, idx: i64) -> bool {
+        let e = match &e.kind {
+            // §6.24: a type cast lowered to a pass-through Paren wrapper.
+            ExprKind::Paren(inner) => inner.as_ref(),
+            _ => e,
+        };
+        if let ExprKind::Index { expr: base, index } = &e.kind {
+            if self.array_operand_name(base).as_deref() == Some(arr) {
+                return self.eval_expr(index).to_i64() == Some(idx);
+            }
+        }
+        false
+    }
+
+    /// §18.5.7: solve one inline-`foreach` body item for element `arr[idx]`.
+    /// The loop index variable is already bound in the top local_stack frame,
+    /// so index expressions (`i`, `i+1`) and value expressions (`i + 5`)
+    /// evaluate with the concrete index.
+    ///
+    /// Two-phase per element (mirrors the scalar-target flow in
+    /// `eval_randomize_with`): first ACCUMULATE all relational bounds across
+    /// the whole body into one [lo, hi] interval — item-at-a-time re-picking
+    /// would ping-pong between `arr[i] > 100` and `arr[i] <= 110` — then
+    /// apply pins (equality / `inside` / `dist`), and finally re-pick inside
+    /// the interval only when the current value violates it, so
+    /// cross-element relations (`arr[i] > arr[i-1]`) converge across the
+    /// outer apply sweeps.
+    fn solve_inline_foreach_elem(
+        &mut self,
+        item: &crate::ast::decl::ConstraintItem,
+        arr: &str,
+        idx: i64,
+        w: u32,
+    ) {
+        use rand::Rng;
+        let elem_name = format!("{}[{}]", arr, idx);
+        // Phase 1: gather relational bounds (unsigned element domain).
+        let (mut lo, mut hi) = (0i64, if w >= 63 { i64::MAX } else { (1i64 << w) - 1 });
+        let mut any_rel = false;
+        let mut excl: Vec<i64> = Vec::new();
+        self.narrow_inline_foreach_bounds(item, arr, idx, &mut lo, &mut hi, &mut any_rel, &mut excl);
+        // Phase 2: equality / inside / dist pins.
+        let pinned = self.apply_inline_foreach_pins(item, arr, idx, w);
+        // Phase 3: repair against the accumulated interval / exclusions.
+        if pinned || !(any_rel || !excl.is_empty()) || lo > hi {
+            return;
+        }
+        let cur = self
+            .get_signal_value_by_name(&elem_name)
+            .and_then(|v| v.to_i64())
+            .unwrap_or(0);
+        if cur >= lo && cur <= hi && !excl.contains(&cur) {
+            return; // already satisfied
+        }
+        for _ in 0..16 {
+            let p = if lo == hi { lo } else { self.rng.gen_range(lo..=hi) };
+            if !excl.contains(&p) {
+                self.set_signal_value_by_name(&elem_name, Value::from_u64(p as u64, w));
+                return;
+            }
+        }
+    }
+
+    /// Phase-1 walker for `solve_inline_foreach_elem`: accumulate the
+    /// relational bounds (`<`, `<=`, `>`, `>=`) and `!=` exclusions the body
+    /// places on element `arr[idx]`. Bound sides are evaluated with the loop
+    /// var bound, so index-dependent (`i * 2`) and cross-element
+    /// (`arr[i-1] + 1`) bounds use the current solve state.
+    #[allow(clippy::too_many_arguments)]
+    fn narrow_inline_foreach_bounds(
+        &mut self,
+        item: &crate::ast::decl::ConstraintItem,
+        arr: &str,
+        idx: i64,
+        lo: &mut i64,
+        hi: &mut i64,
+        any: &mut bool,
+        excl: &mut Vec<i64>,
+    ) {
+        use crate::ast::decl::ConstraintItem as CI;
+        match item {
+            CI::Expr(e) => {
+                if let ExprKind::Binary { op, left, right } = &e.kind {
+                    if !matches!(
+                        op,
+                        BinaryOp::Lt
+                            | BinaryOp::Leq
+                            | BinaryOp::Gt
+                            | BinaryOp::Geq
+                            | BinaryOp::Neq
+                    ) {
+                        return;
+                    }
+                    let on_l = self.inline_foreach_elem_ref(left, arr, idx);
+                    let on_r = self.inline_foreach_elem_ref(right, arr, idx);
+                    if on_l == on_r {
+                        return;
+                    }
+                    // Normalize to `arr[i] OP bound` (mirror the op when the
+                    // element sits on the right: `5 < arr[i]` ≡ `arr[i] > 5`).
+                    let (bound_side, eff) = if on_l {
+                        (right, *op)
+                    } else {
+                        let m = match op {
+                            BinaryOp::Lt => BinaryOp::Gt,
+                            BinaryOp::Gt => BinaryOp::Lt,
+                            BinaryOp::Leq => BinaryOp::Geq,
+                            BinaryOp::Geq => BinaryOp::Leq,
+                            other => *other,
+                        };
+                        (left, m)
+                    };
+                    let b = self.eval_expr(bound_side).to_i64().unwrap_or(0);
+                    match eff {
+                        BinaryOp::Lt => {
+                            *hi = (*hi).min(b.saturating_sub(1));
+                            *any = true;
+                        }
+                        BinaryOp::Leq => {
+                            *hi = (*hi).min(b);
+                            *any = true;
+                        }
+                        BinaryOp::Gt => {
+                            *lo = (*lo).max(b.saturating_add(1));
+                            *any = true;
+                        }
+                        BinaryOp::Geq => {
+                            *lo = (*lo).max(b);
+                            *any = true;
+                        }
+                        BinaryOp::Neq => excl.push(b),
+                        _ => {}
+                    }
+                }
+            }
+            CI::IfElse { condition, then_item, else_item, .. } => {
+                if self.eval_expr(condition).is_true() {
+                    self.narrow_inline_foreach_bounds(then_item, arr, idx, lo, hi, any, excl);
+                } else if let Some(ei) = else_item {
+                    self.narrow_inline_foreach_bounds(ei, arr, idx, lo, hi, any, excl);
+                }
+            }
+            CI::Implication { condition, constraint, .. } => {
+                if self.eval_expr(condition).is_true() {
+                    self.narrow_inline_foreach_bounds(constraint, arr, idx, lo, hi, any, excl);
+                }
+            }
+            CI::Block(items) => {
+                for it in items {
+                    self.narrow_inline_foreach_bounds(it, arr, idx, lo, hi, any, excl);
+                }
+            }
+            CI::Soft(inner) => {
+                self.narrow_inline_foreach_bounds(inner, arr, idx, lo, hi, any, excl)
+            }
+            _ => {}
+        }
+    }
+
+    /// Phase-2 walker for `solve_inline_foreach_elem`: apply value PINS to
+    /// element `arr[idx]` — equality (`arr[i] == i + 5`, issue #28's shape)
+    /// and `inside` / `dist` picks. Returns true when a pin was applied (the
+    /// relational repair phase then leaves the element alone).
+    fn apply_inline_foreach_pins(
+        &mut self,
+        item: &crate::ast::decl::ConstraintItem,
+        arr: &str,
+        idx: i64,
+        w: u32,
+    ) -> bool {
+        use crate::ast::decl::ConstraintItem as CI;
+        let elem_name = format!("{}[{}]", arr, idx);
+        match item {
+            CI::Expr(e) => match &e.kind {
+                ExprKind::Binary { op: BinaryOp::Eq, left, right } => {
+                    let on_l = self.inline_foreach_elem_ref(left, arr, idx);
+                    let on_r = self.inline_foreach_elem_ref(right, arr, idx);
+                    if on_l == on_r {
+                        return false;
+                    }
+                    let bound_side = if on_l { right } else { left };
+                    let v = self.eval_expr(bound_side).resize(w);
+                    self.set_signal_value_by_name(&elem_name, v);
+                    true
+                }
+                ExprKind::Inside { expr: inner, ranges } => {
+                    if self.inline_foreach_elem_ref(inner, arr, idx) {
+                        if let Some(v) = self.pick_inside_value(ranges) {
+                            self.set_signal_value_by_name(&elem_name, v);
+                            return true;
+                        }
+                    }
+                    false
+                }
+                _ => false,
+            },
+            CI::Inside { expr, range, is_dist, dist_weights, .. } => {
+                if self.inline_foreach_elem_ref(expr, arr, idx) {
+                    let picked = if *is_dist && !dist_weights.is_empty() {
+                        self.pick_dist_value(range, dist_weights)
+                    } else {
+                        let rs: Vec<Expression> = range
+                            .iter()
+                            .map(|r| match r {
+                                ConstraintRange::Value(e) => e.clone(),
+                                ConstraintRange::Range { lo, hi } => Expression::new(
+                                    ExprKind::Range(
+                                        Box::new((*lo).clone()),
+                                        Box::new((*hi).clone()),
+                                    ),
+                                    lo.span,
+                                ),
+                            })
+                            .collect();
+                        self.pick_inside_value(&rs)
+                    };
+                    if let Some(v) = picked {
+                        self.set_signal_value_by_name(&elem_name, v);
+                        return true;
+                    }
+                }
+                false
+            }
+            CI::IfElse { condition, then_item, else_item, .. } => {
+                if self.eval_expr(condition).is_true() {
+                    self.apply_inline_foreach_pins(then_item, arr, idx, w)
+                } else if let Some(ei) = else_item {
+                    self.apply_inline_foreach_pins(ei, arr, idx, w)
+                } else {
+                    false
+                }
+            }
+            CI::Implication { condition, constraint, .. } => {
+                if self.eval_expr(condition).is_true() {
+                    self.apply_inline_foreach_pins(constraint, arr, idx, w)
+                } else {
+                    false
+                }
+            }
+            CI::Block(items) => {
+                let mut pinned = false;
+                for it in items {
+                    if self.apply_inline_foreach_pins(it, arr, idx, w) {
+                        pinned = true;
+                    }
+                }
+                pinned
+            }
+            CI::Soft(inner) => self.apply_inline_foreach_pins(inner, arr, idx, w),
+            _ => false,
+        }
+    }
+
+    /// Post-solve satisfaction check for a `std::randomize(...) with {…}`
+    /// constraint set (§18.5.7 / §18.3): true when every MODELED item holds
+    /// under the current variable assignment. Soft items (§18.5.14) and
+    /// structurally unmodeled shapes never force a retry. Foreach items are
+    /// checked per element with the loop var bound — the piece the generic
+    /// class-path checker skips via `constraint_unmodeled`.
+    fn inline_constraints_satisfied(
+        &mut self,
+        constraints: &[crate::ast::decl::ConstraintItem],
+    ) -> bool {
+        for c in constraints {
+            if !self.inline_constraint_item_ok(c) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn inline_constraint_item_ok(&mut self, item: &crate::ast::decl::ConstraintItem) -> bool {
+        use crate::ast::decl::ConstraintItem as CI;
+        match item {
+            CI::Soft(_) => true, // §18.5.14: soft constraints never fail the check
+            CI::Foreach { array, vars, item: body, .. } => {
+                if Self::constraint_unmodeled(body) {
+                    return true;
+                }
+                let base = match &array.kind {
+                    ExprKind::Index { expr: b, .. } => b.as_ref(),
+                    _ => array,
+                };
+                let Some(arr_name) = self.array_operand_name(base) else {
+                    return true;
+                };
+                let (lo, hi) = self
+                    .foreach_dims(&arr_name)
+                    .and_then(|d| d.first().copied())
+                    .unwrap_or_else(|| (0, self.get_queue_size(&arr_name) as i64 - 1));
+                let idx_var: Option<String> =
+                    vars.first().and_then(|v| v.as_ref().map(|id| id.name.clone()));
+                for i in lo..=hi {
+                    let mut frame: HashMap<String, Value> = HashMap::default();
+                    if let Some(iv) = &idx_var {
+                        frame.insert(iv.clone(), Value::from_u64(i as u64, 32));
+                    }
+                    self.local_stack.push(frame);
+                    let ok = self.check_constraint_item_impl(body);
+                    self.local_stack.pop();
+                    if !ok {
+                        return false;
+                    }
+                }
+                true
+            }
+            // Recurse so nested foreach items get the per-element check.
+            CI::Block(items) => {
+                for it in items {
+                    if !self.inline_constraint_item_ok(it) {
+                        return false;
+                    }
+                }
+                true
+            }
+            _ => {
+                if Self::constraint_unmodeled(item) {
+                    return true;
+                }
+                self.check_constraint_item_impl(item)
+            }
+        }
+    }
+
+    /// §18.3 constraint expressions may wrap operands in casts. Decompose a
+    /// constraint operand as an AFFINE function `scale * <name> + offset` of
+    /// the randomize target `name`, seeing through §6.24.1 size casts
+    /// (`32'(e)`, lowered by the parser to `$__xz_size_cast`), §6.24 type
+    /// casts (lowered to pass-through `Paren`) and `$signed`/`$unsigned`.
+    /// Modeling the cast context in i64 arithmetic matches §11.6.1: inside
+    /// `32'(A * B)` the operands are expanded to the cast size BEFORE the
+    /// multiply, so the solver must reason in the widened domain instead of
+    /// giving up on the compound operand (issue #29).
+    ///
+    /// Subexpressions referencing NO randomize target evaluate to constants;
+    /// returns None when the shape isn't affine in `name` (or pulls in a
+    /// different, still-unsolved target).
+    fn affine_in_target(
+        &mut self,
+        e: &Expression,
+        name: &str,
+        targets: &[(String, Expression)],
+    ) -> Option<(i64, i64)> {
+        if self.constraint_operand_name(e).as_deref() == Some(name) {
+            return Some((1, 0));
+        }
+        // A subexpression with no target references is a plain constant.
+        if let Some(c) = self.affine_const_if_no_targets(e, targets) {
+            return Some(c);
+        }
+        match &e.kind {
+            ExprKind::Paren(inner) => self.affine_in_target(inner, name, targets),
+            // §6.24.1 size cast / sign casts — transparent for solving (the
+            // cast context WIDENS the operands per §11.6.1; i64 math models
+            // exactly that).
+            ExprKind::SystemCall { name: fname, args } => match fname.as_str() {
+                "$__xz_size_cast" if args.len() == 2 => {
+                    self.affine_in_target(&args[1], name, targets)
+                }
+                "$signed" | "$unsigned" if args.len() == 1 => {
+                    self.affine_in_target(&args[0], name, targets)
+                }
+                _ => None,
+            },
+            ExprKind::Binary { op, left, right }
+                if matches!(op, BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul) =>
+            {
+                let (ls, lc) = self.affine_in_target(left, name, targets)?;
+                let (rs, rc) = self.affine_in_target(right, name, targets)?;
+                match op {
+                    BinaryOp::Add => Some((ls.checked_add(rs)?, lc.checked_add(rc)?)),
+                    BinaryOp::Sub => Some((ls.checked_sub(rs)?, lc.checked_sub(rc)?)),
+                    BinaryOp::Mul => {
+                        if ls == 0 {
+                            Some((lc.checked_mul(rs)?, lc.checked_mul(rc)?))
+                        } else if rs == 0 {
+                            Some((rc.checked_mul(ls)?, rc.checked_mul(lc)?))
+                        } else {
+                            None // quadratic in the target — not affine
+                        }
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Constant leg of `affine_in_target`: if `e` references none of the
+    /// randomize targets, evaluate it and return `(0, value)`.
+    fn affine_const_if_no_targets(
+        &mut self,
+        e: &Expression,
+        targets: &[(String, Expression)],
+    ) -> Option<(i64, i64)> {
+        let mut ids = HashSet::default();
+        self.collect_expr_idents(e, &mut ids);
+        if targets.iter().any(|(n, _)| ids.contains(n)) {
+            return None;
+        }
+        Some((0, self.eval_expr(e).to_i64()?))
     }
 
     /// Match `expr` (a constraint operand) to one of the randomize targets,
@@ -41869,9 +42308,29 @@ impl Simulator {
                 // emit an illegal `la x0, _start`.
                 fn has_positive_inside(item: &ConstraintItem) -> bool {
                     match item {
-                        ConstraintItem::Expr(e) => {
-                            matches!(&e.kind, ExprKind::Inside { .. })
-                        }
+                        ConstraintItem::Expr(e) => match &e.kind {
+                            ExprKind::Inside { .. } => true,
+                            // §18.5.7: equality / relational element bodies
+                            // (`arr[i] == i + 5`, `arr[i] < K`) are also
+                            // solved per-index by solve_forced_array_elem,
+                            // so the pool pass must not re-seed them either.
+                            // Exactly ONE side must be an element ref —
+                            // cross-element relations (`arr[i] < arr[i+1]`)
+                            // are not solved there and keep pool seeding.
+                            ExprKind::Binary { op, left, right } => {
+                                let li = matches!(&left.kind, ExprKind::Index { .. });
+                                let ri = matches!(&right.kind, ExprKind::Index { .. });
+                                matches!(
+                                    op,
+                                    BinaryOp::Eq
+                                        | BinaryOp::Lt
+                                        | BinaryOp::Leq
+                                        | BinaryOp::Gt
+                                        | BinaryOp::Geq
+                                ) && (li != ri)
+                            }
+                            _ => false,
+                        },
                         ConstraintItem::Inside { .. } => true,
                         ConstraintItem::Block(items) => {
                             items.iter().any(has_positive_inside)
@@ -42780,6 +43239,87 @@ impl Simulator {
                     }
                     false
                 }
+                // §18.5.7 equality / relational element constraints in a class
+                // foreach body — `foreach (arr[i]) arr[i] == i + 5` (issue
+                // #28's shape) or `arr[i] < K`. The loop var is bound in the
+                // caller's local frame, so index and bound expressions
+                // evaluate with the concrete `i`.
+                ExprKind::Binary { op, left, right } => {
+                    // Element ref: `arr[<index-expr that evals to idx>]`.
+                    fn elem_index(
+                        s: &mut Simulator,
+                        e: &Expression,
+                        arr_name: &str,
+                    ) -> Option<i64> {
+                        if let ExprKind::Index { expr: b, index } = &e.kind {
+                            if matches!(&b.kind, ExprKind::Ident(h)
+                                if h.path.len() == 1 && h.path[0].name.name == arr_name)
+                            {
+                                return s.eval_expr(index).to_i64();
+                            }
+                        }
+                        None
+                    }
+                    let on_l = elem_index(self, left, arr_name) == Some(idx);
+                    let on_r = elem_index(self, right, arr_name) == Some(idx);
+                    if on_l == on_r {
+                        return false; // cross-element or unrelated — skip
+                    }
+                    // Normalize to `arr[i] OP bound`.
+                    let (bound_side, eff) = if on_l {
+                        (right, *op)
+                    } else {
+                        let m = match op {
+                            BinaryOp::Lt => BinaryOp::Gt,
+                            BinaryOp::Gt => BinaryOp::Lt,
+                            BinaryOp::Leq => BinaryOp::Geq,
+                            BinaryOp::Geq => BinaryOp::Leq,
+                            other => *other,
+                        };
+                        (left, m)
+                    };
+                    let elem_name = format!("{}[{}]", arr_name, idx);
+                    let scoped_key = format!("{}#{}[{}]", handle, arr_name, idx);
+                    let cur = self
+                        .get_signal_value_by_name(&elem_name)
+                        .or_else(|| self.signals.get(&scoped_key).cloned());
+                    let w = cur.as_ref().map(|v| v.width).unwrap_or(32).max(1);
+                    let write_elem = |s: &mut Self, v: Value| {
+                        s.signals.insert(scoped_key.clone(), v.clone());
+                        s.set_signal_value_by_name(&elem_name, v);
+                    };
+                    match eff {
+                        BinaryOp::Eq => {
+                            let v = self.eval_expr(bound_side).resize(w);
+                            let changed =
+                                cur.as_ref().map(|c| c.to_u64() != v.to_u64()).unwrap_or(true);
+                            write_elem(self, v);
+                            changed
+                        }
+                        BinaryOp::Lt | BinaryOp::Leq | BinaryOp::Gt | BinaryOp::Geq => {
+                            use rand::Rng;
+                            let b = self.eval_expr(bound_side).to_i64().unwrap_or(0);
+                            let cur_i = cur.and_then(|v| v.to_i64()).unwrap_or(0);
+                            // Unsigned element domain [0, 2^w - 1].
+                            let (mut lo, mut hi) =
+                                (0i64, if w >= 63 { i64::MAX } else { (1i64 << w) - 1 });
+                            match eff {
+                                BinaryOp::Lt => hi = hi.min(b.saturating_sub(1)),
+                                BinaryOp::Leq => hi = hi.min(b),
+                                BinaryOp::Gt => lo = lo.max(b.saturating_add(1)),
+                                BinaryOp::Geq => lo = lo.max(b),
+                                _ => {}
+                            }
+                            if lo > hi || (cur_i >= lo && cur_i <= hi) {
+                                return false; // unsatisfiable or already OK
+                            }
+                            let p = if lo == hi { lo } else { self.rng.gen_range(lo..=hi) };
+                            write_elem(self, Value::from_u64(p as u64, w));
+                            true
+                        }
+                        _ => false,
+                    }
+                }
                 _ => false,
             },
             ConstraintItem::Block(items) => {
@@ -42936,6 +43476,14 @@ impl Simulator {
                 }
             }
             ExprKind::Call { args, .. } => {
+                for a in args {
+                    self.collect_expr_idents(a, idents);
+                }
+            }
+            // §6.24.1: size casts are lowered to `$__xz_size_cast(N, inner)`
+            // SystemCalls — without this arm a cast-wrapped operand looked
+            // identifier-free to the constraint solver (issue #29).
+            ExprKind::SystemCall { args, .. } => {
                 for a in args {
                     self.collect_expr_idents(a, idents);
                 }

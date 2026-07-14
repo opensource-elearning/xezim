@@ -97,3 +97,17 @@ fn issue_18_type_parameters() {
     let msgs = outputs(include_str!("issue_cases/type-parameter-compliance.sv"), 100_000);
     assert!(msgs.iter().any(|m| m.contains("TEST PASSED")), "{:?}", msgs);
 }
+
+#[test]
+fn issue_28_constraint_foreach() {
+    // §18.5.7 foreach constraint bodies beyond `inside`.
+    let msgs = outputs(include_str!("issue_cases/constraint.foreach.sv"), 100_000);
+    assert!(msgs.iter().any(|m| m.contains("TEST_PASS")), "{:?}", msgs);
+}
+
+#[test]
+fn issue_29_constraint_typecast() {
+    // §18.3/§6.24.1/§11.6.1 casts inside constraint expressions.
+    let msgs = outputs(include_str!("issue_cases/constraint.typecast.sv"), 100_000);
+    assert!(msgs.iter().any(|m| m.contains("TEST_PASS")), "{:?}", msgs);
+}

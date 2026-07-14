@@ -45852,6 +45852,12 @@ impl Simulator {
             // constraint (`sub_inst.sub_data == q[0] + 5`) gets the final word
             // on the sub-object's variable.
             for hp in &rand_handles {
+                // A handle already randomized (and constraint-checked) by the
+                // §18.4 rand-object pass must NOT be redrawn here — that would
+                // discard the cross-object solution just computed for it.
+                if rand_obj_props.contains(hp) {
+                    continue;
+                }
                 let sub = self
                     .heap
                     .get(handle)

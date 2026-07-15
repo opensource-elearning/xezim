@@ -22320,6 +22320,35 @@ impl Simulator {
                                         self.set_signal_value_by_name(&elem_name, cur);
                                         return changed;
                                     }
+                                    // §7.4.2: PACKED array of packed struct —
+                                    // `foo[i]` is NOT a separate signal but a bit
+                                    // slice of the single backing vector. Splice
+                                    // the field at `i*elem_w + off`.
+                                    if indices.len() == 1 {
+                                        if let Some(&elem_w) =
+                                            self.module.packed_signal_elem_widths.get(&arr_name)
+                                        {
+                                            if let Some(cur_sig) =
+                                                self.get_signal_value_by_name(&arr_name)
+                                            {
+                                                let total_w = cur_sig.width;
+                                                let mut cur = cur_sig.resize(total_w);
+                                                let abs_off = indices[0] as u32 * elem_w + off;
+                                                let piece = val.resize(w);
+                                                for i in 0..w {
+                                                    cur.set_bit(
+                                                        (abs_off + i) as usize,
+                                                        piece.get_bit(i as usize),
+                                                    );
+                                                }
+                                                let changed =
+                                                    self.get_signal_value_by_name(&arr_name).as_ref()
+                                                        != Some(&cur);
+                                                self.set_signal_value_by_name(&arr_name, cur);
+                                                return changed;
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -33076,7 +33105,22 @@ impl Simulator {
         match &expr.kind {
             ExprKind::Ident(h) => {
                 let n = self.resolve_hier_name(h);
-                self.lookup_signal_width(&n).unwrap_or(1)
+                if let Some(w) = self.lookup_signal_width(&n) {
+                    return w;
+                }
+                // A packed struct/union member (`word3.high`) has no leaf
+                // signal; its width comes from the parent's field layout. Needed
+                // so a concatenation LHS (`{word3.high, word3.low} = ...`) splits
+                // the rvalue at the right bit boundaries.
+                if let Some(dot) = n.rfind('.') {
+                    let (parent, field) = (&n[..dot], &n[dot + 1..]);
+                    if let Some(fields) = self.module.packed_struct_fields.get(parent) {
+                        if let Some((_, _, w)) = fields.iter().find(|(m, _, _)| m == field) {
+                            return *w;
+                        }
+                    }
+                }
+                1
             }
             ExprKind::Number(NumberLiteral::Integer { size, .. }) => size.unwrap_or(32),
             ExprKind::Concatenation(p) => {

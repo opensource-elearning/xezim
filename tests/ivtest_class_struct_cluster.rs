@@ -116,6 +116,84 @@ endmodule
 }
 
 // ---------------------------------------------------------------------------
+// §7.2: concatenation LHS distributing bits into packed-struct-member net
+// slices (`{word3.high, word3.low} = {word1.low, word1.high}`). Requires the
+// concat parts' widths to come from the packed-struct field layout.
+// (ivltests/struct3b.v)
+#[test]
+fn struct3b_concat_lhs_into_struct_member_nets() {
+    assert!(passes(r#"
+module main;
+   struct packed { logic [7:0] high; logic [7:0] low; } word1;
+   wire struct packed { logic [7:0] high; logic [7:0] low; } word2, word3;
+   assign word2.high = word1.high;
+   assign word2.low  = word1.low;
+   assign {word3.high, word3.low} = {word1.low, word1.high};
+   initial begin
+      word1 = 16'haa_55;
+      if (word1.high !== 8'haa || word1.low !== 8'h55) begin $display("FAILED: word1"); $finish; end
+      #1;
+      if (word2.high !== 8'haa || word2.low !== 8'h55) begin $display("FAILED: word2"); $finish; end
+      if (word3.low !== 8'haa || word3.high !== 8'h55) begin $display("FAILED: word3"); $finish; end
+      $display("PASSED");
+   end
+endmodule
+"#));
+}
+
+// §7.4.2: packed ARRAY of packed struct (variable) — element and member
+// read/write with absolute bit offsets. (ivltests/struct_packed_array.v)
+#[test]
+fn struct_packed_array_var() {
+    assert!(passes(r#"
+module main;
+   typedef struct packed { logic [3:0] high; logic [3:0] low; } word;
+   typedef word [1:0] dword;
+   dword foo;
+   int   idx;
+   initial begin
+      foo[0].low = 1; foo[0].high = 2; foo[1].low = 3; foo[1].high = 4;
+      if (foo !== 16'h4321) begin $display("FAILED -- foo=%h", foo); $finish; end
+      if (foo[0] !== 8'h21) begin $display("FAILED -- foo[0]=%h", foo[0]); $finish; end
+      if (foo[1] !== 8'h43) begin $display("FAILED -- foo[1]=%h", foo[1]); $finish; end
+      if (foo[0].low !== 4'h1 || foo[0].high !== 4'h2) begin $display("FAILED lo"); $finish; end
+      if (foo[1].low !== 4'h3 || foo[1].high !== 4'h4) begin $display("FAILED hi"); $finish; end
+      idx = 0;
+      if (foo[idx].low !== 4'h1) begin $display("FAILED idx0"); $finish; end
+      idx = 1;
+      if (foo[idx].high !== 8'h4) begin $display("FAILED idx1"); $finish; end
+      $display("PASSED");
+   end
+endmodule
+"#));
+}
+
+// §7.4.2: packed ARRAY of packed struct declared as a NET, driven by member-
+// target continuous assigns (`wire dword foo; assign foo[0].low = 1;`).
+// (ivltests/struct_packed_array2.v)
+#[test]
+fn struct_packed_array2_net() {
+    assert!(passes(r#"
+module main;
+   typedef struct packed { logic [3:0] high; logic [3:0] low; } word;
+   typedef word [1:0] dword;
+   wire dword foo;
+   int  idx;
+   assign foo[0].low = 1; assign foo[0].high = 2;
+   assign foo[1].low = 3; assign foo[1].high = 4;
+   initial begin
+      #1;
+      if (foo !== 16'h4321) begin $display("FAILED -- foo=%h", foo); $finish; end
+      if (foo[0] !== 8'h21 || foo[1] !== 8'h43) begin $display("FAILED elem"); $finish; end
+      if (foo[0].low !== 4'h1 || foo[1].high !== 4'h4) begin $display("FAILED field"); $finish; end
+      idx = 1;
+      if (foo[idx].high !== 8'h4) begin $display("FAILED idx"); $finish; end
+      $display("PASSED");
+   end
+endmodule
+"#));
+}
+
 // §8: class property assignment truncates/sign-extends to the declared type.
 // (ivltests/sv_class2.v — byte signed/unsigned)
 // ---------------------------------------------------------------------------

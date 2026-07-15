@@ -1,27 +1,26 @@
-//! Mailbox producer/consumer + fork-local propagation regression.
+//! Mailbox producer/consumer + fork-automatic propagation regression.
 //!
-//! Two LRM-compliance bugs in the genuine-UVM-library scheduling path
-//! (PURE_SV_LRM=1, the default) deadlocked the phase scheduler at t=0:
+//! Two IEEE 1800.1-2023 scheduling bugs that deadlocked a fork-driven
+//! mailbox phase-hop loop (the mechanism the UVM phase scheduler uses, but
+//! reproduced here in plain SystemVerilog):
 //!
-//! 1. **`mailbox::put` in expression context did not unblock a parked `get`.**
-//!    IEEE 1800-2023 §15.4.3/§15.4.5: a `put` stores in FIFO order and unblocks
-//!    any process waiting in a `get`/`peek`. xezim had two `put`
-//!    implementations — `exec_method_call` (which delivered to a parked waiter)
-//!    and `eval_call_inner` (statement/expression context, which only pushed to
-//!    the queue). A forked producer's `put` (e.g. UVM `m_run_phases` scheduling
-//!    the successor phase) took the `eval_call_inner` path, so the consumer's
-//!    parked `get` never resumed and the schedule deadlocked.
+//! 1. **`mailbox.put` in expression context did not unblock a parked `get`.**
+//!    §15.4.3/§15.4.5: a `put` stores in FIFO order and unblocks any process
+//!    waiting in a `get`/`peek`. xezim had two `put` implementations —
+//!    `exec_method_call` (which delivered to a parked waiter) and
+//!    `eval_call_inner` (statement/expression context, which only pushed to
+//!    the queue). A forked producer's `put` took the `eval_call_inner` path,
+//!    so the consumer's parked `get` never resumed and the loop deadlocked.
 //!
 //! 2. **Fork-child-local propagation clobbered a value the parent modified
-//!    after the fork.** IEEE 1800-2023 §9.3.2: a fork child's *writes* to the
-//!    parent's automatic variables are visible to the parent. xezim models this
-//!    by giving each child a *copy* of the parent's locals and merging the
+//!    after the fork.** §9.3.2: a fork child's *writes* to the parent's
+//!    automatic variables are visible to the parent. xezim models this by
+//!    giving each child a *copy* of the parent's locals and merging the
 //!    child's frames back when it finishes — but it merged *every* local,
-//!    including ones the child only inherited (never wrote). When a mailbox
-//!    `get` delivery wrote `phase` into the parent while a `fork ... join_none`
-//!    child was still running (exactly UVM's `m_run_phases`), the child's stale
-//!    inherited `phase` overwrote the freshly delivered value on finish, so the
-//!    loop re-read the previous phase forever.
+//!    including ones the child only inherited (never wrote). A mailbox `get`
+//!    delivery into the parent while a `fork ... join_none` child was still
+//!    running was overwritten by the child's stale inherited copy on finish,
+//!    so the loop re-read the previous handle forever.
 //!
 //! Both are exercised by a fork-driven mailbox phase-hop loop (no UVM library
 //! dependency). The test asserts the loop ADVANCES through successive handles
@@ -38,9 +37,8 @@ endclass
 module top;
   mailbox mb = new();
 
-  // Mimics UVM uvm_phase::m_run_phases: a forever loop that gets the next
-  // "phase" handle from a mailbox, forks a worker that uses it and schedules
-  // the successor, then yields with #0.
+  // A forever loop that gets the next handle from a mailbox, forks a worker
+  // that uses it and schedules the successor, then yields with #0.
   task automatic run_loop;
     forever begin
       C phase;

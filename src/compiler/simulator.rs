@@ -20645,6 +20645,50 @@ impl Simulator {
                 return self.write_class_agg(&r, val);
             }
         }
+        // §8.9: assignment to a STATIC class property (`obj.static_prop = ...`,
+        // `this.static_prop = ...`) writes the single shared cell, not per-
+        // instance storage. static_prop_key is None for a non-static member, so
+        // ordinary property writes fall through to the arms below.
+        {
+            let obj_prop: Option<(String, String)> = match &lhs.kind {
+                ExprKind::Ident(h)
+                    if h.path.len() == 2 && h.path.iter().all(|s| s.selects.is_empty()) =>
+                {
+                    Some((h.path[0].name.name.clone(), h.path[1].name.name.clone()))
+                }
+                ExprKind::MemberAccess { expr, member } => match &expr.kind {
+                    ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                        Some((h.path[0].name.name.clone(), member.name.clone()))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some((obj, prop)) = obj_prop {
+                let cn = if obj == "this" {
+                    self.this_stack
+                        .last()
+                        .copied()
+                        .flatten()
+                        .and_then(|h| self.heap.get(h))
+                        .and_then(|o| o.as_ref())
+                        .map(|i| i.class_name.clone())
+                } else {
+                    self.class_of_var(&obj)
+                };
+                if let Some(cn) = cn {
+                    if self.static_prop_key(&cn, &prop).is_some() {
+                        let mut v = val.clone();
+                        if let Some(w) = self.class_prop_width(&cn, &prop) {
+                            if w != v.width && !v.is_real {
+                                v = v.resize_for_assign(w);
+                            }
+                        }
+                        return self.class_static_set(&cn, &prop, v);
+                    }
+                }
+            }
+        }
         match &lhs.kind {
             ExprKind::Ident(hier) => {
                 // LRM §25.9: virtual-interface alias (task/function
@@ -25608,6 +25652,25 @@ impl Simulator {
                 }
                 let base = self.eval_expr(expr);
                 let handle = base.to_u64().unwrap_or(0) as usize;
+                // §8.9: a STATIC property is shared and instance-independent —
+                // it lives in `class_statics`, not per-instance storage, and is
+                // readable even through a null handle (`obj.static_prop` before
+                // `obj = new`). Route to the shared cell. class_static_get
+                // returns None for a non-static member, so ordinary reads fall
+                // through unchanged.
+                let static_class: Option<String> = if handle != 0 && handle < self.heap.len() {
+                    self.heap[handle].as_ref().map(|i| i.class_name.clone())
+                } else if let ExprKind::Ident(h) = &expr.kind {
+                    let n = self.resolve_hier_name(h);
+                    self.class_of_var(&n)
+                } else {
+                    None
+                };
+                if let Some(cn) = static_class {
+                    if let Some(v) = self.class_static_get(&cn, &member.name) {
+                        return v;
+                    }
+                }
                 if handle == 0 || handle >= self.heap.len() {
                     Value::zero(32)
                 } else {
@@ -45849,6 +45912,33 @@ impl Simulator {
             }
         }
         self.this_stack.pop();
+        // §8.7: implicit `super.new(...)` chaining. If the constructor that
+        // will run does not call super.new explicitly, run its base-class
+        // constructor(s) first (base-most first), passing the `extends
+        // Base(args)` value arguments. Only fires when NO explicit super.new
+        // exists, so designs that chain explicitly are unaffected. A class
+        // WITHOUT its own `new` inherits the base new via the dispatch walk-up
+        // (handled by exec_method_call), so it must not also be chained here.
+        {
+            let mut chain: Vec<(String, Vec<Expression>)> = Vec::new();
+            let mut cur = class_def.name.clone();
+            let mut guard = 0;
+            loop {
+                guard += 1;
+                if guard > 64 { break; }
+                let Some(cdef) = self.module.classes.get(&cur).cloned() else { break };
+                if !cdef.methods.contains_key("new") { break; }
+                let Some(base) = cdef.extends.clone() else { break };
+                if self.constructor_calls_super_new(&cur) { break; }
+                chain.push((base.clone(), cdef.extends_args.clone()));
+                cur = base;
+            }
+            for (cls, cargs) in chain.iter().rev() {
+                self.this_stack.push(Some(handle));
+                self.exec_method_in_class_hierarchy(handle, cls, "new", cargs);
+                self.this_stack.pop();
+            }
+        }
         self.exec_method_call(handle, "new", args);
         Value::from_u64(handle as u64, 32)
     }
@@ -51464,6 +51554,60 @@ impl Simulator {
     /// an inherited method's `super` chain correctly starts from its own
     /// defining class's parent (e.g. Grand::sup2's `super.get()` binds to
     /// Derived::get even on a Grand object).
+    /// Does class `class_name`'s own `new` body call `super.new(...)`
+    /// explicitly? (§8.7 — the first statement, but scan a few nesting levels
+    /// to be safe.) Used to decide whether an IMPLICIT super.new must be
+    /// injected; explicit chains are left untouched.
+    fn constructor_calls_super_new(&self, class_name: &str) -> bool {
+        use crate::ast::decl::ClassMethodKind;
+        let Some(cd) = self.module.classes.get(class_name) else { return false };
+        let Some(m) = cd.methods.get("new") else { return false };
+        let items = match &m.kind {
+            ClassMethodKind::Function(f) => &f.items,
+            ClassMethodKind::Task(t) => &t.items,
+            _ => return false,
+        };
+        Self::stmts_call_super_new(items)
+    }
+
+    fn stmts_call_super_new(stmts: &[Statement]) -> bool {
+        stmts.iter().any(Self::stmt_calls_super_new)
+    }
+
+    fn stmt_calls_super_new(s: &Statement) -> bool {
+        use crate::ast::stmt::StatementKind as SK;
+        let expr_is_super_new = |e: &Expression| -> bool {
+            let ExprKind::Call { func, .. } = &e.kind else { return false };
+            match &func.kind {
+                // Flattened form: `super.new` as a single dotted Ident.
+                ExprKind::Ident(h) => {
+                    h.path.first().is_some_and(|s| s.name.name == "super")
+                        && h.path.last().is_some_and(|s| s.name.name == "new")
+                }
+                // Common form: `super.new(...)` parses as a MemberAccess whose
+                // base is the `super` keyword and member is `new`.
+                ExprKind::MemberAccess { expr, member } => {
+                    member.name == "new"
+                        && matches!(&expr.kind, ExprKind::Ident(h)
+                            if h.path.last().is_some_and(|s| s.name.name == "super"))
+                }
+                _ => false,
+            }
+        };
+        match &s.kind {
+            SK::Expr(e) => expr_is_super_new(e),
+            SK::SeqBlock { stmts, .. } | SK::ParBlock { stmts, .. } => {
+                Self::stmts_call_super_new(stmts)
+            }
+            SK::TimingControl { stmt, .. } => Self::stmt_calls_super_new(stmt),
+            SK::If { then_stmt, else_stmt, .. } => {
+                Self::stmt_calls_super_new(then_stmt)
+                    || else_stmt.as_ref().is_some_and(|e| Self::stmt_calls_super_new(e))
+            }
+            _ => false,
+        }
+    }
+
     fn super_call_parent(&self) -> Option<String> {
         let ctx = self
             .class_context_stack

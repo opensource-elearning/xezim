@@ -242,3 +242,86 @@ program main;
 endprogram
 "#));
 }
+
+// §8.9/§8.7: static property (shared cell, readable via null handle) + a
+// property initializer overridden by the constructor. (ivltests/sv_class19.v)
+#[test]
+fn sv_class19_static_property_and_shallow_copy() {
+    assert!(passes(r#"
+program main;
+   class foo_t ;
+      static int int_incr = 1;
+      int       int_value = 42;
+      function new();
+         int_value = int_value + int_incr;
+      endfunction
+   endclass : foo_t
+   foo_t obj1;
+   foo_t obj2;
+   initial begin
+      if (obj1.int_incr !== 1) begin $display("FAILED == obj1.int_incr=%0d.", obj1.int_incr); $finish; end
+      obj1 = new;
+      if (obj1.int_value !== 43) begin $display("FAILED -- obj1.int_value=%0d.", obj1.int_value); $finish; end
+      obj2 = new obj1;
+      if (obj2.int_value !== 43) begin $display("FAILED -- obj2.int_value=%0d.", obj2.int_value); $finish; end
+      obj1.int_incr = 2;
+      if (obj1.int_incr !== 2) begin $display("FAILED == obj1.int_incr=%0d", obj1.int_incr); $finish; end
+      if (obj2.int_incr !== 2) begin $display("FAILED == obj2.int_incr=%0d", obj2.int_incr); $finish; end
+      $display("PASSED");
+      $finish;
+   end
+endprogram
+"#));
+}
+
+// §8.7: implicit super.new — a derived constructor with no explicit super.new
+// still runs the base constructor. (ivltests/sv_class20.v)
+#[test]
+fn sv_class20_implicit_super_new() {
+    assert!(passes(r#"
+program main;
+   class base_t ;
+      int int_value;
+      function new(); int_value = 42; endfunction
+   endclass : base_t
+   class foo_t extends base_t ;
+      string str_value;
+      function new(); str_value = "42"; endfunction
+   endclass : foo_t
+   foo_t obj1;
+   initial begin
+      obj1 = new;
+      if (obj1.int_value !== 42) begin $display("FAILED -- obj1.int_value = %0d", obj1.int_value); $finish; end
+      if (obj1.str_value != "42") begin $display("FAILED -- obj1.str_value = %0s", obj1.str_value); $finish; end
+      $display("PASSED");
+      $finish;
+   end
+endprogram
+"#));
+}
+
+// §8.7: implicit super.new passes the `extends Base(args)` value arguments.
+// (ivltests/sv_class22.v)
+#[test]
+fn sv_class22_implicit_super_new_with_extends_args() {
+    assert!(passes(r#"
+program main;
+   class base_t ;
+      int int_value;
+      function new(int val); int_value = val; endfunction
+   endclass : base_t
+   class foo_t extends base_t(42) ;
+      string str_value;
+      function new(); str_value = "42"; endfunction
+   endclass : foo_t
+   foo_t obj1;
+   initial begin
+      obj1 = new;
+      if (obj1.int_value !== 42) begin $display("FAILED -- obj1.int_value = %0d", obj1.int_value); $finish; end
+      if (obj1.str_value != "42") begin $display("FAILED -- obj1.str_value = %0s", obj1.str_value); $finish; end
+      $display("PASSED");
+      $finish;
+   end
+endprogram
+"#));
+}

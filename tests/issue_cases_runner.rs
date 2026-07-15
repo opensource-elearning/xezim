@@ -52,14 +52,11 @@ fn issue_24_swrite_sformat() {
 
 #[test]
 fn issue_25_format_specifiers() {
-    // 40 of 42 checks pass; the two %g exponent-style diffs (1.23e-5 vs
-    // 1.23e-05) were explicitly accepted by the reporter. Ratchet on the
-    // exact counts.
     let msgs = outputs(include_str!("issue_cases/fmt.specifiers.sv"), 100_000);
     let pass = msgs.iter().filter(|m| m.starts_with("[PASS]")).count();
     let fail = msgs.iter().filter(|m| m.starts_with("[ERROR]")).count();
-    assert_eq!(pass, 40, "passing-check count changed: {:?}", msgs);
-    assert_eq!(fail, 2, "only the two accepted %g style diffs may fail");
+    assert_eq!(pass, 42, "passing-check count changed: {:?}", msgs);
+    assert_eq!(fail, 0, "all format specifier checks should pass");
 }
 
 #[test]

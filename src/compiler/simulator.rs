@@ -26,7 +26,7 @@ use libffi::middle::{Arg, Cif, CodePtr, Type};
 use libloading::Library;
 use rand::SeedableRng;
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::ffi::{CStr, CString};
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -57,6 +57,12 @@ pub struct SvRng {
 }
 
 impl SvRng {
+    /// The seed a run uses when it does not ask for another one. Fixed, not
+    /// drawn from entropy, so that two runs of the same design are identical
+    /// and a failing random test can be re-run and debugged. `+seed=<n>`
+    /// picks a different stream; `+seed=random` opts into entropy.
+    const DEFAULT_SEED: u64 = 1;
+
     /// §18.14: seeding is deterministic — equal seeds yield equal sequences.
     fn from_seed(seed: u64) -> Self {
         SvRng {
@@ -64,8 +70,9 @@ impl SvRng {
         }
     }
 
-    /// Non-reproducible stream for an unseeded run (the default `$urandom`
-    /// source, which must vary from run to run).
+    /// Non-reproducible stream, used only when the run explicitly asks for one
+    /// with `+seed=random`. It is NOT the default: a run whose seed varies with
+    /// each launch cannot be replayed, so a random failure cannot be debugged.
     fn from_entropy() -> Self {
         use rand::Rng;
         SvRng::from_seed(rand::rngs::StdRng::from_entropy().gen::<u64>())
@@ -152,6 +159,37 @@ pub fn set_sim_debug(enabled: bool) {
 #[inline]
 fn sim_debug_enabled() -> bool {
     SIM_DEBUG_ENABLED.load(Ordering::Relaxed)
+}
+
+/// XTrace header knobs that only the CLI sets: `--xtrace-profile` (the §6.5
+/// `@profile` token) and `--xtrace-compress` (the §6.8 `@compression` token).
+///
+/// Process-global, like `set_dpi_libs`, because `simulate_multi` constructs and
+/// runs the `Simulator` internally — there is no other channel from `main` into
+/// the dump, and threading two more arguments through a 24-argument public
+/// signature would churn every caller in the tree.
+#[derive(Clone, Default)]
+pub struct XtraceOptions {
+    pub profile: Option<String>,
+    pub compress: Option<String>,
+}
+
+fn xtrace_options_cell() -> &'static Mutex<XtraceOptions> {
+    static XTRACE_OPTIONS: OnceLock<Mutex<XtraceOptions>> = OnceLock::new();
+    XTRACE_OPTIONS.get_or_init(|| Mutex::new(XtraceOptions::default()))
+}
+
+pub fn set_xtrace_options(profile: Option<String>, compress: Option<String>) {
+    if let Ok(mut guard) = xtrace_options_cell().lock() {
+        *guard = XtraceOptions { profile, compress };
+    }
+}
+
+fn xtrace_options() -> XtraceOptions {
+    xtrace_options_cell()
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_default()
 }
 
 fn dpi_lib_paths() -> &'static Mutex<Vec<String>> {
@@ -1635,6 +1673,35 @@ enum RandMemberTarget {
     Sub(usize, String),
 }
 
+/// IEEE 1800-2017 §21.7.2.1 `var_type` of a dumped object. Every `$var` used to
+/// be hardcoded `wire`, which mislabels every variable in the design and hides
+/// `event` semantics from the viewer entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VcdVarKind {
+    Wire,
+    Reg,
+    Integer,
+    Time,
+    Real,
+    Event,
+    Parameter,
+}
+
+impl VcdVarKind {
+    /// The §21.7.2.1 `var_type` keyword.
+    fn keyword(self) -> &'static str {
+        match self {
+            VcdVarKind::Wire => "wire",
+            VcdVarKind::Reg => "reg",
+            VcdVarKind::Integer => "integer",
+            VcdVarKind::Time => "time",
+            VcdVarKind::Real => "real",
+            VcdVarKind::Event => "event",
+            VcdVarKind::Parameter => "parameter",
+        }
+    }
+}
+
 pub struct Simulator {
     pub signals: HashMap<String, Value>,
     /// Signals currently under force/release control (LRM §9.3.1).
@@ -1715,6 +1782,15 @@ pub struct Simulator {
     /// Set of signal IDs that are signed.
     signal_signed: Vec<bool>,
     signal_real: Vec<bool>,
+    /// Signal ids that carry a CONTINUOUS driver — the whole-name LHS of an
+    /// `assign` (including the continuous-assigns that inlining synthesizes for
+    /// instance port connections). §6.5 forbids mixing continuous and procedural
+    /// drivers on a variable, so this is exactly "has no procedural driver", and
+    /// §21.7.2.1's `var_type` for such an object is `wire` — what Icarus emits
+    /// and what makes a viewer colour it as a net. `module.continuous_assigns` is
+    /// drained into bytecode at compile time, so the fact is recorded here while
+    /// it is still known.
+    cont_driven: HashSet<usize>,
     /// Sparse: signal_id → declared user type name (e.g. class/struct
     /// type for `MyClass h;`). Only populated for signals where the
     /// elaborator recorded a non-None `type_name` on the source
@@ -1761,6 +1837,8 @@ pub struct Simulator {
     pub finished: bool,
     compiled: bool,
     pub monitor: Option<(String, Vec<Expression>)>,
+    /// `$monitoroff` pauses (not destroys) the monitor; `$monitoron` resumes.
+    pub monitor_paused: bool,
     /// `$strobe` queue: formatted+printed at the end of the current
     /// event-loop iteration, after `apply_nba` has committed scheduled
     /// non-blocking writes. Each entry is `(task_name, args)` and is
@@ -2359,13 +2437,32 @@ pub struct Simulator {
     vcd_trace: Vec<(usize, Arc<str>)>,
     vcd_enabled: bool,
     vcd_last_time: u64,
+    /// Optional size limit for the VCD dump ($dumplimit, §21.7.1.5).
     /// Previous emitted value per entry in `vcd_trace` (parallel vector).
     /// A plain Vec<Value> — no duplicated name strings, no hashing.
     vcd_prev_signals: Vec<Value>,
     /// Optional scope/signal-name filters captured from `$dumpvars(level, sig...)`.
-    /// When non-empty, only signals whose hierarchical name starts with one of
-    /// these strings (or matches exactly) are emitted to the VCD.
+    /// When non-empty, only signals whose hierarchical name matches one of these
+    /// scopes (or is a signal name given exactly) are emitted to the VCD. The
+    /// strings are ABSOLUTE (they include the top module); `dump_filter_prefixes`
+    /// rewrites them to the top-RELATIVE form the signal table uses.
     vcd_filter_scopes: Vec<String>,
+    /// §21.7.1.4 `$dumpvars` depth argument: 0 = every level below the given
+    /// scope, N = N levels starting at it.
+    vcd_dump_depth: u32,
+    /// §21.7.2.1 var type per `vcd_trace` entry (parallel vector). Drives both
+    /// the `$var` declaration and the runtime record shape (an `event` emits a
+    /// bare `1<id>` pulse, a `real` an `r<decimal>` record).
+    vcd_var_kinds: Vec<VcdVarKind>,
+    /// Last sim time at which each `vcd_trace` entry that is an `event` emitted
+    /// its trigger pulse — dedups repeat triggers inside one time slot.
+    vcd_event_last: Vec<u64>,
+    /// §21.7.1.8 `$dumplimit`: byte budget for the dump, and the running
+    /// (approximate) count of bytes handed to the sink. `vcd_limit_hit` latches
+    /// once the budget is spent and permanently stops the dump.
+    vcd_limit: Option<u64>,
+    vcd_bytes: u64,
+    vcd_limit_hit: bool,
     /// Worker-thread count. >=2 routes VCD dumps through a
     /// background writer thread (see vcd_sink::VcdSink).
     threads: usize,
@@ -2409,10 +2506,31 @@ pub struct Simulator {
     /// signals matching one of these (exact, or `<scope>.` prefix) are dumped.
     pub xtrace_scopes: Vec<String>,
     xtrace_writer: Option<super::vcd_sink::VcdSink>,
-    /// Per-traced-signal table: (signal_table index, XTrace `sN` id).
+    /// Per-traced-NET table: (signal_table index, XTrace signal id). One entry
+    /// per backing net — an aliased name (§9.2 `alias=`) has its own id in the
+    /// dictionary but emits no deltas of its own.
     xtrace_trace: Vec<(usize, String)>,
     /// Previous emitted value per entry in `xtrace_trace` (parallel vector).
     xtrace_prev_signals: Vec<Value>,
+    /// Whether entry `i` of `xtrace_trace` is a `real` (parallel vector): its
+    /// value token is a decimal number, not a hex bit pattern (§15.1).
+    xtrace_real: Vec<bool>,
+    /// Whether entry `i` of `xtrace_trace` is a `string` (parallel vector): its
+    /// value token is a §15.4 quoted, escaped string rather than a bit pattern.
+    xtrace_string: Vec<bool>,
+    /// The t=0 `N,full` snapshot is emitted lazily, on the first in-window
+    /// `xtrace_write_changes` call — by then the time-0 initial blocks have run
+    /// and settled, so the checkpoint carries real values (matching the
+    /// reference producer) instead of the pre-init all-X image.
+    xtrace_snapshot_pending: bool,
+    /// SV `event` objects (signal_table index, XTrace signal id). An event has
+    /// no level, so it is NOT in `xtrace_trace`: it emits an §10.4 `X` record
+    /// per trigger instead of a value delta.
+    xtrace_events: Vec<(usize, String)>,
+    /// Time of the last `X` record emitted for each `xtrace_events` entry, so a
+    /// 0→1→0 toggle inside one time slot still counts as exactly one trigger
+    /// (mirrors `vcd_event_last`).
+    xtrace_event_last: Vec<u64>,
     xtrace_last_time: u64,
     /// Change-emitting steps since the last durable flush of the XTrace
     /// writer. Bounds how much trailing trace a crash/SIGKILL can lose
@@ -2671,6 +2789,33 @@ pub struct Simulator {
     /// executed on worker threads and are NOT included in `insns=`.
     prof_par_ticks: u64,
     prof_par_blocks: u64,
+    /// Zero-delay (delta) livelock detection: how many event-loop iterations
+    /// have run at the CURRENT simulation time without it advancing. A design
+    /// whose processes keep re-arming at the same timestamp (`forever #0;`, a
+    /// zero-delay event ping-pong, a `wait` on an already-true condition inside
+    /// a `forever`) can never advance, and xezim used to spin silently forever
+    /// — the user just saw the sim "stuck at time 0".
+    /// Re-entry depth of `exec_forever_sched`'s suspend-aware path. A `forever`
+    /// whose leading statement only SOMETIMES blocks (`wait (cond)` with cond
+    /// already true) would otherwise recurse once per iteration and overflow the
+    /// Rust stack; past this depth the continuation goes back to the scheduler.
+    forever_depth: u32,
+    /// §11.8.1: while narrowing relational constraint bounds for a target whose
+    /// comparison context is UNSIGNED (the target, or the other operand, is
+    /// unsigned), a bound literal must be read by its unsigned value — e.g. the
+    /// unsized decimal `4294967290` (0xFFFFFFFA), which `to_i64` would otherwise
+    /// sign-extend to -6, collapsing `u >= 4294967290` to `u >= 0`. Scoped to
+    /// the `narrow_relational_bounds` / `affine_*` subtree.
+    constraint_cmp_unsigned: bool,
+    stall_iters: u64,
+    stall_time: u64,
+    /// Process activations at the current timestamp — the accurate signal for
+    /// "who is spinning" (the event queue's own pid_counts is reset per drain).
+    stall_pid_hits: HashMap<usize, u64>,
+    /// Delta cycles allowed at one timestamp before the run is declared a
+    /// zero-delay livelock. Generous by default (real designs settle in a
+    /// handful); tune with XEZIM_STALL_LIMIT, 0 disables the check.
+    stall_limit: u64,
     prof_fallback_insns: u64,
     prof_fallback_by_reason: HashMap<&'static str, (u64, u64)>,
     prof_settle_dc_ns: u64,
@@ -2725,8 +2870,15 @@ pub struct Simulator {
     /// `after_signal_write` whenever a signal value differs from its
     /// previous inline-bits snapshot.
     dpi_value_change_cbs: HashMap<usize, Vec<DpiCbHandle>>,
+    /// Registered cbNextSimTime callbacks with their registration time.
+    /// Each is one-shot and fires when simulation time advances.
+    dpi_next_time_cbs: Vec<(DpiCbHandle, u64)>,
     /// Registered start-of-reset callbacks. Fired at simulation start.
     dpi_reset_cbs: Vec<DpiCbHandle>,
+    /// Registered start-of-simulation callbacks. Fired once at sim start.
+    dpi_start_sim_cbs: Vec<DpiCbHandle>,
+    /// Registered end-of-simulation callbacks. Fired once when the event loop ends.
+    dpi_end_sim_cbs: Vec<DpiCbHandle>,
     /// Self-pointer, installed once at the top of `simulate()`. The
     /// `write_sig!` macro needs a `*mut Simulator` to hand the VPI
     /// callback dispatcher, but it expands in contexts that already hold
@@ -2739,10 +2891,16 @@ pub struct Simulator {
     /// (`vpi_register_cb` may also be called with `cbValueChange` to
     /// mark a scope's reset triggers; we keep a flag set for that).
     dpi_pending_reset_fired: bool,
+    dpi_pending_start_sim_fired: bool,
+    dpi_pending_end_sim_fired: bool,
     /// Open file handles for $fopen/$fwrite/$fclose.
     file_handles: HashMap<i32, std::fs::File>,
     /// Per-fd ungetc pushback buffer (LIFO).
     ungetc_buf: HashMap<i32, Vec<u8>>,
+    /// §20.15 stochastic-analysis queues, keyed by q_id. Created by
+    /// `$q_initialize`, mutated by `$q_add`/`$q_remove`, queried by
+    /// `$q_full`/`$q_exam`.
+    queues: HashMap<i64, StochasticQueue>,
     static_task_init: HashSet<String>,
     current_static_task: Option<String>,
     next_file_handle: i32,
@@ -2753,6 +2911,55 @@ pub struct Simulator {
 /// Empty static used as fallback name for unnamed array-element ids
 /// (large 1-D arrays have per-element entries skipped to save memory).
 static EMPTY_NAME: &str = "";
+
+/// §20.15 stochastic-analysis queue state for `$q_initialize`/`$q_add`/
+/// `$q_remove`/`$q_full`/`$q_exam`.
+///
+/// `q_type`: 1 = FIFO (§20.15.1 Table 20-9), 2 = LIFO. Each entry records the
+/// user `job_id`, `inform_id`, and the sim-time tick at which it was added so
+/// `$q_exam` can compute the wait-time statistics of Table 20-10. Statistics
+/// accumulate across the queue's lifetime: `max_len_seen` is the high-water
+/// mark (code 3); inter-arrival samples feed code 2; per-job waits feed codes
+/// 4/5/6. `i64::MIN`/sentinels encode "no sample yet" (the LRM leaves these
+/// stats implementation-defined; many tools report -1 in that case).
+#[derive(Clone, Debug, Default)]
+struct StochasticQueue {
+    q_type: i64,
+    max_length: i64,
+    entries: VecDeque<(i64, i64, i64)>, // (job_id, inform_id, arrival_tick)
+    // lifetime statistics
+    arrivals: u64,
+    last_arrival_tick: Option<i64>,
+    sum_interarrival: i128,
+    max_len_seen: usize,
+    shortest_wait_ever: Option<i64>,
+    longest_wait_queued: Option<i64>,
+    sum_wait_removed: i128,
+    count_wait_removed: u64,
+}
+
+/// Evaluate the single real argument of a §20.8.2 one-operand real math
+/// function (`$sin`, `$sqrt`, …). Defaults to 0.0 when absent.
+#[inline]
+fn real1<F>(args: &[Expression], eval: &mut F) -> f64
+where
+    F: FnMut(&Expression) -> Value,
+{
+    args.first().map(|a| eval(a).to_f64()).unwrap_or(0.0)
+}
+
+/// Evaluate the two real arguments of a §20.8.2 two-operand real math function
+/// (`$atan2(y,x)`, `$hypot(x,y)`), defaulting missing operands to 0.0.
+#[inline]
+fn real2<F>(args: &[Expression], eval: &mut F) -> (f64, f64)
+where
+    F: FnMut(&Expression) -> Value,
+{
+    (
+        args.get(0).map(|a| eval(a).to_f64()).unwrap_or(0.0),
+        args.get(1).map(|a| eval(a).to_f64()).unwrap_or(0.0),
+    )
+}
 
 impl Simulator {
     /// Safe accessor for `id_to_name`. Large-array element ids may sit
@@ -3623,6 +3830,7 @@ impl Simulator {
             signal_widths: signal_widths_vec,
             signal_signed: signal_signed_vec,
             signal_real: signal_real_vec,
+            cont_driven: HashSet::default(),
             signal_type_names,
             time: 0,
             output: Vec::new(),
@@ -3630,6 +3838,7 @@ impl Simulator {
             finished: false,
             compiled: false,
             monitor: None,
+            monitor_paused: false,
             monitor_prev: HashMap::default(),
             monitor_arg_prev: None,
             pending_strobes: Vec::new(),
@@ -3715,7 +3924,7 @@ impl Simulator {
             current_scope: String::new(),
             func_call_stack: Vec::new(),
             return_value: None,
-            rng: SvRng::from_entropy(),
+            rng: SvRng::from_seed(SvRng::DEFAULT_SEED),
             proc_rng: HashMap::default(),
             obj_rng: HashMap::default(),
             obj_rng_stack: Vec::new(),
@@ -3797,6 +4006,12 @@ impl Simulator {
             vcd_last_time: u64::MAX,
             vcd_prev_signals: Vec::new(),
             vcd_filter_scopes: Vec::new(),
+            vcd_dump_depth: 0,
+            vcd_var_kinds: Vec::new(),
+            vcd_event_last: Vec::new(),
+            vcd_limit: None,
+            vcd_bytes: 0,
+            vcd_limit_hit: false,
             threads: 1,
             pdes_worker_pool: None,
             perlp_settle_prefix: None,
@@ -3814,6 +4029,11 @@ impl Simulator {
             xtrace_writer: None,
             xtrace_trace: Vec::new(),
             xtrace_prev_signals: Vec::new(),
+            xtrace_real: Vec::new(),
+            xtrace_string: Vec::new(),
+            xtrace_snapshot_pending: false,
+            xtrace_events: Vec::new(),
+            xtrace_event_last: Vec::new(),
             xtrace_last_time: 0,
             xtrace_dirty_steps: 0,
             xtrace_from_ns: 0,
@@ -3914,6 +4134,15 @@ impl Simulator {
             par_cal_use_parallel: false,
             prof_par_ticks: 0,
             prof_par_blocks: 0,
+            forever_depth: 0,
+            constraint_cmp_unsigned: false,
+            stall_iters: 0,
+            stall_time: 0,
+            stall_pid_hits: HashMap::default(),
+            stall_limit: std::env::var("XEZIM_STALL_LIMIT")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(100_000),
             prof_fallback_insns: 0,
             prof_fallback_by_reason: HashMap::default(),
             prof_settle_dc_ns: 0,
@@ -3946,11 +4175,17 @@ impl Simulator {
             vpi_argv: Vec::new(),
             dpi_scopes: HashMap::default(),
             dpi_value_change_cbs: HashMap::default(),
+            dpi_next_time_cbs: Vec::new(),
             dpi_reset_cbs: Vec::new(),
+            dpi_start_sim_cbs: Vec::new(),
+            dpi_end_sim_cbs: Vec::new(),
             vpi_self_ptr: std::ptr::null_mut(),
             dpi_pending_reset_fired: false,
+            dpi_pending_start_sim_fired: false,
+            dpi_pending_end_sim_fired: false,
             file_handles: HashMap::default(),
             ungetc_buf: HashMap::default(),
+            queues: HashMap::default(),
             static_task_init: HashSet::default(),
             current_static_task: None,
             next_file_handle: 3,
@@ -3981,10 +4216,15 @@ impl Simulator {
         if !vpi_paths.is_empty() {
             let self_ptr = &mut sim as *mut Simulator;
             ACTIVE_SIMULATOR.with(|cell| cell.set(self_ptr));
+            let prev_global = GLOBAL_ACTIVE_SIMULATOR.swap(
+                self_ptr,
+                std::sync::atomic::Ordering::AcqRel,
+            );
             let mut libs = std::mem::take(&mut sim.dpi_libraries);
             vpi_run_startup_routines(&mut libs, &vpi_paths);
             sim.dpi_libraries = libs;
             ACTIVE_SIMULATOR.with(|cell| cell.set(std::ptr::null_mut()));
+            GLOBAL_ACTIVE_SIMULATOR.store(prev_global, std::sync::atomic::Ordering::Release);
         }
         sim
     }
@@ -3992,14 +4232,23 @@ impl Simulator {
     pub fn set_plusargs(&mut self, plusargs: &[String]) {
         self.plusargs = plusargs.to_vec();
         sim_dbg_eprintln!("[DEBUG] plusargs set: {:?}", self.plusargs);
-        // `+seed=<n>` makes the run reproducible: deterministically seed the
-        // RNG (same seed → byte-identical output) instead of pulling fresh
-        // system entropy each launch. Mirrors the standard simulator knob a
-        // verification flow uses to replay a failing random test bit-for-bit.
+        // Seeding. The default is SvRng::DEFAULT_SEED — a run is reproducible
+        // unless it asks not to be, so a failing random test can be re-run
+        // bit-for-bit. `+seed=<n>` selects another stream; `+seed=random` draws
+        // one from system entropy and PRINTS it, since a seed you cannot see is
+        // a run you cannot replay.
         for a in &self.plusargs {
             if let Some(v) = a.strip_prefix("seed=").or_else(|| a.strip_prefix("+seed=")) {
-                if let Ok(seed) = v.trim().parse::<u64>() {
+                let v = v.trim();
+                if v.eq_ignore_ascii_case("random") {
+                    use rand::Rng;
+                    let seed = rand::rngs::StdRng::from_entropy().gen::<u64>();
+                    eprintln!("[xezim] random seed: {} (replay with +seed={})", seed, seed);
                     self.rng = SvRng::from_seed(seed);
+                } else if let Ok(seed) = v.parse::<u64>() {
+                    self.rng = SvRng::from_seed(seed);
+                } else {
+                    eprintln!("[xezim][warning] ignoring malformed +seed={} (want an integer or 'random')", v);
                 }
             }
         }
@@ -4103,7 +4352,10 @@ impl Drop for Simulator {
             cbs.clear();
         }
         // Reset callbacks
+        self.dpi_next_time_cbs.clear();
         self.dpi_reset_cbs.clear();
+        self.dpi_start_sim_cbs.clear();
+        self.dpi_end_sim_cbs.clear();
     }
 }
 
@@ -5365,12 +5617,21 @@ impl Simulator {
     }
 
     fn write_file_handle(&mut self, args: &[Expression], newline: bool) -> Value {
+        self.write_file_handle_named(args, newline, "$write")
+    }
+
+    fn write_file_handle_named(
+        &mut self,
+        args: &[Expression],
+        newline: bool,
+        tn: &str,
+    ) -> Value {
         if args.is_empty() {
             return Value::zero(32);
         }
         let fd = self.eval_file_handle_arg(&args[0]);
         let mut payload = if args.len() > 1 {
-            self.format_args(&args[1..], "$write")
+            self.format_args(&args[1..], tn)
         } else {
             String::new()
         };
@@ -5554,6 +5815,63 @@ impl Simulator {
             mem_name,
             path
         );
+        Value::zero(32)
+    }
+
+    /// §21.5 `$writememb/h/d`: dump a memory array to a file in the specified
+    /// radix. Each line is `@<addr_hex> <value_in_radix>`, matching the
+    /// `$readmem*` format so the file is round-trippable.
+    fn write_memory_file(&mut self, args: &[Expression], tn: &str) -> Value {
+        if args.len() < 2 {
+            return Value::zero(32);
+        }
+        let path = self.system_string_arg(&args[0]);
+        if path.is_empty() {
+            return Value::zero(32);
+        }
+        let Some(mem_name) = self.resolve_array_name_from_expr(&args[1]) else {
+            return Value::zero(32);
+        };
+        let Some((lo, hi, width)) = self.module.arrays.get(&mem_name).copied() else {
+            return Value::zero(32);
+        };
+        let start = if args.len() >= 3 {
+            self.eval_expr(&args[2]).to_i64().unwrap_or(lo)
+        } else {
+            lo
+        };
+        let end = if args.len() >= 4 {
+            self.eval_expr(&args[3]).to_i64().unwrap_or(hi)
+        } else {
+            hi
+        };
+        let radix: u32 = if tn.ends_with('b') { 2 } else if tn.ends_with('h') { 16 } else { 10 };
+        let step: i64 = if start <= end { 1 } else { -1 };
+        let min_idx = lo.min(hi);
+        let max_idx = lo.max(hi);
+        let dense_array = self.array_first_id.get(mem_name.as_str()).copied();
+        let mut out = String::new();
+        let mut addr = start;
+        while (step > 0 && addr <= end) || (step < 0 && addr >= end) {
+            if addr >= min_idx && addr <= max_idx {
+                let val = if let Some((first_id, arr_lo, _)) = dense_array {
+                    let id = first_id + (addr - arr_lo) as usize;
+                    self.signal_table.get(id).cloned().unwrap_or_else(|| Value::zero(width))
+                } else {
+                    Value::zero(width)
+                };
+                out.push_str(&format!("@{:x} ", addr));
+                let s = match radix {
+                    2 => val.to_bin_string(),
+                    16 => val.to_hex_string(),
+                    _ => val.to_dec_string(),
+                };
+                out.push_str(&s);
+                out.push('\n');
+            }
+            addr += step;
+        }
+        let _ = std::fs::write(&path, out);
         Value::zero(32)
     }
 
@@ -6065,12 +6383,13 @@ impl Simulator {
     }
 
     fn exec_dpi_import_call(&mut self, sv_name: &str, args: &[Expression]) -> Option<Value> {
+        let prev_active = ACTIVE_SIMULATOR.with(|cell| cell.get());
         let spec = self.module.dpi_imports.get(sv_name)?.clone();
         if !self.dpi_bindings.contains_key(sv_name) && !self.dpi_unsupported.contains(sv_name) {
             self.try_bind_dpi(sv_name, &spec);
         }
         if self.dpi_unsupported.contains(sv_name) {
-            ACTIVE_SIMULATOR.with(|cell| cell.set(std::ptr::null_mut()));
+            ACTIVE_SIMULATOR.with(|cell| cell.set(prev_active));
             return Some(Value::zero(32));
         }
         let Some(binding) = self.dpi_bindings.get(sv_name) else {
@@ -6080,7 +6399,7 @@ impl Simulator {
                     sv_name, spec.c_name
                 );
             }
-            ACTIVE_SIMULATOR.with(|cell| cell.set(std::ptr::null_mut()));
+            ACTIVE_SIMULATOR.with(|cell| cell.set(prev_active));
             return Some(Value::zero(32));
         };
         let ret_kind = binding.ret;
@@ -6522,8 +6841,8 @@ impl Simulator {
             // No side effects expected; kept for future optimization hooks.
             let _ = &mut result;
         }
-        // Clear active simulator after DPI call
-        ACTIVE_SIMULATOR.with(|cell| cell.set(std::ptr::null_mut()));
+        // Restore the caller's active simulator context after DPI call.
+        ACTIVE_SIMULATOR.with(|cell| cell.set(prev_active));
         // Restore the previous DPI scope so nested DPI calls don't
         // leak scope state across invocations.
         ACTIVE_SCOPE.with(|cell| cell.set(prev_scope));
@@ -9479,7 +9798,23 @@ impl Simulator {
         if !self.compiled {
             self.compile();
         }
-        self.vpi_self_ptr = self as *mut Simulator;
+        let prev_active = ACTIVE_SIMULATOR.with(|cell| cell.get());
+        let self_ptr = self as *mut Simulator;
+        ACTIVE_SIMULATOR.with(|cell| cell.set(self_ptr));
+        let prev_global = GLOBAL_ACTIVE_SIMULATOR.swap(
+            self_ptr,
+            std::sync::atomic::Ordering::AcqRel,
+        );
+        self.vpi_self_ptr = self_ptr;
+        // Fire cbStartOfSimulation callbacks exactly once at simulation start.
+        if !self.dpi_start_sim_cbs.is_empty() && !self.dpi_pending_start_sim_fired {
+            let self_ptr = self as *mut Simulator;
+            let now = self.time;
+            for cb in &self.dpi_start_sim_cbs.clone() {
+                dispatch_vpi_cb(self_ptr, now, None, cb, vpi::CB_START_OF_SIMULATION);
+            }
+            self.dpi_pending_start_sim_fired = true;
+        }
         // Fire cbStartOfReset callbacks exactly once at simulation
         // start. UVM's polling framework uses this hook to clear its
         // pending-change lists; we expose it because the upstream
@@ -9494,6 +9829,16 @@ impl Simulator {
             self.dpi_pending_reset_fired = true;
         }
         self.event_loop();
+        // Fire cbEndOfSimulation callbacks exactly once after the event loop
+        // terminates, before `final` blocks execute.
+        if !self.dpi_end_sim_cbs.is_empty() && !self.dpi_pending_end_sim_fired {
+            let self_ptr = self as *mut Simulator;
+            let now = self.time;
+            for cb in &self.dpi_end_sim_cbs.clone() {
+                dispatch_vpi_cb(self_ptr, now, None, cb, vpi::CB_END_OF_SIMULATION);
+            }
+            self.dpi_pending_end_sim_fired = true;
+        }
         // LRM §9.2.3 — `final` procedures run after the event loop terminates
         // but BEFORE any trace flush. May not contain time-consuming
         // statements (no `#`, `@`, `wait`). We honor that by running each
@@ -9532,6 +9877,8 @@ impl Simulator {
         if std::env::var("XEZIM_RS_STATS").is_ok() {
             xezim_core::value::Value::dump_range_select_stats();
         }
+        ACTIVE_SIMULATOR.with(|cell| cell.set(prev_active));
+        GLOBAL_ACTIVE_SIMULATOR.store(prev_global, std::sync::atomic::Ordering::Release);
     }
 
     /// Detect `initial begin VAR = CONST; forever #d VAR = ~VAR; end`
@@ -12195,6 +12542,19 @@ impl Simulator {
             .chain(pending_ca.into_iter().map(|p| p.materialize()))
         {
             let explicit_delay = ca.delay;
+            // §21.7.2.1 `var_type`: an object whose only driver is continuous is
+            // a `wire` in a dump (see `cont_driven`). Recorded here — this is the
+            // last point at which the continuous assigns still exist as ASTs.
+            // Only a WHOLE-name LHS counts: `assign a[3] = …` leaves the rest of
+            // `a` to other drivers, so the object is not purely continuous.
+            if let ExprKind::Ident(lhs_hier) = &ca.lhs.kind {
+                if lhs_hier.path.iter().all(|s| s.selects.is_empty()) {
+                    let n = Self::resolve_hier_name_static(lhs_hier, &self.module);
+                    if let Some(&id) = self.signal_name_to_id.get(n.as_str()) {
+                        self.cont_driven.insert(id);
+                    }
+                }
+            }
             reads.clear();
             writes.clear();
             Self::collect_expr_reads(&ca.rhs, &self.module, &mut reads);
@@ -14049,6 +14409,61 @@ impl Simulator {
     /// disabled by the LLVM threshold drop).  See diff against the
     /// pre-Phase-3 inline body for context.
     #[inline(always)]
+    /// How deep `exec_forever_sched` may re-enter itself before it stops
+    /// recursing and trampolines through the event queue instead. Small: real
+    /// designs suspend on the first iteration, so any depth beyond a handful
+    /// means the loop is not actually blocking.
+    const FOREVER_RECURSION_LIMIT: u32 = 32;
+
+    /// A zero-delay livelock: `self.stall_limit` delta cycles have run at one
+    /// timestamp and time never moved. Rather than spin forever (the user just
+    /// sees "stuck at time 0"), say so and name the processes responsible —
+    /// the ones the scheduler keeps re-arming.
+    fn report_zero_delay_stall(&mut self) {
+        let mut top: Vec<(usize, u64)> =
+            self.stall_pid_hits.iter().map(|(p, c)| (*p, *c)).collect();
+        top.sort_by_key(|&(_, c)| std::cmp::Reverse(c));
+        top.truncate(5);
+
+        // Report whichever count actually tripped: the outer loop's delta count,
+        // or (when a process re-armed inside one tick's drain loop) how many
+        // times that process ran. Quoting "1 delta cycle" for a process that ran
+        // 100_000 times would just be confusing.
+        let worst = top.first().map(|&(_, c)| c).unwrap_or(0);
+        eprintln!(
+            "[xezim][error] simulation STALLED at time {} — no progress after {} process activations \
+             at this timestamp ({} delta cycles).",
+            self.time,
+            worst.max(self.stall_iters),
+            self.stall_iters
+        );
+        eprintln!(
+            "               This is a zero-delay (delta) livelock: one or more processes keep"
+        );
+        eprintln!(
+            "               re-arming at the same timestamp, so simulated time can never move."
+        );
+        if !top.is_empty() {
+            eprintln!("               Most frequently scheduled processes:");
+            for (pid, count) in &top {
+                let scope = self
+                    .process_scope_hint
+                    .get(pid)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| format!(" in {}", s))
+                    .unwrap_or_default();
+                eprintln!("                 process {}{} — ran {} times at this timestamp", pid, scope, count);
+            }
+        }
+        eprintln!("               Common causes:");
+        eprintln!("                 * `forever` / `always` with `#0` or no timing control at all");
+        eprintln!("                 * two processes triggering each other's events with no delay");
+        eprintln!("                 * `wait (cond)` inside a `forever` where cond is already true");
+        eprintln!(
+            "               Raise or disable the check with XEZIM_STALL_LIMIT=<n> (0 = never stall-check)."
+        );
+    }
+
     fn run_one_tick(
         &mut self,
         accum: &mut PerTickAccum,
@@ -14431,8 +14846,38 @@ impl Simulator {
             if next_time > self.max_time {
                 break;
             }
+            let old_time = self.time;
             if next_time > self.time {
                 self.time = next_time;
+                self.stall_iters = 0;
+                self.stall_time = next_time;
+                self.stall_pid_hits.clear();
+            } else {
+                // Time did NOT advance this iteration. That is normal for a few
+                // delta cycles; it is a livelock if it never ends.
+                if self.time == self.stall_time {
+                    self.stall_iters += 1;
+                } else {
+                    self.stall_time = self.time;
+                    self.stall_iters = 1;
+                }
+                if self.stall_limit > 0 && self.stall_iters > self.stall_limit {
+                    self.report_zero_delay_stall();
+                    self.finished = true;
+                    break;
+                }
+            }
+            if self.time > old_time && !self.dpi_next_time_cbs.is_empty() {
+                let self_ptr = self as *mut Simulator;
+                let now = self.time;
+                let mut pending = std::mem::take(&mut self.dpi_next_time_cbs);
+                for (cb, reg_time) in pending.drain(..) {
+                    if now > reg_time {
+                        dispatch_vpi_cb(self_ptr, now, None, &cb, vpi::CB_NEXT_SIM_TIME);
+                    } else {
+                        self.dpi_next_time_cbs.push((cb, reg_time));
+                    }
+                }
             }
 
             // Per-LP harness (step 1): rendezvous with persistent workers at
@@ -15592,6 +16037,23 @@ impl Simulator {
             RPS_DEPTH.with(|c| c.set(c.get() + 1));
             DepthGuard
         };
+        if self.stall_limit > 0 {
+            let hits = self.stall_pid_hits.entry(pid).or_insert(0);
+            *hits += 1;
+            // One process re-activated this many times at a SINGLE timestamp is
+            // not a busy design, it is a livelock: it keeps re-arming itself and
+            // time can never advance. (Counting per-process, rather than
+            // counting activations at the timestamp, is what makes this safe for
+            // a wide design that legitimately wakes thousands of DISTINCT
+            // processes at time 0.) run_one_tick's inner drain loop re-reads the
+            // queue at the current time, so a self-rescheduling process never
+            // reaches the outer event loop — the check has to live here.
+            if *hits > self.stall_limit {
+                self.report_zero_delay_stall();
+                self.finished = true;
+                return;
+            }
+        }
         sim_dbg_eprintln!(
             "[DEBUG] running process {} ({} stmts) at time {}",
             pid,
@@ -16972,7 +17434,23 @@ impl Simulator {
                     body.span,
                 ));
                 cont.extend_from_slice(after);
+
+                // The statement is only POTENTIALLY blocking: `wait (cond)` with
+                // cond already true runs straight through, reaches the Forever
+                // continuation, and lands back here — one recursion per loop
+                // iteration. Unbounded, that overflows the Rust stack (an abort,
+                // with no hint of which loop did it) instead of presenting as
+                // what it is: a zero-delay livelock. Past a small depth, hand the
+                // continuation to the scheduler as a delta at the current time.
+                // The loop then spins through the event loop, where it is bounded,
+                // and the stall detector can see it and name it.
+                if self.forever_depth >= Self::FOREVER_RECURSION_LIMIT {
+                    self.event_queue.schedule(self.time, pid, cont);
+                    return;
+                }
+                self.forever_depth += 1;
                 self.run_process_stmts(pid, &cont);
+                self.forever_depth -= 1;
                 return;
             }
             self.exec_statement(s);
@@ -23636,8 +24114,14 @@ impl Simulator {
                 "$value$plusargs" => self.eval_value_plusargs(args),
                 "$fopen" => self.open_file_handle(args),
                 "$fclose" => self.close_file_handle(args),
-                "$fwrite" => self.write_file_handle(args, false),
-                "$fdisplay" => self.write_file_handle(args, true),
+                "$fwrite" => self.write_file_handle_named(args, false, "$write"),
+                "$fwriteb" => self.write_file_handle_named(args, false, "$writeb"),
+                "$fwriteh" | "$fwritex" => self.write_file_handle_named(args, false, "$writeh"),
+                "$fwriteo" => self.write_file_handle_named(args, false, "$writeo"),
+                "$fdisplay" => self.write_file_handle_named(args, true, "$display"),
+                "$fdisplayb" => self.write_file_handle_named(args, true, "$displayb"),
+                "$fdisplayh" | "$fdisplayx" => self.write_file_handle_named(args, true, "$displayh"),
+                "$fdisplayo" => self.write_file_handle_named(args, true, "$displayo"),
                 "$ftell" => {
                     use std::io::Seek;
                     let fd = args
@@ -23780,8 +24264,72 @@ impl Simulator {
                     }
                     Value::from_u64(u32::MAX as u64, 32)
                 }
+                // §21.3.4.2 `$fgets(str, fd)`: read a line into the string
+                // variable; returns the count of chars read, or 0 on EOF/error.
+                "$fgets" => {
+                    use std::io::Read;
+                    let dest = args.first();
+                    let fd = args.get(1).map(|a| self.eval_file_handle_arg(a)).unwrap_or(0);
+                    let mut line = Vec::new();
+                    let mut got_eof = true;
+                    if let Some(f) = self.file_handles.get_mut(&fd) {
+                        let mut b = [0u8; 1];
+                        loop {
+                            // Check ungetc buffer first
+                            if let Some(buf) = self.ungetc_buf.get_mut(&fd) {
+                                if let Some(c) = buf.pop() {
+                                    got_eof = false;
+                                    if c == b'\n' { line.push(c); break; }
+                                    line.push(c);
+                                    continue;
+                                }
+                            }
+                            match f.read(&mut b) {
+                                Ok(0) => break,
+                                Ok(_) => {
+                                    got_eof = false;
+                                    if b[0] == b'\n' { line.push(b[0]); break; }
+                                    line.push(b[0]);
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                    }
+                    let s = String::from_utf8_lossy(&line).to_string();
+                    if let Some(d) = dest {
+                        self.assign_value(d, &Value::from_string(&s));
+                    }
+                    if got_eof && s.is_empty() {
+                        Value::zero(32)
+                    } else {
+                        Value::from_u64(s.len() as u64, 32)
+                    }
+                }
+                // §21.3.8 `$feof(fd)`: returns nonzero if the file is at EOF.
+                "$feof" => {
+                    use std::io::{Read, Seek, SeekFrom};
+                    let fd = args.first().map(|a| self.eval_file_handle_arg(a)).unwrap_or(0);
+                    let at_eof = if let Some(f) = self.file_handles.get_mut(&fd) {
+                        let pos = f.stream_position().unwrap_or(0);
+                        let end = f.seek(SeekFrom::End(0)).unwrap_or(0);
+                        let _ = f.seek(SeekFrom::Start(pos));
+                        pos >= end
+                    } else {
+                        false
+                    };
+                    Value::from_u64(if at_eof { 1 } else { 0 }, 32)
+                }
+                // §21.3.7 `$ferror(fd, str)`: returns 0 if no error, writes a
+                // description string to the 2nd argument.
+                "$ferror" => {
+                    if let Some(out) = args.get(1) {
+                        self.assign_value(out, &Value::from_string("No error"));
+                    }
+                    Value::zero(32)
+                }
                 "$readmemh" => self.read_memory_file(args, 16),
                 "$readmemb" => self.read_memory_file(args, 2),
+                "$readmemd" => self.read_memory_file(args, 10),
                 // PRNG system functions.
                 //  - no-seed `$urandom`/`$urandom_range` draw from the OS-entropy
                 //    RNG, so each run differs (riscv-dv's source of variation).
@@ -23982,11 +24530,12 @@ impl Simulator {
                     Value::from_f64(v.to_f64().floor())
                 }
                 "$sqrt" => {
+                    // §20.8.2: real result, matches C sqrt().
                     let v = args
                         .first()
                         .map(|a| self.eval_expr(a))
                         .unwrap_or(Value::zero(64));
-                    Value::from_u64(v.to_f64().sqrt() as u64, 32)
+                    Value::from_f64(v.to_f64().sqrt())
                 }
                 "$pow" => {
                     let a = args
@@ -24000,11 +24549,12 @@ impl Simulator {
                     Value::from_f64(a.to_f64().powf(b.to_f64()))
                 }
                 "$log10" => {
+                    // §20.8.2: real result, matches C log10().
                     let v = args
                         .first()
                         .map(|a| self.eval_expr(a))
                         .unwrap_or(Value::zero(64));
-                    Value::from_u64(v.to_f64().log10() as u64, 32)
+                    Value::from_f64(v.to_f64().log10())
                 }
                 "$exp" => {
                     let v = args
@@ -24026,6 +24576,67 @@ impl Simulator {
                         .map(|a| self.eval_expr(a))
                         .unwrap_or(Value::zero(64));
                     Value::from_f64(v.to_f64().log2())
+                }
+                // §20.8.2 real trigonometric and hyperbolic functions. Per
+                // Table 20-4 each matches the equivalent C <math.h> function.
+                // All take a real argument (two for $atan2/$hypot) and return a
+                // real result. f64 methods below are direct C-library mirrors.
+                "$sin" => {
+                    let v = real1(args, &mut |a| self.eval_expr(a));
+                    Value::from_f64(v.sin())
+                }
+                "$cos" => {
+                    let v = real1(args, &mut |a| self.eval_expr(a));
+                    Value::from_f64(v.cos())
+                }
+                "$tan" => {
+                    let v = real1(args, &mut |a| self.eval_expr(a));
+                    Value::from_f64(v.tan())
+                }
+                "$asin" => {
+                    let v = real1(args, &mut |a| self.eval_expr(a));
+                    Value::from_f64(v.asin())
+                }
+                "$acos" => {
+                    let v = real1(args, &mut |a| self.eval_expr(a));
+                    Value::from_f64(v.acos())
+                }
+                "$atan" => {
+                    let v = real1(args, &mut |a| self.eval_expr(a));
+                    Value::from_f64(v.atan())
+                }
+                // $atan2(y, x): first arg is y, second is x (Table 20-4).
+                "$atan2" => {
+                    let (a, b) = real2(args, &mut |a| self.eval_expr(a));
+                    Value::from_f64(a.atan2(b))
+                }
+                "$hypot" => {
+                    let (a, b) = real2(args, &mut |a| self.eval_expr(a));
+                    Value::from_f64(a.hypot(b))
+                }
+                "$sinh" => {
+                    let v = real1(args, &mut |a| self.eval_expr(a));
+                    Value::from_f64(v.sinh())
+                }
+                "$cosh" => {
+                    let v = real1(args, &mut |a| self.eval_expr(a));
+                    Value::from_f64(v.cosh())
+                }
+                "$tanh" => {
+                    let v = real1(args, &mut |a| self.eval_expr(a));
+                    Value::from_f64(v.tanh())
+                }
+                "$asinh" => {
+                    let v = real1(args, &mut |a| self.eval_expr(a));
+                    Value::from_f64(v.asinh())
+                }
+                "$acosh" => {
+                    let v = real1(args, &mut |a| self.eval_expr(a));
+                    Value::from_f64(v.acosh())
+                }
+                "$atanh" => {
+                    let v = real1(args, &mut |a| self.eval_expr(a));
+                    Value::from_f64(v.atanh())
                 }
                 "$clog2" => {
                     let v = args
@@ -24435,6 +25046,23 @@ impl Simulator {
                         return Value::from_u64(n as u64, 32);
                     }
                     Value::zero(32)
+                }
+                // §20.15 `$q_full(q_id, status)`: system FUNCTION returning 0/1
+                // and writing the status code to its second argument.
+                "$q_full" => {
+                    let (full, status) = self.q_full_impl(args);
+                    self.assign_q_status(args, 1, status);
+                    Value::from_u64(full as u64, 32)
+                }
+                // §20.17.1 `$system` as a FUNCTION: returns the host shell
+                // exit status (int). With no argument calls system(NULL).
+                "$system" => {
+                    Value::from_u64(self.system_impl(args) as u64, 32)
+                }
+                // §20.17.2 `$stacktrace` as a FUNCTION: returns the call-stack
+                // text as a string. Content is implementation-defined (20.17.2).
+                "$stacktrace" => {
+                    Value::from_string(&self.stacktrace_text())
                 }
                 // A `$name` a VPI module registered as a system FUNCTION.
                 // Checked last so a builtin always wins.
@@ -29476,6 +30104,32 @@ impl Simulator {
                     self.assign_value(&args[0], &v);
                 }
             }
+            // §20.10 severity system tasks. Each emits a tool-specific
+            // message (severity tag + user `$display`-style text + a context
+            // line with time/scope) and — except for `$fatal` — allows
+            // execution to CONTINUE (LRM 20.10: only `$fatal` terminates,
+            // via an implicit `$finish`). The user message uses the same
+            // format-string rules as `$display`.
+            "$info" => {
+                self.emit_severity("Info", args);
+            }
+            "$warning" => {
+                self.emit_severity("Warning", args);
+            }
+            "$error" => {
+                self.emit_severity("Error", args);
+            }
+            "$fatal" => {
+                // `$fatal [ ( finish_number [, list_of_arguments] ) ]`. The
+                // first argument, when it is an integer literal 0/1/2, is the
+                // finish_number (LRM 20.10 / 20.2 diagnostics level); the
+                // remaining arguments are the `$display`-style message. A bare
+                // `$fatal("msg")` (no valid finish_number) defaults to 1 and
+                // treats every argument as the message.
+                let (msg_args, _finish) = self.fatal_msg_args(args);
+                self.emit_severity("Fatal", msg_args);
+                self.finished = true; // implicit $finish
+            }
             "$display" | "$displayb" | "$displayh" | "$displayo" => {
                 let m = self.format_args(args, name);
                 self.record_output(m.clone());
@@ -29529,7 +30183,15 @@ impl Simulator {
                 self.check_monitor();
             }
             "$monitoroff" => {
-                self.monitor = None;
+                self.monitor_paused = true;
+            }
+            "$monitoron" => {
+                // Re-enable a previously paused monitor. Per LRM §21.2.3,
+                // $monitoron always prints once immediately (even if values
+                // are unchanged since the last $monitoroff).
+                self.monitor_paused = false;
+                self.monitor_arg_prev = None; // force immediate print
+                self.check_monitor();
             }
             "$finish" | "$stop" => {
                 if std::env::var("XEZIM_TRACE_FINISH").is_ok() {
@@ -29543,10 +30205,41 @@ impl Simulator {
                 let _ = self.close_file_handle(args);
             }
             "$fwrite" => {
-                let _ = self.write_file_handle(args, false);
+                let _ = self.write_file_handle_named(args, false, "$write");
+            }
+            "$fwriteb" => {
+                let _ = self.write_file_handle_named(args, false, "$writeb");
+            }
+            "$fwriteh" | "$fwritex" => {
+                let _ = self.write_file_handle_named(args, false, "$writeh");
+            }
+            "$fwriteo" => {
+                let _ = self.write_file_handle_named(args, false, "$writeo");
             }
             "$fdisplay" => {
-                let _ = self.write_file_handle(args, true);
+                let _ = self.write_file_handle_named(args, true, "$display");
+            }
+            "$fdisplayb" => {
+                let _ = self.write_file_handle_named(args, true, "$displayb");
+            }
+            "$fdisplayh" | "$fdisplayx" => {
+                let _ = self.write_file_handle_named(args, true, "$displayh");
+            }
+            "$fdisplayo" => {
+                let _ = self.write_file_handle_named(args, true, "$displayo");
+            }
+            "$fflush" => {
+                let fd = args.first()
+                    .map(|a| self.eval_file_handle_arg(a))
+                    .unwrap_or(0);
+                if fd == 0 {
+                    // Flush ALL open file handles
+                    for f in self.file_handles.values_mut() {
+                        let _ = f.flush();
+                    }
+                } else if let Some(f) = self.file_handles.get_mut(&fd) {
+                    let _ = f.flush();
+                }
             }
             "$fseek" => {
                 use std::io::{Seek, SeekFrom};
@@ -29592,11 +30285,54 @@ impl Simulator {
                     .unwrap_or(0);
                 self.ungetc_buf.entry(fd).or_default().push(ch);
             }
+            "$fgets" => {
+                // task form: discard return value, just write to the string arg
+                use std::io::Read;
+                let dest = args.first();
+                let fd = args.get(1).map(|a| self.eval_file_handle_arg(a)).unwrap_or(0);
+                let mut line = Vec::new();
+                if let Some(f) = self.file_handles.get_mut(&fd) {
+                    let mut b = [0u8; 1];
+                    loop {
+                        if let Some(buf) = self.ungetc_buf.get_mut(&fd) {
+                            if let Some(c) = buf.pop() {
+                                if c == b'\n' { line.push(c); break; }
+                                line.push(c); continue;
+                            }
+                        }
+                        match f.read(&mut b) {
+                            Ok(0) => break,
+                            Ok(_) => {
+                                if b[0] == b'\n' { line.push(b[0]); break; }
+                                line.push(b[0]);
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+                let s = String::from_utf8_lossy(&line).to_string();
+                if let Some(d) = dest {
+                    self.assign_value(d, &Value::from_string(&s));
+                }
+            }
+            "$feof" => { /* function-only; task form is a no-op */ }
+            "$ferror" => {
+                // task form: just write the message string
+                if let Some(out) = args.get(1) {
+                    self.assign_value(out, &Value::from_string("No error"));
+                }
+            }
             "$readmemh" => {
                 let _ = self.read_memory_file(args, 16);
             }
             "$readmemb" => {
                 let _ = self.read_memory_file(args, 2);
+            }
+            "$readmemd" => {
+                let _ = self.read_memory_file(args, 10);
+            }
+            "$writememb" | "$writememh" | "$writememd" => {
+                let _ = self.write_memory_file(args, name);
             }
             "$dumpfile" => {
                 if let Some(arg) = args.first() {
@@ -29608,12 +30344,14 @@ impl Simulator {
                 }
             }
             "$dumpvars" => {
-                // Collect optional scope/signal-name filter from args 1..N.
-                // arg[0] is depth (currently ignored — always treat as
-                // "all children"). args[1..] are scope or signal names.
-                // When non-empty, restrict the dump to signals whose
-                // resolved hierarchical name starts with one of these
-                // scopes (or matches a signal name exactly).
+                // §21.7.1.4 `$dumpvars(level, scope_or_var, ...)`.
+                // arg[0] is the DEPTH: 0 = every level below each named scope,
+                // N = N levels starting at it. args[1..] are scope or signal
+                // names; with none, the whole design is dumped.
+                let depth = args
+                    .first()
+                    .and_then(|a| self.eval_expr(a).to_u64())
+                    .unwrap_or(0) as u32;
                 let mut filter_scopes: Vec<String> = Vec::new();
                 for a in args.iter().skip(1) {
                     if let ExprKind::Ident(hier) = &a.kind {
@@ -29626,13 +30364,27 @@ impl Simulator {
                     }
                 }
                 self.vcd_filter_scopes = filter_scopes;
+                self.vcd_dump_depth = depth;
                 self.vcd_start_dump();
             }
             "$dumpoff" => {
-                self.vcd_enabled = false;
+                self.vcd_dump_off();
             }
             "$dumpon" => {
-                self.vcd_enabled = true;
+                self.vcd_dump_on();
+            }
+            "$dumpall" => {
+                self.vcd_dump_all();
+            }
+            "$dumpflush" => {
+                // §21.7.1.9: force everything buffered so far out to the file.
+                if let Some(w) = self.vcd_writer.as_mut() {
+                    let _ = w.flush();
+                }
+            }
+            "$dumplimit" => {
+                // §21.7.1.8: cap the dump at N bytes.
+                self.vcd_limit = args.first().and_then(|a| self.eval_expr(a).to_u64());
             }
             "$sscanf" => {
                 if args.len() >= 2 {
@@ -29649,6 +30401,36 @@ impl Simulator {
                     let _ = self.sv_sscanf(&src_str, &fmt, &args[2..]);
                 }
             }
+            // §20.15 stochastic-analysis tasks. All four write an output status
+            // code (Table 20-11) to their last argument; `$q_remove`/
+            // `$q_exam` additionally write their job/stat outputs.
+            "$q_initialize" => {
+                let status = self.q_initialize_impl(args);
+                self.assign_q_status(args, 3, status);
+            }
+            "$q_add" => {
+                let status = self.q_add_impl(args);
+                self.assign_q_status(args, 3, status);
+            }
+            "$q_remove" => {
+                let status = self.q_remove_impl(args);
+                self.assign_q_status(args, 3, status);
+            }
+            "$q_exam" => {
+                let status = self.q_exam_impl(args);
+                self.assign_q_status(args, 3, status);
+            }
+            // §20.17.1 `$system` as a TASK (return value discarded). Invokes
+            // the host shell; with no argument calls system(NULL).
+            "$system" => {
+                let _ = self.system_impl(args);
+            }
+            // §20.17.2 `$stacktrace` as a TASK: displays the call-stack text.
+            "$stacktrace" => {
+                let trace = self.stacktrace_text();
+                self.record_output(trace.clone());
+                self.stdout_writeln(&trace);
+            }
             // A `$name` a VPI module registered with `vpi_register_systf`.
             // Checked last so a builtin always wins.
             _ if vpi_systf_registered(name) => {
@@ -29659,6 +30441,240 @@ impl Simulator {
         }
     }
 
+    /// Hierarchical scope name of the currently running process, for the
+    /// context line of §20.10 severity messages and §20.17.2 `$stacktrace`.
+    /// Mirrors the resolution used by `$printtimescale`.
+    fn severity_scope(&self) -> String {
+        match self.process_scope_hint.get(&self.current_pid) {
+            Some(s) if !s.is_empty() => format!("{}.{}", self.module.name, s),
+            _ => self.module.name.clone(),
+        }
+    }
+
+    /// Split `$fatal` arguments into `(message_args, finish_number)` per LRM
+    /// 20.10: if the first argument is an integer literal whose value is 0, 1,
+    /// or 2, it is the finish_number (diagnostics level, §20.2) and the
+    /// remaining arguments form the `$display`-style message; otherwise every
+    /// argument is the message and finish_number defaults to 1.
+    fn fatal_msg_args<'a>(&mut self, args: &'a [Expression]) -> (&'a [Expression], i32) {
+        if let Some(first) = args.first() {
+            if let ExprKind::Number(NumberLiteral::Integer { value, base: NumberBase::Decimal, .. }) =
+                &first.kind
+            {
+                if let Ok(n) = value.parse::<i64>() {
+                    if (0..=2).contains(&n) {
+                        return (&args[1..], n as i32);
+                    }
+                }
+            }
+        }
+        (args, 1)
+    }
+
+    /// Emit a §20.10 severity-system-task message. Formats the user
+    /// `$display`-style arguments and prefixes a `** <Severity>:` tag plus a
+    /// context line (sim time + hierarchical scope). Routed to both the
+    /// captured output log and stdout, exactly like `$display`.
+    fn emit_severity(&mut self, severity: &str, args: &[Expression]) {
+        let body = if args.is_empty() {
+            String::new()
+        } else {
+            self.format_args(args, "$display")
+        };
+        let scope = self.severity_scope();
+        let time_s = self.format_time_parts(self.time_in_current_unit()).0;
+        let line = if body.is_empty() {
+            format!("** {}", severity)
+        } else {
+            format!("** {}: {}", severity, body)
+        };
+        let ctx = format!("   Time: {}  Scope: {}", time_s.trim(), scope);
+        self.record_output(line.clone());
+        self.record_output(ctx.clone());
+        self.stdout_writeln(&line);
+        self.stdout_writeln(&ctx);
+    }
+
+    /// Write a §20.15 status code to output argument `idx` (if present). The
+    /// status is an `int`; stored as a 32-bit unsigned (sign bit preserved
+    /// via two's complement for the -1 sentinel some stats use).
+    fn assign_q_status(&mut self, args: &[Expression], idx: usize, status: i64) {
+        if let Some(out) = args.get(idx) {
+            self.assign_value(out, &Value::from_u64(status as u32 as u64, 32));
+        }
+    }
+
+    /// §20.15.1 `$q_initialize(q_id, q_type, max_length, status)`. Creates a
+    /// new queue. Status codes: 0 OK, 4 unsupported type, 5 length<=0,
+    /// 6 duplicate q_id (Table 20-11).
+    fn q_initialize_impl(&mut self, args: &[Expression]) -> i64 {
+        let qid = args.get(0).map(|a| self.eval_expr(a).to_u64().unwrap_or(0) as i64).unwrap_or(0);
+        let qtype = args.get(1).map(|a| self.eval_expr(a).to_u64().unwrap_or(0) as i64).unwrap_or(0);
+        let maxlen = args.get(2).map(|a| self.eval_expr(a).to_i64().unwrap_or(0)).unwrap_or(0);
+        if qtype != 1 && qtype != 2 {
+            return 4; // unsupported queue type
+        }
+        if maxlen <= 0 {
+            return 5; // specified length <= 0
+        }
+        if self.queues.contains_key(&qid) {
+            return 6; // duplicate q_id
+        }
+        self.queues.insert(qid, StochasticQueue { q_type: qtype, max_length: maxlen, ..Default::default() });
+        0
+    }
+
+    /// §20.15.2 `$q_add(q_id, job_id, inform_id, status)`. Enqueues an entry
+    /// tagged with the current sim time (for wait statistics). Status codes:
+    /// 0 OK, 1 queue full, 2 undefined q_id.
+    fn q_add_impl(&mut self, args: &[Expression]) -> i64 {
+        let qid = args.get(0).map(|a| self.eval_expr(a).to_u64().unwrap_or(0) as i64).unwrap_or(0);
+        let job = args.get(1).map(|a| self.eval_expr(a).to_u64().unwrap_or(0) as i64).unwrap_or(0);
+        let inform = args.get(2).map(|a| self.eval_expr(a).to_u64().unwrap_or(0) as i64).unwrap_or(0);
+        // §20.15: queue timing statistics are in the same time basis as $time
+        // (the current scope's time unit), not raw simulator ticks. A `#10` in a
+        // 1ns design therefore contributes a wait of 10, not 10000 (ps ticks).
+        let now = self.time_in_current_unit() as i64;
+        let Some(q) = self.queues.get_mut(&qid) else { return 2; };
+        if q.entries.len() >= q.max_length as usize {
+            return 1; // queue full
+        }
+        // inter-arrival statistics (§20.15.5 code 2)
+        q.arrivals += 1;
+        if let Some(last) = q.last_arrival_tick {
+            q.sum_interarrival += now.saturating_sub(last) as i128;
+        }
+        q.last_arrival_tick = Some(now);
+        q.entries.push_back((job, inform, now));
+        if q.entries.len() > q.max_len_seen {
+            q.max_len_seen = q.entries.len();
+        }
+        0
+    }
+
+    /// §20.15.3 `$q_remove(q_id, job_id, inform_id, status)`. Dequeues per the
+    /// queue type (1=FIFO front, 2=LIFO back), writing the entry's job_id and
+    /// inform_id to the output arguments, and accumulating wait statistics.
+    /// Status codes: 0 OK, 2 undefined q_id, 3 queue empty.
+    fn q_remove_impl(&mut self, args: &[Expression]) -> i64 {
+        let qid = args.get(0).map(|a| self.eval_expr(a).to_u64().unwrap_or(0) as i64).unwrap_or(0);
+        let now = self.time_in_current_unit() as i64;
+        // Dequeue + update statistics while holding the mutable queue borrow,
+        // then drop it before assigning the output arguments (which borrow
+        // `self` again via assign_value).
+        let (job, inform, status) = match self.queues.get_mut(&qid) {
+            None => (0i64, 0i64, 2i64), // undefined q_id
+            Some(q) => {
+                let popped = if q.q_type == 2 { q.entries.pop_back() } else { q.entries.pop_front() };
+                match popped {
+                    None => (0, 0, 3), // queue empty
+                    Some((job, inform, arrival)) => {
+                        let wait = now as i64 - arrival as i64;
+                        // shortest wait over removed jobs (code 4)
+                        q.shortest_wait_ever = Some(match q.shortest_wait_ever {
+                            Some(w) => w.min(wait),
+                            None => wait,
+                        });
+                        q.sum_wait_removed += wait as i128;
+                        q.count_wait_removed += 1;
+                        // longest wait over jobs STILL queued (code 5)
+                        q.longest_wait_queued = q
+                            .entries
+                            .iter()
+                            .map(|(_, _, t)| now as i64 - *t as i64)
+                            .max();
+                        (job, inform, 0)
+                    }
+                }
+            }
+        };
+        if status == 0 {
+            if let Some(out) = args.get(1) {
+                self.assign_value(out, &Value::from_u64(job as u32 as u64, 32));
+            }
+            if let Some(out) = args.get(2) {
+                self.assign_value(out, &Value::from_u64(inform as u32 as u64, 32));
+            }
+        }
+        status
+    }
+
+    /// §20.15.5 `$q_exam(q_id, q_stat_code, q_stat_value, status)`. Writes the
+    /// requested statistic (Table 20-10) to `q_stat_value`. The
+    /// time-influenced codes (2/4/5/6) return -1 when insufficient samples
+    /// exist; the LRM leaves their exact computation implementation-defined.
+    fn q_exam_impl(&mut self, args: &[Expression]) -> i64 {
+        let qid = args.get(0).map(|a| self.eval_expr(a).to_u64().unwrap_or(0) as i64).unwrap_or(0);
+        let code = args.get(1).map(|a| self.eval_expr(a).to_u64().unwrap_or(0) as i64).unwrap_or(0);
+        let now = self.time_in_current_unit() as i64;
+        // Compute the statistic while borrowing the queue, then drop the
+        // borrow before assigning the output (which re-borrows `self`).
+        let (val, status) = match self.queues.get(&qid) {
+            None => (0i64, 2i64), // undefined q_id
+            Some(q) => {
+                let v: i64 = match code {
+                    1 => q.entries.len() as i64,                       // current length
+                    2 => if q.arrivals >= 2 {                          // mean interarrival
+                        (q.sum_interarrival / (q.arrivals - 1) as i128) as i64
+                    } else { -1 },
+                    3 => q.max_len_seen as i64,                        // maximum length
+                    4 => q.shortest_wait_ever.unwrap_or(-1),           // shortest wait ever
+                    5 => q.longest_wait_queued.unwrap_or_else(|| {     // longest wait, jobs still queued
+                        q.entries.iter().map(|(_, _, t)| now as i64 - *t as i64).max().unwrap_or(-1)
+                    }),
+                    6 => if q.count_wait_removed >= 1 {                // average wait time
+                        (q.sum_wait_removed / q.count_wait_removed as i128) as i64
+                    } else { -1 },
+                    _ => 0,
+                };
+                (v, 0)
+            }
+        };
+        if let Some(out) = args.get(2) {
+            self.assign_value(out, &Value::from_u64(val as u32 as u64, 32));
+        }
+        status
+    }
+
+    /// §20.15.4 `$q_full(q_id, status)` — system FUNCTION. Returns 1 if the
+    /// queue is full, 0 otherwise; also writes the status code. Status codes:
+    /// 0 OK, 2 undefined q_id.
+    fn q_full_impl(&mut self, args: &[Expression]) -> (i64, i64) {
+        let qid = args.get(0).map(|a| self.eval_expr(a).to_u64().unwrap_or(0) as i64).unwrap_or(0);
+        let Some(q) = self.queues.get(&qid) else { return (0, 2); };
+        let full = if q.entries.len() >= q.max_length as usize { 1 } else { 0 };
+        (full, 0)
+    }
+
+    /// §20.17.1 `$system`. Invokes the host POSIX shell on the command string
+    /// (via `sh -c <cmd>`, mirroring C `system()`); with no argument calls
+    /// `system(NULL)` (returns nonzero when a shell is available). Returns the
+    /// command's exit status as an `int`.
+    fn system_impl(&mut self, args: &[Expression]) -> i32 {
+        match args.first() {
+            None => 1, // system(NULL): a shell is available
+            Some(a) => {
+                let cmd = self.system_string_arg(a);
+                match std::process::Command::new("sh").arg("-c").arg(&cmd).status() {
+                    Ok(s) => s.code().unwrap_or(-1),
+                    Err(_) => -1,
+                }
+            }
+        }
+    }
+
+    /// §20.17.2 `$stacktrace` text. Content is implementation-defined; xezim
+    /// reports the current hierarchical scope (the deepest frame it models at
+    /// runtime) in a `Call Stack:`/`A total of N stack frames` envelope. The
+    /// task form prints this; the function form returns it as a string.
+    fn stacktrace_text(&self) -> String {
+        let scope = self.severity_scope();
+        format!(
+            "Call Stack:\nModule {}\n\nA total of 1 stack frames are displayed.\n",
+            scope
+        )
+    }
+
     fn format_args(&mut self, args: &[Expression], tn: &str) -> String {
         if args.is_empty() {
             return String::new();
@@ -29667,6 +30683,8 @@ impl Simulator {
             'b'
         } else if tn.ends_with('h') {
             'h'
+        } else if tn.ends_with('o') {
+            'o'
         } else {
             'd'
         };
@@ -29708,6 +30726,7 @@ impl Simulator {
                 result.push_str(&match r {
                     'b' => v.to_bin_string(),
                     'h' => v.to_hex_string(),
+                    'o' => Self::bin_to_oct_string(&v.to_bin_string()),
                     _ => v.to_dec_string(),
                 });
             }
@@ -30028,9 +31047,11 @@ impl Simulator {
                                 ai += 1;
                                 match spec {
                                     'd' | 'D' => {
-                                        // §21.2.1.3: default field width is the
-                                        // widest decimal the operand's type can
-                                        // take (sign included), space-padded.
+                                        // §21.2.1.2: default field width is
+                                        // the widest decimal the operand's
+                                        // type can take (sign included).
+                                        // %0d = minimum width; %0Nd zero-pads;
+                                        // %Nd space-pads; %-Nd left-justifies.
                                         let mut core = v.to_dec_string();
                                         if plus_sign && !core.starts_with('-') {
                                             core.insert(0, '+');
@@ -30043,56 +31064,66 @@ impl Simulator {
                                     }
                                     'b' | 'B' => {
                                         let full = v.to_bin_string();
-                                        let core = if zero_pad {
-                                            Self::trim_radix_zeros(&full)
+                                        if has_width {
+                                            Self::push_radix(&mut result, &full, pad_width, left_align, zero_pad);
                                         } else {
-                                            full
-                                        };
-                                        result.push_str(&field(core, 0));
+                                            result.push_str(&full);
+                                        }
                                     }
                                     'h' | 'H' | 'x' | 'X' => {
                                         let full = v.to_hex_string();
-                                        let core = if zero_pad {
-                                            Self::trim_radix_zeros(&full)
+                                        if has_width {
+                                            Self::push_radix(&mut result, &full, pad_width, left_align, zero_pad);
                                         } else {
-                                            full
-                                        };
-                                        result.push_str(&field(core, 0));
+                                            result.push_str(&full);
+                                        }
                                     }
                                     'o' | 'O' => {
                                         // Full width is ceil(bits/3) digits
-                                        // (§21.2.1.3) — "075" for an 8-bit 8'o75.
+                                        // (§21.2.1.3).
                                         let full = Self::bin_to_oct_string(&v.to_bin_string());
-                                        let core = if zero_pad {
-                                            Self::trim_radix_zeros(&full)
+                                        if has_width {
+                                            Self::push_radix(&mut result, &full, pad_width, left_align, zero_pad);
                                         } else {
-                                            full
-                                        };
-                                        result.push_str(&field(core, 0));
+                                            result.push_str(&full);
+                                        }
                                     }
                                     'f' | 'F' => {
-                                        let mut core = format!(
-                                            "{:.*}",
-                                            precision.unwrap_or(6),
-                                            v.to_f64()
-                                        );
+                                        let x = v.to_f64();
+                                        let mut core = Self::nonfinite_float(x, spec == 'F')
+                                            .unwrap_or_else(|| {
+                                                format!("{:.*}", precision.unwrap_or(6), x)
+                                            });
                                         if plus_sign && !core.starts_with('-') {
                                             core.insert(0, '+');
                                         }
                                         result.push_str(&field(core, 0));
                                     }
                                     'g' | 'G' => {
-                                        let s = format!("{:?}", v.to_f64());
+                                        // §21.2.1.2: the `+` flag forces a sign
+                                        // on %g just as it does on %f/%d.
+                                        let x = v.to_f64();
+                                        let mut s = Self::nonfinite_float(x, spec == 'G')
+                                            .unwrap_or_else(|| {
+                                                Self::format_g(x, precision.unwrap_or(6), spec == 'G')
+                                            });
+                                        if plus_sign && !s.starts_with('-') {
+                                            s.insert(0, '+');
+                                        }
                                         result.push_str(&field(s, 0));
                                     }
                                     'e' | 'E' => {
                                         // C-style exponent: `1.0e+02`, two
                                         // exponent digits minimum (§21.2.1.2).
-                                        let core = Self::c_style_exp(
-                                            v.to_f64(),
-                                            precision.unwrap_or(6),
-                                            spec == 'E',
-                                        );
+                                        // The `+` flag forces a leading sign.
+                                        let x = v.to_f64();
+                                        let mut core = Self::nonfinite_float(x, spec == 'E')
+                                            .unwrap_or_else(|| {
+                                                Self::c_style_exp(x, precision.unwrap_or(6), spec == 'E')
+                                            });
+                                        if plus_sign && !core.starts_with('-') {
+                                            core.insert(0, '+');
+                                        }
                                         result.push_str(&field(core, 0));
                                     }
                                     's' | 'S' => {
@@ -30667,6 +31698,9 @@ impl Simulator {
     }
 
     fn check_monitor(&mut self) {
+        if self.monitor_paused {
+            return;
+        }
         if let Some((tn, args)) = self.monitor.clone() {
             self.sync_table_to_hashmap();
             // LRM §21.2.3: $monitor prints once when armed, then again only
@@ -32224,8 +33258,356 @@ impl Simulator {
         std::env::var_os("XEZIM_DUMP_INLINE").is_none()
     }
 
+    // ── $dumpvars scope/name filtering (IEEE 1800-2017 §21.7.1.4) ──────
+    //
+    // The signal table names every object RELATIVE to the top module (`clk`,
+    // `u_sub.c`), but a `$dumpvars` scope argument resolves through
+    // `resolve_hier_name` to an ABSOLUTE path that INCLUDES the top (`top`,
+    // `top.u_sub`). Comparing the two directly never matches, so the extremely
+    // common `$dumpvars(0, top);` selected zero signals and produced an empty
+    // dump. The same copy-pasted filter backed the FST and XTrace dumps.
+
+    /// Rewrite dump scope arguments into the top-relative form the signal table
+    /// uses. `None` means "no filter" — either no arguments at all, or an
+    /// argument naming the top module itself (everything lives under it).
+    fn dump_filter_prefixes(top: &str, scopes: &[String]) -> Option<Vec<String>> {
+        if scopes.is_empty() {
+            return None;
+        }
+        let top_dot = format!("{}.", top);
+        let mut out = Vec::with_capacity(scopes.len());
+        for s in scopes {
+            if s == top {
+                return None;
+            }
+            out.push(
+                s.strip_prefix(top_dot.as_str())
+                    .unwrap_or(s.as_str())
+                    .to_string(),
+            );
+        }
+        Some(out)
+    }
+
+    /// Whether a top-relative signal name is selected by a normalized filter
+    /// list and the `$dumpvars` depth (§21.7.1.4: 0 = all levels below the
+    /// scope, N = N levels starting at the scope; a filter that names a SIGNAL
+    /// rather than a scope always matches exactly).
+    fn dump_name_selected(name: &str, filters: Option<&[String]>, depth: u32) -> bool {
+        // `rest` is the name relative to the selected scope: no dot = level 1.
+        let level_ok = |rest: &str| depth == 0 || (rest.matches('.').count() as u32) < depth;
+        match filters {
+            None => level_ok(name),
+            Some(fs) => fs.iter().any(|f| {
+                if name == f.as_str() {
+                    return true;
+                }
+                match name
+                    .strip_prefix(f.as_str())
+                    .and_then(|r| r.strip_prefix('.'))
+                {
+                    Some(rest) => level_ok(rest),
+                    None => false,
+                }
+            }),
+        }
+    }
+
+    /// The objects a dump should carry, enumerated from the REAL signal table
+    /// (`id_to_name`) rather than the lazily-synced `self.signals` mirror. That
+    /// mirror is only filled by `sync_table_to_hashmap()` when `table_modified`
+    /// is set, so a purely behavioral design (nothing marks the table dirty
+    /// before `$dumpvars`) dumped NOTHING at all.
+    ///
+    /// §21.7.2.1 admits only nets and variables, so the entries that are not
+    /// objects are dropped here: module/interface INSTANCE handles and UNPACKED
+    /// STRUCT aggregates (both of which are really SCOPES and were emitted as
+    /// stuck-at-x 1-bit wires beside their own scope), enum LITERALS (which
+    /// `elaborate` registers as signals), and the base name of an unpacked array
+    /// whose elements are dumped individually.
+    fn dump_signal_names(&self, scopes: &[String], depth: u32) -> Vec<String> {
+        let filters = Self::dump_filter_prefixes(&self.module.name, scopes);
+
+        // Enum literals (`RED`/`GRN`/`BLU`) are registered as signals by
+        // `elaborate::register_*_enum_members` — they are constants, not objects.
+        let mut enum_lits: HashSet<&str> = HashSet::default();
+        for members in self.module.enum_members.values() {
+            for (nm, _) in members {
+                enum_lits.insert(nm.as_str());
+            }
+        }
+
+        // Non-object table entries, computed over the WHOLE table (never over the
+        // selected subset — at `$dumpvars(1, top)` a scope's children are all
+        // filtered out, and an instance handle that is no longer the prefix of
+        // any selected name would leak straight back in as a 1-bit x wire):
+        //
+        //   * every dotted PREFIX of a name is a scope, so a same-named entry is
+        //     an instance handle or an UNPACKED STRUCT aggregate, not an object.
+        //     A PACKED struct is exempt — there the aggregate IS the storage and
+        //     its flattened members are slices of it.
+        //   * every module/interface INSTANCE path (authoritative, and it also
+        //     covers an instance whose module declares nothing at all).
+        //   * the base of an unpacked array whose elements are dumped
+        //     individually (`mem` beside `mem[0]`…`mem[3]`).
+        let n = self.id_to_name.len().min(self.signal_table.len());
+        let mut scope_names: HashSet<&str> = HashSet::default();
+        let mut expanded_bases: HashSet<&str> = HashSet::default();
+        for id in 0..n {
+            let name = self.id_to_name[id].as_ref();
+            let mut cut = 0usize;
+            while let Some(p) = name[cut..].find('.') {
+                let end = cut + p;
+                if !self.module.packed_struct_fields.contains_key(&name[..end]) {
+                    scope_names.insert(&name[..end]);
+                }
+                cut = end + 1;
+            }
+            if let Some(p) = name.find('[') {
+                expanded_bases.insert(&name[..p]);
+            }
+        }
+        for inst in &self.module.instances {
+            scope_names.insert(inst.path.as_str());
+        }
+
+        let mut out: Vec<String> = Vec::new();
+        for id in 0..n {
+            let name = self.id_to_name[id].as_ref();
+            if name.is_empty()
+                || enum_lits.contains(name)
+                || scope_names.contains(name)
+                || expanded_bases.contains(name)
+            {
+                continue;
+            }
+            if !Self::dump_name_selected(name, filters.as_deref(), depth) {
+                continue;
+            }
+            out.push(name.to_string());
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// The signal-table entry that BACKS each dumped name.
+    ///
+    /// An instance port whose actual is a whole net (`.din(src_bus)`) is not a
+    /// second object: inlining gives the formal its own table entry kept in step
+    /// by a port continuous-assign, but `src_bus` and `u_sub.din` are ONE net.
+    /// Verilator collapses them (same `$var` identifier code, one value-change
+    /// record per change); so does Icarus. Dumping them independently doubled the
+    /// records of every hierarchical design and showed one net as two signals.
+    ///
+    /// Resolves alias CHAINS (a port bound to a port bound to a port) up to the
+    /// outermost net that is itself in the dump. A chain stops early at a name
+    /// the current `$dumpvars` scope/depth filter did not select (so
+    /// `$dumpvars(0, top.u_sub)` still dumps `u_sub.din` under its own code), at
+    /// a width change, and at a `real`/`event` boundary — a shared code may only
+    /// carry one width and one record shape.
+    fn dump_backing_ids(&self, names: &[String]) -> HashMap<String, usize> {
+        let selected: HashSet<&str> = names.iter().map(|s| s.as_str()).collect();
+        let tbl_id = |n: &str| -> Option<usize> {
+            match self.signal_name_to_id.get(n) {
+                Some(&i) if i < self.signal_table.len() => Some(i),
+                _ => None,
+            }
+        };
+        let mut out: HashMap<String, usize> = HashMap::default();
+        for name in names {
+            let own = match tbl_id(name.as_str()) {
+                Some(i) => i,
+                None => continue,
+            };
+            let mut rep_name: &str = name.as_str();
+            let mut rep = own;
+            // Bounded walk: a malformed alias cycle must not hang the dump.
+            for _ in 0..64 {
+                let parent = match self.module.port_aliases.get(rep_name) {
+                    Some(p) => p.as_str(),
+                    None => break,
+                };
+                if !selected.contains(parent) {
+                    break;
+                }
+                let pid = match tbl_id(parent) {
+                    Some(i) => i,
+                    None => break,
+                };
+                if self.signal_widths[pid] != self.signal_widths[rep]
+                    || self.lookup_signal_width(parent) != self.lookup_signal_width(rep_name)
+                {
+                    break;
+                }
+                if self.signal_real.get(pid).copied().unwrap_or(false)
+                    != self.signal_real.get(rep).copied().unwrap_or(false)
+                {
+                    break;
+                }
+                // An `event` emits a pulse, not a level — never fold one into a
+                // level signal (or into another event's pulse dedup).
+                if self.module.events.contains(parent) || self.module.events.contains(rep_name) {
+                    break;
+                }
+                rep = pid;
+                rep_name = parent;
+            }
+            out.insert(name.clone(), rep);
+        }
+        out
+    }
+
+    /// §21.7.2.1 `var_type` of a dumped object. Every `$var` used to be
+    /// hardcoded `wire`.
+    fn dump_var_kind(&self, name: &str, id: usize) -> VcdVarKind {
+        if self.module.events.contains(name) {
+            return VcdVarKind::Event;
+        }
+        if self.signal_real.get(id).copied().unwrap_or(false) {
+            return VcdVarKind::Real;
+        }
+        // An array element (`mem[0]`) inherits its base's declared type.
+        let base = match name.find('[') {
+            Some(p) => &name[..p],
+            None => name,
+        };
+        match self.module.var_decl_types.get(base) {
+            Some(DataType::Real { .. }) => return VcdVarKind::Real,
+            Some(DataType::IntegerAtom {
+                kind: IntegerAtomType::Integer,
+                ..
+            }) => return VcdVarKind::Integer,
+            Some(DataType::IntegerAtom {
+                kind: IntegerAtomType::Time,
+                ..
+            }) => return VcdVarKind::Time,
+            Some(DataType::Simple {
+                kind: crate::ast::types::SimpleType::Event,
+                ..
+            }) => return VcdVarKind::Event,
+            _ => {}
+        }
+        if self.module.nets.contains(base) {
+            return VcdVarKind::Wire;
+        }
+        // §21.7.2.1: a variable with no PROCEDURAL driver — driven only by a
+        // continuous assign, or by an instance output port (which inlining
+        // lowers to one) — is a net to a viewer, and Icarus types it `wire`.
+        // §6.5 makes continuous and procedural drivers mutually exclusive on a
+        // variable, so a continuous driver is proof there is no procedural one.
+        // Typing these `reg` made GTKWave colour a driven net as a register.
+        if self.cont_driven.contains(&id) {
+            return VcdVarKind::Wire;
+        }
+        if self.module.parameters.contains_key(base)
+            && self
+                .module
+                .var_decl_types
+                .get(base)
+                .is_none()
+        {
+            return VcdVarKind::Parameter;
+        }
+        VcdVarKind::Reg
+    }
+
+    /// §21.7.2.1 optional bit range on a `$var` reference
+    /// (`$var wire 8 ( hi [15:8] $end`). Without it a `logic [15:8]` shows as
+    /// `[7:0]` in a viewer, and an ascending `logic [0:7]` loses its bit order.
+    ///
+    /// An unpacked-array ELEMENT carries the range too — the index in its
+    /// reference name selects the element, and the range then gives that
+    /// element's own packed bit numbering, exactly as Verilator emits it:
+    ///   `$var wire 8 ) mem[0] [7:0] $end`
+    /// Suppressing it (the old behaviour) left every `mem[i]` un-ranged.
+    fn dump_var_range(&self, name: &str, width: u32) -> Option<(i64, i64)> {
+        // A scalar has no range.
+        if width <= 1 {
+            return None;
+        }
+        let base = match name.find('[') {
+            Some(p) => &name[..p],
+            None => name,
+        };
+        let dims = match self.module.var_decl_types.get(base) {
+            Some(DataType::IntegerVector { dimensions, .. })
+            | Some(DataType::Implicit { dimensions, .. })
+            | Some(DataType::TypeReference { dimensions, .. }) => Some(dimensions),
+            _ => None,
+        };
+        if let Some(dims) = dims {
+            if dims.len() == 1 {
+                if let crate::ast::types::PackedDimension::Range { left, right, .. } = &dims[0] {
+                    let params = Some(&self.module.parameters);
+                    if let (Some(l), Some(r)) = (
+                        super::elaborate::const_eval_i64_with_params(left, params),
+                        super::elaborate::const_eval_i64_with_params(right, params),
+                    ) {
+                        if (l - r).unsigned_abs() + 1 == width as u64 {
+                            return Some((l, r));
+                        }
+                    }
+                }
+            }
+        }
+        if self.module.ascending_packed.contains_key(base) {
+            Some((0, width as i64 - 1))
+        } else {
+            Some((width as i64 - 1, 0))
+        }
+    }
+
+    /// The value to dump for a signal-table id, with `is_real` forced from the
+    /// declaration so a `real` always formats as an `r<decimal>` record even if
+    /// the stored `Value` lost its flag along the way.
+    fn dump_value(&self, id: usize) -> Value {
+        let mut v = self.signal_table[id].clone();
+        if self.signal_real.get(id).copied().unwrap_or(false) {
+            v.is_real = true;
+        }
+        v
+    }
+
+    /// `$date` content. The header used to carry no date at all.
+    fn vcd_date_string() -> String {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let (days, tod) = ((secs / 86_400) as i64, secs % 86_400);
+        // civil_from_days (Howard Hinnant's algorithm), no calendar crate needed.
+        let z = days + 719_468;
+        let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = if m <= 2 { y + 1 } else { y };
+        format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+            y,
+            m,
+            d,
+            tod / 3600,
+            (tod % 3600) / 60,
+            tod % 60
+        )
+    }
+
     /// Start VCD dumping: open file, write header, record initial values
     fn vcd_start_dump(&mut self) {
+        // §21.7.1.2: a repeat `$dumpvars` must NOT re-create the file. The old
+        // sink's background thread is still draining into the same path, so a
+        // second `File::create` interleaves two byte streams into one file and
+        // corrupts it. A second call is a checkpoint of the running dump.
+        if self.vcd_writer.is_some() {
+            self.vcd_dump_all();
+            return;
+        }
         self.sync_table_to_hashmap();
         let filename = self
             .vcd_file
@@ -32245,7 +33627,11 @@ impl Simulator {
         } else {
             None
         };
-        let mut w = match super::vcd_sink::VcdSink::open_file(file, self.dump_writer_threaded(), zstd_level) {
+        let mut w = match super::vcd_sink::VcdSink::open_file(
+            file,
+            self.dump_writer_threaded(),
+            zstd_level,
+        ) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("Warning: cannot create VCD writer for '{}': {}", filename, e);
@@ -32253,47 +33639,51 @@ impl Simulator {
             }
         };
 
-        // Collect and sort signal names for deterministic output.
-        // If `vcd_filter_scopes` is non-empty, only include signals whose
-        // hierarchical name matches one of the scopes (exact match or
-        // prefix match for scope arguments to $dumpvars).
-        let mut sig_names: Vec<String> = if self.vcd_filter_scopes.is_empty() {
-            self.signals.keys().cloned().collect()
-        } else {
-            // Precompute each scope's "<scope>." prefix once (see XTrace note).
-            let filters: Vec<(&str, String)> = self
-                .vcd_filter_scopes
-                .iter()
-                .map(|f| (f.as_str(), format!("{}.", f)))
-                .collect();
-            self.signals
-                .keys()
-                .filter(|name| {
-                    filters
-                        .iter()
-                        .any(|(f, fdot)| name.as_str() == *f || name.starts_with(fdot.as_str()))
-                })
-                .cloned()
-                .collect()
-        };
-        sig_names.sort();
-        eprintln!("[VCD] dumping {} signals (filter_scopes={})",
-                  sig_names.len(), self.vcd_filter_scopes.len());
+        let sig_names = self.dump_signal_names(&self.vcd_filter_scopes, self.vcd_dump_depth);
+        eprintln!(
+            "[VCD] dumping {} signals (filter_scopes={}, depth={})",
+            sig_names.len(),
+            self.vcd_filter_scopes.len(),
+            self.vcd_dump_depth
+        );
 
         // Assign VCD identifier codes. Codes are Arc<str> so the per-change
         // clone in vcd_write_changes is a refcount bump, not a heap alloc.
+        //
+        // §21.7.2.1: "several variables can be mapped to the same identifier
+        // code if the variables would always have identical values" — which is
+        // exactly a net threaded through instance ports. Names that share a
+        // backing signal (see `dump_backing_ids`) therefore share ONE code: each
+        // still gets its own `$var` line in its own `$scope`, but the net emits a
+        // single value-change record instead of one per hierarchical name.
+        let backing = self.dump_backing_ids(&sig_names);
         let mut id_map: HashMap<String, Arc<str>> = HashMap::default();
-        for (idx, name) in sig_names.iter().enumerate() {
-            id_map.insert(name.clone(), Arc::from(Self::vcd_id_code(idx)));
+        let mut code_of_backing: HashMap<usize, Arc<str>> = HashMap::default();
+        for name in sig_names.iter() {
+            let rep = match backing.get(name.as_str()) {
+                Some(&r) => r,
+                // No backing signal — never declared, never dumped.
+                None => continue,
+            };
+            let code = match code_of_backing.get(&rep) {
+                Some(c) => c.clone(),
+                None => {
+                    let c: Arc<str> = Arc::from(Self::vcd_id_code(code_of_backing.len()));
+                    code_of_backing.insert(rep, c.clone());
+                    c
+                }
+            };
+            id_map.insert(name.clone(), code);
         }
 
         // Write VCD header. The timescale is derived from the sim's actual
         // finest precision (tick_s), not hardcoded — a fixed "1ns" mislabels
         // designs with finer precision (e.g. c910 runs at 100ps).
-        let _ = writeln!(w, "$date\n  Simulation generated by xezim\n$end");
-        let _ = writeln!(w, "$version\n  xezim 0.1\n$end");
+        let mut hdr: Vec<u8> = Vec::with_capacity(4096);
+        let _ = writeln!(hdr, "$date\n  {}\n$end", Self::vcd_date_string());
+        let _ = writeln!(hdr, "$version\n  xezim {}\n$end", env!("CARGO_PKG_VERSION"));
         let _ = writeln!(
-            w,
+            hdr,
             "$timescale\n  {}\n$end",
             Self::xtrace_timescale_str(self.module.tick_s)
         );
@@ -32303,9 +33693,16 @@ impl Simulator {
         // Signal "clk" → hierarchy [], leaf "clk"
         // Signal "uut.cpuregs[5]" → hierarchy ["uut"], leaf "cpuregs[5]"
         use std::collections::BTreeMap;
+        struct VcdVar {
+            leaf: String,
+            width: u32,
+            id: Arc<str>,
+            kind: VcdVarKind,
+            range: Option<(i64, i64)>,
+        }
         struct ScopeNode {
             children: BTreeMap<String, ScopeNode>,
-            signals: Vec<(String, u32, Arc<str>)>, // (leaf_name, width, vcd_id)
+            signals: Vec<VcdVar>,
         }
         impl ScopeNode {
             fn new() -> Self {
@@ -32318,7 +33715,18 @@ impl Simulator {
 
         let mut root = ScopeNode::new();
         for name in &sig_names {
+            let tbl_id = match self.signal_name_to_id.get(name.as_str()) {
+                Some(&i) if i < self.signal_table.len() => i,
+                _ => continue,
+            };
             let width = self.lookup_signal_width(name).unwrap_or(1);
+            let kind = self.dump_var_kind(name, tbl_id);
+            let range = match kind {
+                // A `real` is always declared 64 bits wide with no range, and an
+                // `event` is a 1-bit pulse.
+                VcdVarKind::Real | VcdVarKind::Event => None,
+                _ => self.dump_var_range(name, width),
+            };
             let id = id_map[name].clone();
             // Split into hierarchy parts
             let parts: Vec<&str> = name.split('.').collect();
@@ -32335,17 +33743,57 @@ impl Simulator {
                     .entry(part.to_string())
                     .or_insert_with(ScopeNode::new);
             }
-            node.signals.push((leaf.to_string(), width, id));
+            node.signals.push(VcdVar {
+                leaf: leaf.to_string(),
+                width,
+                id,
+                kind,
+                range,
+            });
+        }
+
+        // §21.7.2.1 declaration of one object.
+        fn emit_var(w: &mut impl Write, v: &VcdVar) {
+            match v.kind {
+                VcdVarKind::Real => {
+                    let _ = writeln!(w, "$var real 64 {} {} $end", v.id, v.leaf);
+                }
+                VcdVarKind::Event => {
+                    let _ = writeln!(w, "$var event 1 {} {} $end", v.id, v.leaf);
+                }
+                k => match v.range {
+                    Some((l, r)) => {
+                        let _ = writeln!(
+                            w,
+                            "$var {} {} {} {} [{}:{}] $end",
+                            k.keyword(),
+                            v.width,
+                            v.id,
+                            v.leaf,
+                            l,
+                            r
+                        );
+                    }
+                    None => {
+                        let _ = writeln!(
+                            w,
+                            "$var {} {} {} {} $end",
+                            k.keyword(),
+                            v.width,
+                            v.id,
+                            v.leaf
+                        );
+                    }
+                },
+            }
         }
 
         // Emit VCD scopes recursively
         fn emit_scope(w: &mut impl Write, name: &str, node: &ScopeNode) {
             let _ = writeln!(w, "$scope module {} $end", name);
-            // Emit signals at this level
-            for (leaf, width, id) in &node.signals {
-                let _ = writeln!(w, "$var wire {} {} {} $end", width, id, leaf);
+            for v in &node.signals {
+                emit_var(w, v);
             }
-            // Emit child scopes
             for (child_name, child_node) in &node.children {
                 emit_scope(w, child_name, child_node);
             }
@@ -32353,113 +33801,164 @@ impl Simulator {
         }
 
         // Use actual top module name
-        let top_name = &self.module.name;
-        let _ = writeln!(w, "$scope module {} $end", top_name);
-        // Emit top-level signals (no dot prefix)
-        for (leaf, width, id) in &root.signals {
-            let _ = writeln!(w, "$var wire {} {} {} $end", width, id, leaf);
+        let top_name = self.module.name.clone();
+        let _ = writeln!(hdr, "$scope module {} $end", top_name);
+        for v in &root.signals {
+            emit_var(&mut hdr, v);
         }
-        // Emit sub-module scopes
         for (child_name, child_node) in &root.children {
-            emit_scope(&mut w, child_name, child_node);
+            emit_scope(&mut hdr, child_name, child_node);
         }
-        let _ = writeln!(w, "$upscope $end");
-
-        let _ = writeln!(w, "$enddefinitions $end");
+        let _ = writeln!(hdr, "$upscope $end");
+        let _ = writeln!(hdr, "$enddefinitions $end");
 
         // Build the compact per-cycle trace table: (signal_table index, code).
         // Initial values are written below and seeded into vcd_prev_signals so
         // the first vcd_write_changes only emits actual transitions.
         let mut trace: Vec<(usize, Arc<str>)> = Vec::with_capacity(sig_names.len());
+        let mut kinds: Vec<VcdVarKind> = Vec::with_capacity(sig_names.len());
         let mut prev: Vec<Value> = Vec::with_capacity(sig_names.len());
 
-        // Write initial values
-        let _ = writeln!(w, "$dumpvars");
+        // §21.7.1.4: the `$dumpvars` checkpoint is the state at the CURRENT sim
+        // time. Without the `#t` marker a dump started mid-run (e.g. at t=23) is
+        // placed at t=0 by every viewer.
+        let _ = writeln!(hdr, "#{}", self.time);
+        let _ = writeln!(hdr, "$dumpvars");
+        // One trace entry — and one checkpoint record — per BACKING signal, not
+        // per name: the aliased names of a port-connected net share a code, so a
+        // per-name loop would emit the same record two or three times over.
+        let mut traced: HashSet<usize> = HashSet::default();
         for name in &sig_names {
-            let id = match self.signal_name_to_id.get(name.as_str()) {
-                Some(&i) if i < self.signal_table.len() => i,
+            let sid = match backing.get(name.as_str()) {
+                Some(&i) => i,
                 _ => continue,
             };
-            let val = self.signal_table[id].clone();
+            if !traced.insert(sid) {
+                continue;
+            }
+            let kind = self.dump_var_kind(name, sid);
             let code = id_map[name].clone();
-            Self::vcd_write_value(&mut w, &val, &code);
-            prev.push(val);
-            trace.push((id, code));
+            // An `event` has no level, so it contributes no checkpoint record —
+            // it only ever emits a `1<id>` pulse when triggered.
+            if kind != VcdVarKind::Event {
+                let val = self.dump_value(sid);
+                super::vcd_sink::write_vcd_value(&mut hdr, &val, &code);
+            }
+            prev.push(self.signal_table[sid].clone());
+            kinds.push(kind);
+            trace.push((sid, code));
         }
-        let _ = writeln!(w, "$end");
+        let _ = writeln!(hdr, "$end");
 
+        let nbytes = hdr.len() as u64;
+        let _ = w.write_all(&hdr);
+
+        self.vcd_event_last = vec![u64::MAX; trace.len()];
         self.vcd_trace = trace;
+        self.vcd_var_kinds = kinds;
         self.vcd_prev_signals = prev;
         self.vcd_writer = Some(w);
         self.vcd_enabled = true;
+        self.vcd_bytes = 0;
+        self.vcd_limit_hit = false;
         self.vcd_last_time = self.time;
+        self.vcd_account_bytes(nbytes);
     }
 
-    /// Write a single value to VCD
-    fn vcd_write_value(w: &mut impl Write, val: &Value, id: &str) {
-        if val.width == 1 {
-            // Scalar: single char + id
-            let ch = match val.bits_first() {
-                LogicBit::Zero => '0',
-                LogicBit::One => '1',
-                LogicBit::X => 'x',
-                LogicBit::Z => 'z',
-            };
-            let _ = writeln!(w, "{}{}", ch, id);
+    // NOTE: `Simulator::vcd_write_value` is GONE. It was a second, divergent
+    // copy of `vcd_sink::write_vcd_value` (the two disagreed about `real` and
+    // about leading-zero suppression, so a value's spelling depended on whether
+    // it went out through the header path or the sink's writer thread). There is
+    // now exactly one VCD value formatter, in `vcd_sink`, and every path uses it.
+
+    /// Byte length of the value-change record the sink will format for `val`.
+    /// The sink formats batched changes on its own thread, so `$dumplimit`
+    /// sizes them here instead of materializing them.
+    fn vcd_record_len(val: &Value, code: &str) -> u64 {
+        let body = if val.is_real {
+            22 // "r" + decimal + " "
+        } else if val.width == 1 {
+            1
         } else {
-            // Vector: b<bits> <id>
-            let mut s = String::with_capacity(val.width as usize + 2);
-            s.push('b');
-            let mut all_zero = true;
-            for i in (0..val.width as usize).rev() {
-                let ch = match val.get_bit(i) {
-                    LogicBit::Zero => {
-                        if !all_zero {
-                            s.push('0');
-                        }
-                        '0'
-                    }
-                    LogicBit::One => {
-                        all_zero = false;
-                        s.push('1');
-                        '1'
-                    }
-                    LogicBit::X => {
-                        all_zero = false;
-                        s.push('x');
-                        'x'
-                    }
-                    LogicBit::Z => {
-                        all_zero = false;
-                        s.push('z');
-                        'z'
-                    }
-                };
-                let _ = ch;
-            }
-            if all_zero {
-                s.push('0');
-            }
-            let _ = writeln!(w, "{} {}", s, id);
+            2 + val.width as u64 // "b" + bits + " "
+        };
+        body + code.len() as u64 + 1 // + '\n'
+    }
+
+    /// §21.7.1.8 `$dumplimit(n)`: stop dumping once the file reaches `n` bytes.
+    fn vcd_account_bytes(&mut self, n: u64) {
+        if self.vcd_limit_hit {
+            return;
         }
+        self.vcd_bytes += n;
+        let limit = match self.vcd_limit {
+            Some(l) => l,
+            None => return,
+        };
+        if self.vcd_bytes >= limit {
+            self.vcd_limit_hit = true;
+            if let Some(w) = self.vcd_writer.as_mut() {
+                let _ = writeln!(
+                    w,
+                    "$comment $dumplimit of {} bytes reached — dumping stopped $end",
+                    limit
+                );
+                let _ = w.flush();
+            }
+        }
+    }
+
+    /// Hand a fully formatted record block to the sink and bill it to the limit.
+    fn vcd_emit(&mut self, buf: Vec<u8>) {
+        if self.vcd_limit_hit {
+            return;
+        }
+        if let Some(w) = self.vcd_writer.as_mut() {
+            let _ = w.write_all(&buf);
+        }
+        self.vcd_account_bytes(buf.len() as u64);
     }
 
     /// Write VCD value changes for the current timestep
     fn vcd_write_changes(&mut self) {
-        if !self.vcd_enabled || self.vcd_writer.is_none() {
+        if !self.vcd_enabled || self.vcd_writer.is_none() || self.vcd_limit_hit {
             return;
         }
 
         // Walk the compact trace table directly: no name hashing, and
         // vcd_prev_signals is a parallel Vec<Value> (index == position in
         // vcd_trace), so change detection is a single indexed compare.
+        let now = self.time;
         let mut changes: Vec<(Arc<str>, Value)> = Vec::new();
         for idx in 0..self.vcd_trace.len() {
             let id = self.vcd_trace[idx].0;
+            if self.vcd_var_kinds[idx] == VcdVarKind::Event {
+                // §21.7.2.1: an event has no level — it emits a bare `1<id>`
+                // record at EVERY trigger. Treating it as a level signal with
+                // prev!=cur dedup drops a repeat `->ev` whose 0→1→0 toggle
+                // cancels inside one time slot.
+                let fired = self
+                    .id_to_name
+                    .get(id)
+                    .and_then(|n| self.event_triggered_time.get(n.as_ref()))
+                    .copied()
+                    == Some(now);
+                if fired && self.vcd_event_last[idx] != now {
+                    self.vcd_event_last[idx] = now;
+                    changes.push((self.vcd_trace[idx].1.clone(), Value::ones(1)));
+                }
+                // Keep the level mirror in step so the toggle never leaks out.
+                self.vcd_prev_signals[idx] = self.signal_table[id].clone();
+                continue;
+            }
             let val = &self.signal_table[id];
             if self.vcd_prev_signals[idx] != *val {
-                changes.push((self.vcd_trace[idx].1.clone(), val.clone()));
+                let mut out = val.clone();
+                if self.signal_real.get(id).copied().unwrap_or(false) {
+                    out.is_real = true;
+                }
                 self.vcd_prev_signals[idx] = val.clone();
+                changes.push((self.vcd_trace[idx].1.clone(), out));
             }
         }
 
@@ -32474,17 +33973,147 @@ impl Simulator {
             None
         };
 
+        let mut nbytes = if time_marker.is_some() { 12 } else { 0 };
+        for (code, val) in &changes {
+            nbytes += Self::vcd_record_len(val, code);
+        }
+
+        if let Some(sink) = self.vcd_writer.as_mut() {
+            sink.post_vcd_changes(time_marker, changes);
+        }
+        self.vcd_account_bytes(nbytes);
+    }
+
+    /// Emit a `$dumpall` / `$dumpon` checkpoint (§21.7.1.5, §21.7.1.7): the
+    /// CURRENT value of every dumped variable, bracketed by the keyword and
+    /// `$end` and stamped with the current time.
+    fn vcd_checkpoint(&mut self, keyword: &str) {
+        if self.vcd_writer.is_none() || self.vcd_limit_hit {
+            return;
+        }
+        let mut buf: Vec<u8> = Vec::new();
+        let _ = writeln!(buf, "#{}", self.time);
+        let _ = writeln!(buf, "{}", keyword);
+        for idx in 0..self.vcd_trace.len() {
+            // An event has no level to check-point.
+            if self.vcd_var_kinds[idx] == VcdVarKind::Event {
+                continue;
+            }
+            let sid = self.vcd_trace[idx].0;
+            let val = self.dump_value(sid);
+            let code = self.vcd_trace[idx].1.clone();
+            super::vcd_sink::write_vcd_value(&mut buf, &val, &code);
+            self.vcd_prev_signals[idx] = self.signal_table[sid].clone();
+        }
+        let _ = writeln!(buf, "$end");
+        self.vcd_last_time = self.time;
+        self.vcd_emit(buf);
+    }
+
+    /// §21.7.1.5 `$dumpall` — checkpoint every dumped variable.
+    fn vcd_dump_all(&mut self) {
+        if !self.vcd_enabled {
+            return;
+        }
+        self.vcd_write_changes();
+        self.vcd_checkpoint("$dumpall");
+    }
+
+    /// §21.7.1.6 `$dumpoff` — suspend dumping. The suspended window must be
+    /// marked: every dumped variable goes to x (a `real` to z), so a viewer
+    /// paints the window as unknown instead of holding a stale, false level.
+    /// Merely flipping a bool (the old behaviour) leaves the last value on
+    /// screen across the whole off-window.
+    fn vcd_dump_off(&mut self) {
+        if self.vcd_writer.is_none() || !self.vcd_enabled || self.vcd_limit_hit {
+            return;
+        }
+        // Flush anything that changed at this time before freezing.
+        self.vcd_write_changes();
+        let mut buf: Vec<u8> = Vec::new();
+        let _ = writeln!(buf, "#{}", self.time);
+        let _ = writeln!(buf, "$dumpoff");
+        for idx in 0..self.vcd_trace.len() {
+            let code = self.vcd_trace[idx].1.clone();
+            match self.vcd_var_kinds[idx] {
+                VcdVarKind::Event => {}
+                VcdVarKind::Real => {
+                    let _ = writeln!(buf, "z{}", code);
+                }
+                _ => {
+                    let width = self.signal_table[self.vcd_trace[idx].0].width;
+                    if width == 1 {
+                        let _ = writeln!(buf, "x{}", code);
+                    } else {
+                        let _ = writeln!(buf, "bx {}", code);
+                    }
+                }
+            }
+        }
+        let _ = writeln!(buf, "$end");
+        self.vcd_last_time = self.time;
+        self.vcd_emit(buf);
+        self.vcd_enabled = false;
+    }
+
+    /// §21.7.1.7 `$dumpon` — resume dumping, re-stating the current value of
+    /// every dumped variable so the viewer recovers from the x window.
+    fn vcd_dump_on(&mut self) {
+        if self.vcd_writer.is_none() || self.vcd_enabled || self.vcd_limit_hit {
+            return;
+        }
+        self.vcd_enabled = true;
+        self.vcd_checkpoint("$dumpon");
+    }
+
+    /// Flush and close VCD file
+    fn vcd_finish(&mut self) {
+        if self.vcd_writer.is_some() {
+            self.vcd_write_changes();
+            // Close the wave window at the final simulation time: without a
+            // trailing `#t` a viewer stops at the last TRANSITION, so the tail
+            // of the run is missing from the waveform.
+            if self.time > self.vcd_last_time && !self.vcd_limit_hit {
+                let t = self.time;
+                self.vcd_emit(format!("#{}\n", t).into_bytes());
+                self.vcd_last_time = t;
+            }
+        }
+        if let Some(ref mut w) = self.vcd_writer {
+            let _ = w.flush();
+        }
+        self.vcd_writer = None;
+    }
+
+    /// §21.7.1.4 `$dumpall`: emit a checkpoint of ALL current signal values,
+    /// regardless of whether they changed.
+    fn vcd_dump_checkpoint(&mut self) {
+        if !self.vcd_enabled || self.vcd_writer.is_none() {
+            return;
+        }
+        let mut changes: Vec<(Arc<str>, Value)> = Vec::new();
+        for idx in 0..self.vcd_trace.len() {
+            let id = self.vcd_trace[idx].0;
+            let val = self.signal_table[id].clone();
+            changes.push((self.vcd_trace[idx].1.clone(), val.clone()));
+            self.vcd_prev_signals[idx] = val;
+        }
+        let time_marker = if self.time != self.vcd_last_time {
+            self.vcd_last_time = self.time;
+            Some(self.time)
+        } else {
+            None
+        };
         if let Some(sink) = self.vcd_writer.as_mut() {
             sink.post_vcd_changes(time_marker, changes);
         }
     }
 
-    /// Flush and close VCD file
-    fn vcd_finish(&mut self) {
+    /// §21.7.1.6 `$dumpflush`: flush the VCD writer buffer to disk.
+    fn vcd_flush(&mut self) {
         if let Some(ref mut w) = self.vcd_writer {
             let _ = w.flush();
         }
-        self.vcd_writer = None;
     }
 
     /// Hand a put/try_put value to a parked mailbox get/peek waiter. The assign
@@ -32939,15 +34568,22 @@ impl Simulator {
     }
 
     // ═══════════════════════════════════════════════════════════════
-    // XTrace v1.0 dump support (XTrace_Specification_v1_0.txt)
+    // XTrace dump support (XTrace_Specification_v1_0.txt)
     // ═══════════════════════════════════════════════════════════════
     //
-    // Emits the "minimal" profile: dictionary + per-cycle signal deltas
-    // (a VCD-equivalent payload, under the @xtrace 1.0 header).
+    // CONFORMANCE LEVEL 0 (§24 "minimal"): dictionary (§9) + time (§10.1) +
+    // signal deltas (§10.2/§10.3), and nothing else — with ONE exception, the
+    // §10.4 `X` event record. An SV `event` has no level, so no D/P record can
+    // represent it (`->e` three times in a row is three events, not a toggling
+    // bit); §10.4/§19.5 define exactly the record for it, and `@capabilities`
+    // declares it.
+    //
+    // The semantic layer is deliberately ABSENT: no transactions (Q/TQ), no
+    // assertions (A), no enums (E), no source maps (F/SL), no memory records
+    // (MW/MR/MB), no context snapshots (N,ctx). The header says so honestly —
+    // `@profile minimal`, `@capabilities signal_delta|events` — rather than
+    // claiming the Appendix-A `xezim_ai_debug` profile we do not implement.
 
-    /// Format a Value per XTrace §13 / §A.6 4-state value semantics.
-    /// Fully-known values use 0xHEX; values with X/Z fall back to the
-    /// per-bit representation so unknowns aren't silently lost.
     /// Render the dump timescale string (e.g. "1ns", "100ps") from `tick_s`,
     /// the seconds-per-tick of the simulator's finest timescale precision.
     /// `T,+delta` records count these ticks, so the header MUST match — a
@@ -32970,12 +34606,99 @@ impl Simulator {
         "1fs".to_string()
     }
 
-    fn xtrace_format_value(val: &Value) -> String {
+    /// XTrace signal ids, in the compact spelling the 0.1.2 producer used (and
+    /// the reference traces carry): `a`..`z`, `A`..`Z`, `0`..`9`, then `ab`,
+    /// `bb`, ... A dictionary of a few thousand nets stays at 1-2 characters,
+    /// and every D/P record pays for it on every line.
+    fn xtrace_id_code(mut idx: usize) -> String {
+        const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        let base = ALPHABET.len();
+        let mut code = String::new();
+        loop {
+            code.push(ALPHABET[idx % base] as char);
+            idx /= base;
+            if idx == 0 {
+                break;
+            }
+            idx -= 1;
+        }
+        code
+    }
+
+    /// Format a `Value` as an XTrace value token (§15).
+    ///
+    /// * `real` (`is_real`): a DECIMAL number — the same spelling the VCD path
+    ///   uses (`vcd_sink::vcd_real_string`). §9.3's type list is *recommended*,
+    ///   not exhaustive, so a `real` signal type carrying a decimal value is a
+    ///   legitimate producer choice; §15.1 explicitly allows decimal "where
+    ///   semantically better". The old code never checked `is_real` and emitted
+    ///   the raw IEEE-754 bit pattern as an integer, so `real r = 3.25` came out
+    ///   as `0x400a000000000000` — which a consumer decodes as the integer
+    ///   -4609434218613702656.
+    /// * fully-known: `0x<hex>`.
+    /// * all-x / all-z: the compact `X` / `Z` forms of §15.3. A 128-bit all-z
+    ///   net then costs 1 byte on the line instead of 130; 4-state designs sit
+    ///   at x/z for most of reset, and full-width binary made XTrace several
+    ///   times LARGER than the equivalent VCD.
+    /// * mixed x/z: FULL-WIDTH `0b<bits>`, every bit spelled out. VCD's
+    ///   leading-run suppression is deliberately NOT copied: it is legal there
+    ///   only because §21.7.2.1 defines a left-EXTENSION rule for a value
+    ///   shorter than its `$var` width. XTrace defines no such rule anywhere,
+    ///   so a partially collapsed vector would be unparseable (nothing tells a
+    ///   consumer how many bits were dropped, or what to refill them with).
+    fn xtrace_format_value(val: &Value, is_real: bool, is_string: bool) -> String {
+        if is_string {
+            // §9.3 `str` type + §15.4: a string signal is emitted as a quoted,
+            // escaped literal, not a 1024-bit hex blob. §8.5 escapes only.
+            let mut s = String::with_capacity(val.width as usize / 8 + 2);
+            s.push('"');
+            for b in val.sv_string_bytes() {
+                match b {
+                    b'\\' => s.push_str("\\\\"),
+                    b'"' => s.push_str("\\\""),
+                    b'\n' => s.push_str("\\n"),
+                    b'\t' => s.push_str("\\t"),
+                    // A raw comma inside a quoted value is spec-legal (a parser
+                    // that honours quotes handles it), but XTrace records are
+                    // comma-delimited and design goal #1 is "easy to parse", so
+                    // escape it via §8.5 `\xHH` to stay safe for naive splitters.
+                    b',' => s.push_str("\\x2c"),
+                    0x20..=0x7e => s.push(b as char),
+                    other => s.push_str(&format!("\\x{:02x}", other)),
+                }
+            }
+            s.push('"');
+            return s;
+        }
+        if is_real || val.is_real {
+            return super::vcd_sink::vcd_real_string(val.to_f64());
+        }
         if val.has_xz() {
+            let w = val.width as usize;
+            // §15.3 compact unknowns: `X` iff EVERY bit is x, `Z` iff every bit
+            // is z. A mixed vector (or one with known bits) keeps full width.
+            let (mut all_x, mut all_z) = (true, true);
+            for i in 0..w {
+                match val.get_bit(i) {
+                    LogicBit::X => all_z = false,
+                    LogicBit::Z => all_x = false,
+                    _ => {
+                        all_x = false;
+                        all_z = false;
+                        break;
+                    }
+                }
+            }
+            if w > 0 && all_x {
+                return "X".to_string();
+            }
+            if w > 0 && all_z {
+                return "Z".to_string();
+            }
             // Per-bit binary representation preserves X/Z exactly.
-            let mut s = String::with_capacity(val.width as usize + 2);
+            let mut s = String::with_capacity(w + 2);
             s.push_str("0b");
-            for i in (0..val.width as usize).rev() {
+            for i in (0..w).rev() {
                 s.push(match val.get_bit(i) {
                     LogicBit::Zero => '0',
                     LogicBit::One => '1',
@@ -33011,13 +34734,13 @@ impl Simulator {
         }
     }
 
-    /// Open the XTrace file and emit `@xtrace 1.0` header + `@section dict`
-    /// + initial state snapshot. Called once at the start of `run()` when
+    /// Open the XTrace file and emit the §6 header + `@section dict` + the
+    /// initial state snapshot. Called once at the start of `run()` when
     /// `xtrace_file` is set.
     fn xtrace_start_dump(&mut self) {
         // Signal count above which an unscoped (whole-design) dump is flagged.
         const XTRACE_UNSCOPED_WARN: usize = 100_000;
-        let filename = match self.xtrace_file.clone() {
+        let requested = match self.xtrace_file.clone() {
             Some(f) => f,
             None => return,
         };
@@ -33030,6 +34753,22 @@ impl Simulator {
         } else {
             (self.xtrace_to_ns as f64 * scale) as u64
         };
+
+        // §6.8 `@compression`: zstd is selected by a `.zst`/`.zstd` suffix or
+        // explicitly by `--xtrace-compress zstd` (which then names the file
+        // `.zst` so the transport is self-describing). The header MUST declare
+        // it — a file that is silently zstd-framed while its own header says
+        // `none` is a conformance bug a consumer cannot recover from.
+        let opts = xtrace_options();
+        let suffix_zstd = requested.ends_with(".zst") || requested.ends_with(".zstd");
+        let compress_zstd = suffix_zstd || opts.compress.as_deref() == Some("zstd");
+        let filename = if compress_zstd && !suffix_zstd {
+            format!("{}.zst", requested)
+        } else {
+            requested
+        };
+        let profile = opts.profile.as_deref().unwrap_or("minimal").to_string();
+
         let file = match std::fs::File::create(&filename) {
             Ok(f) => f,
             Err(e) => {
@@ -33037,12 +34776,7 @@ impl Simulator {
                 return;
             }
         };
-        // Compress the byte stream when the target is a `.zst`/`.zstd` file.
-        let zstd_level = if filename.ends_with(".zst") || filename.ends_with(".zstd") {
-            Some(3)
-        } else {
-            None
-        };
+        let zstd_level = if compress_zstd { Some(3) } else { None };
         let mut w = match super::vcd_sink::VcdSink::open_file(file, self.dump_writer_threaded(), zstd_level) {
             Ok(s) => s,
             Err(e) => {
@@ -33051,31 +34785,12 @@ impl Simulator {
             }
         };
 
-        // Collect signal names to trace. When `xtrace_scopes` is non-empty,
-        // restrict to signals whose hierarchical name matches one of the
-        // scopes exactly or sits underneath it (prefix + '.'). Sorted for
-        // deterministic dictionary IDs.
-        let mut sig_names: Vec<String> = if self.xtrace_scopes.is_empty() {
-            self.signals.keys().cloned().collect()
-        } else {
-            // Precompute each scope's "<scope>." prefix ONCE rather than
-            // re-allocating it per (signal × filter) inside the hot filter loop.
-            let filters: Vec<(&str, String)> = self
-                .xtrace_scopes
-                .iter()
-                .map(|f| (f.as_str(), format!("{}.", f)))
-                .collect();
-            self.signals
-                .keys()
-                .filter(|name| {
-                    filters
-                        .iter()
-                        .any(|(f, fdot)| name.as_str() == *f || name.starts_with(fdot.as_str()))
-                })
-                .cloned()
-                .collect()
-        };
-        sig_names.sort();
+        // Collect signal names to trace. Shares `$dumpvars`'s enumeration: the
+        // REAL signal table (not the lazily-synced `self.signals` mirror, which
+        // is empty unless something dirtied the table first) and the same
+        // top-relative scope normalization, so `--xtrace-scope top.u_sub` and
+        // `--xtrace-scope u_sub` both match. Sorted for deterministic IDs.
+        let sig_names: Vec<String> = self.dump_signal_names(&self.xtrace_scopes, 0);
         if !self.xtrace_scopes.is_empty() {
             eprintln!(
                 "[XTrace] dumping {} signals (scopes={})",
@@ -33103,35 +34818,56 @@ impl Simulator {
         modules.push(("m0".to_string(), top_path.clone()));
         module_map.insert(top_path.clone(), "m0".to_string());
 
-        // Assign signal IDs and build S records. IDs are keyed by the backing
-        // `signal_table` index so that aliased nets (several hierarchical names
-        // resolving to the SAME signal) share ONE sid — VCD-style aliasing.
-        // Change records are then emitted once per net instead of once per
-        // name, shrinking the dump and the per-step change scan on alias-heavy
-        // designs. Every name still gets its own S record, so the full
-        // hierarchy stays navigable. `trace` (unique id → sid, in first-seen
-        // order) is the compact table reused at t=0 and every step.
-        let mut id_to_sid: HashMap<usize, String> = HashMap::default();
-        let mut id_map: HashMap<String, String> = HashMap::default();
-        let mut signal_records: Vec<String> = Vec::new();
-        let mut trace: Vec<(usize, String)> = Vec::new();
-        for name in sig_names.iter() {
-            let tbl_id = match self.signal_name_to_id.get(name.as_str()) {
-                Some(&i) if i < self.signal_table.len() => i,
-                // Unresolved name: no backing signal to trace. Skip it (the
-                // old t=0 snapshot loop dropped these too).
-                _ => continue,
-            };
-            let sid = if let Some(existing) = id_to_sid.get(&tbl_id) {
-                existing.clone()
-            } else {
-                let sid = format!("s{}", trace.len());
-                id_to_sid.insert(tbl_id, sid.clone());
-                trace.push((tbl_id, sid.clone()));
-                sid
-            };
-            id_map.insert(name.clone(), sid.clone());
+        // Port-connected nets resolve to ONE backing signal (see
+        // `dump_backing_ids`): `.din(src_bus)` and `src_bus` are one net.
+        let xt_backing = self.dump_backing_ids(&sig_names);
 
+        // §19.2: "once introduced, an ID retains its meaning" — so two names may
+        // NOT share one signal_id, as the old code had them do (a port-connected
+        // net emitted TWO `S` records carrying the SAME id; a parser keyed on the
+        // id clobbered one of them). Every NAME gets its own id here, and the
+        // names that resolve to the same backing net carry §9.2's
+        // `alias=<canonical_signal_id>` instead. Only the canonical id emits
+        // value deltas, so the record count is unchanged.
+        //
+        // The canonical name is the one that IS the backing net (`src_bus`, not
+        // `u_sub.din`); when the backing net itself is outside the dump (scope
+        // filter), the first name in sorted order stands in for it.
+        let mut canon_name: HashMap<usize, String> = HashMap::default();
+        for name in sig_names.iter() {
+            let Some(&tbl_id) = xt_backing.get(name.as_str()) else {
+                continue;
+            };
+            if self.signal_name_to_id.get(name.as_str()) == Some(&tbl_id) {
+                canon_name.entry(tbl_id).or_insert_with(|| name.clone());
+            }
+        }
+        // Ids are assigned over the WHOLE dictionary first: an alias that sorts
+        // before its canonical name still has to name it.
+        let mut entries: Vec<(&str, usize, String)> = Vec::with_capacity(sig_names.len());
+        for name in sig_names.iter() {
+            let Some(&tbl_id) = xt_backing.get(name.as_str()) else {
+                // Unresolved name: no backing signal to trace.
+                continue;
+            };
+            canon_name.entry(tbl_id).or_insert_with(|| name.clone());
+            let sid = Self::xtrace_id_code(entries.len());
+            entries.push((name.as_str(), tbl_id, sid));
+        }
+        let mut canon_sid: HashMap<usize, String> = HashMap::default();
+        for (name, tbl_id, sid) in &entries {
+            if canon_name.get(tbl_id).map(|c| c.as_str()) == Some(*name) {
+                canon_sid.insert(*tbl_id, sid.clone());
+            }
+        }
+
+        let mut signal_records: Vec<String> = Vec::with_capacity(entries.len());
+        // The compact per-NET tables reused at t=0 and every step.
+        let mut trace: Vec<(usize, String)> = Vec::new();
+        let mut reals: Vec<bool> = Vec::new();
+        let mut strings: Vec<bool> = Vec::new();
+        let mut events: Vec<(usize, String)> = Vec::new();
+        for (name, tbl_id, sid) in &entries {
             // Walk the parent path once, creating M records on demand; the
             // deepest path component is this signal's module.
             let parts: Vec<&str> = name.split('.').collect();
@@ -33152,30 +34888,140 @@ impl Simulator {
                 }
                 (mid, parts[parts.len() - 1].to_string())
             } else {
-                ("m0".to_string(), name.clone())
+                ("m0".to_string(), (*name).to_string())
             };
 
-            let width = self.lookup_signal_width(name).unwrap_or(1);
-            let is_signed = self.lookup_signal_signed(name);
-            // Per spec §8.3 signal types.
-            let type_str = if width == 1 {
+            // Kind is read from the name's OWN table entry (a real/event is
+            // never folded into an alias group by `dump_backing_ids`).
+            let own_id = self
+                .signal_name_to_id
+                .get(*name)
+                .copied()
+                .unwrap_or(*tbl_id);
+            let kind = self.dump_var_kind(name, own_id);
+            let is_event = kind == VcdVarKind::Event;
+            let is_real = kind == VcdVarKind::Real;
+            // A `string` signal is stored as a wide bit vector, so `dump_var_kind`
+            // sees a plain vector; recognise it from the string set (keyed by
+            // both the dotted name and its leaf, since the set may hold either).
+            let leaf_name = name.rsplit('.').next().unwrap_or(name);
+            let is_string = !is_event
+                && !is_real
+                && (self.string_signals.contains(*name)
+                    || self.string_signals.contains(leaf_name));
+            let width = if is_real {
+                64
+            } else {
+                self.lookup_signal_width(name).unwrap_or(1)
+            };
+            // §9.3's type list is *recommended*, not exhaustive. `real` and
+            // `event` are producer types beyond it: a real carries a decimal
+            // value (§15.1), an event carries no value at all and shows up only
+            // as an §10.4 `X` record. Per §8.7/§19.10 a consumer that knows
+            // neither still parses the record and simply sees a signal that
+            // never changes. `str` (§9.3) carries a §15.4 quoted literal.
+            let type_str = if is_event {
+                "event".to_string()
+            } else if is_real {
+                "real".to_string()
+            } else if is_string {
+                "str".to_string()
+            } else if width == 1 {
                 "bit".to_string()
-            } else if is_signed {
+            } else if self.lookup_signal_signed(name) {
                 format!("s{}", width)
             } else {
                 format!("u{}", width)
             };
 
-            signal_records.push(format!("S,{},{},{},{}", sid, mod_id, leaf, type_str));
+            // §9.2 attributes. `enc=` and `width=` were both missing: a consumer
+            // could not tell how the values were encoded, and had to infer the
+            // width from the type name (impossible for `bit`/`real`).
+            let mut attrs = vec![
+                if is_event {
+                    "enc=event".to_string()
+                } else {
+                    "enc=delta".to_string()
+                },
+                format!("width={}", width),
+            ];
+            // A bit-range whose LSB is not 0 (`logic [15:8] hi`) loses its
+            // offset in a bare `width=8` — the bits silently renumber to [7:0],
+            // and an ascending `[0:7]` loses its bit ORDER as well. §9.2 defines
+            // no range attribute, but §8.7 says consumers ignore (or preserve)
+            // unknown attributes, so `range=<msb>:<lsb>` is the safe way to
+            // carry it: a consumer that knows it renumbers correctly, one that
+            // does not is no worse off than before. Emitted only when it says
+            // something a plain `width=` does not (i.e. lsb != 0).
+            if !is_real && !is_event && !is_string {
+                if let Some((l, r)) = self.dump_var_range(name, width) {
+                    if r != 0 {
+                        attrs.push(format!("range={}:{}", l, r));
+                    }
+                }
+            }
+            let canonical = canon_sid.get(tbl_id) == Some(sid);
+            if !canonical {
+                attrs.push(format!("alias={}", canon_sid[tbl_id]));
+            } else if is_event {
+                events.push((*tbl_id, sid.clone()));
+            } else {
+                trace.push((*tbl_id, sid.clone()));
+                reals.push(is_real);
+                strings.push(is_string);
+            }
+
+            signal_records.push(format!(
+                "S,{},{},{},{},{}",
+                sid,
+                mod_id,
+                leaf,
+                type_str,
+                attrs.join(",")
+            ));
         }
 
-        // Header per spec §6.
-        let _ = writeln!(w, "@xtrace 1.0");
+        // Header per §6. The §18 BNF orders `@producer` after `@profile`, but
+        // the spec's own Appendix-A example (and every xezim-produced trace in
+        // the wild, including the 0.1.2 reference dumps) puts it third; the
+        // directives are name-keyed, so this is the interoperable spelling.
+        let _ = writeln!(w, "@xtrace 1.1");
         let _ = writeln!(w, "@format text");
         let _ = writeln!(w, "@producer xezim {}", env!("CARGO_PKG_VERSION"));
         let _ = writeln!(w, "@timescale {}", Self::xtrace_timescale_str(self.module.tick_s));
         let _ = writeln!(w, "@design {}", top_name);
-        let _ = writeln!(w, "@profile minimal");
+        // §6.5: what we actually emit is Level 0, i.e. the `minimal` profile.
+        // `--xtrace-profile` can relabel it (the 0.1.2 traces say `raw_delta`),
+        // but the DEFAULT never over-claims.
+        let _ = writeln!(w, "@profile {}", profile);
+        // §6.7: declare only record families we really produce — signal deltas
+        // (§10.2/§10.3) and events (§10.4). Not transactions, not assertions.
+        let _ = writeln!(
+            w,
+            "@capabilities {}",
+            if compress_zstd {
+                "signal_delta|events|compression_zstd"
+            } else {
+                "signal_delta|events"
+            }
+        );
+        let _ = writeln!(
+            w,
+            "@compression {}",
+            if compress_zstd { "zstd" } else { "none" }
+        );
+        // §6.9: unknown records/attributes (our `range=`, `real`/`event` types)
+        // must not fail a consumer.
+        let _ = writeln!(w, "@extensions ignore_unknown");
+        // §8.3 comment recording which signals this dump carries. The 0.1.2
+        // producer wrote `# xtrace-signals debug` for a hardcoded leaf-name
+        // heuristic (pc/irq/instr/...) that silently dropped everything else;
+        // signal selection is `--xtrace-scope` now, so the comment reports THAT.
+        if self.xtrace_scopes.is_empty() {
+            let _ = writeln!(w, "# xtrace-signals all");
+        } else {
+            let _ = writeln!(w, "# xtrace-signals scope={}", self.xtrace_scopes.join("|"));
+        }
         let _ = writeln!(w);
 
         // Dictionary section.
@@ -33188,20 +35034,64 @@ impl Simulator {
         }
         let _ = writeln!(w);
 
-        // Trace section opens with the t=0 full snapshot.
+        // Trace section. The opening `T,+0` and `N,full` snapshot are emitted
+        // LAZILY, on the first in-window `xtrace_write_changes` call — by then
+        // the time-0 initial blocks have run and settled, so the checkpoint
+        // carries real values (matching the 0.1.2 reference producer) instead
+        // of the pre-init all-X image that a redundant same-time P then had to
+        // correct. See `xtrace_emit_pending_snapshot`.
         let _ = writeln!(w, "@section trace");
-        let _ = writeln!(w, "T,+0");
-        // Seed the t=0 snapshot from the deduped trace table (one entry per
-        // net) reading signal_table (the backing store of truth).
-        let mut prev: Vec<Value> = Vec::with_capacity(trace.len());
-        let mut snap_parts: Vec<String> = Vec::with_capacity(trace.len());
-        for (tbl_id, sid) in &trace {
+
+        self.xtrace_event_last = vec![u64::MAX; events.len()];
+        self.xtrace_events = events;
+        self.xtrace_real = reals;
+        self.xtrace_string = strings;
+        // prev only needs the right LENGTH here; the pending snapshot re-reads
+        // signal_table and reseeds it from settled values.
+        self.xtrace_prev_signals = trace
+            .iter()
+            .map(|(id, _)| self.signal_table[*id].clone())
+            .collect();
+        self.xtrace_trace = trace;
+        self.xtrace_writer = Some(w);
+        self.xtrace_last_time = self.time;
+        self.xtrace_snapshot_pending = true;
+    }
+
+    /// Emit the deferred t=0 (or window-start) `N,full` checkpoint from the
+    /// SETTLED signal values, chunked per §A.13, and reseed `xtrace_prev_signals`
+    /// so subsequent writes are pure deltas. Called once, from the first
+    /// in-window `xtrace_write_changes`.
+    fn xtrace_emit_pending_snapshot(&mut self) {
+        self.xtrace_snapshot_pending = false;
+        let delta = self.time - self.xtrace_last_time;
+        self.xtrace_last_time = self.time;
+
+        let mut snap_parts: Vec<String> = Vec::with_capacity(self.xtrace_trace.len());
+        for idx in 0..self.xtrace_trace.len() {
+            let (tbl_id, sid) = &self.xtrace_trace[idx];
             let val = self.signal_table[*tbl_id].clone();
-            snap_parts.push(format!("{}={}", sid, Self::xtrace_format_value(&val)));
-            prev.push(val);
+            snap_parts.push(format!(
+                "{}={}",
+                sid,
+                Self::xtrace_format_value(&val, self.xtrace_real[idx], self.xtrace_string[idx])
+            ));
+            self.xtrace_prev_signals[idx] = val;
         }
-        // Long N,full lines are split into 16-signal chunks per the
-        // emitter pattern in §A.13 to keep parser memory bounded.
+
+        let w = self.xtrace_writer.as_mut().unwrap();
+        // A lone `T` is a valid trace_record (§18); emit it so the section is
+        // never empty. The `N,full` only follows if there is something to
+        // snapshot — a design (or `--xtrace-scope`) with no traced signals must
+        // NOT emit a bare `N,full,` (trailing comma, empty payload), which is a
+        // malformed §10.6 record.
+        let _ = writeln!(w, "T,+{}", delta);
+        if snap_parts.is_empty() {
+            return;
+        }
+        // Long N,full lines are split into 16-signal chunks per the emitter
+        // pattern in §A.13 to keep parser memory bounded; continuation chunks
+        // reuse the P record form.
         if snap_parts.len() <= 16 {
             let _ = writeln!(w, "N,full,{}", snap_parts.join(","));
         } else {
@@ -33215,15 +35105,11 @@ impl Simulator {
                 }
             }
         }
-
-        self.xtrace_trace = trace;
-        self.xtrace_prev_signals = prev;
-        self.xtrace_writer = Some(w);
-        self.xtrace_last_time = self.time;
     }
 
-    /// Per-cycle XTrace emit. Writes a T record (if time advanced) and the
-    /// signal deltas as packed (P) or single (D) records.
+    /// Per-cycle XTrace emit. Writes a T record (if time advanced), the signal
+    /// deltas as packed (P) or single (D) records, and one §10.4 `X` record per
+    /// event triggered in this time slot.
     fn xtrace_write_changes(&mut self) {
         if self.xtrace_writer.is_none() {
             return;
@@ -33237,9 +35123,26 @@ impl Simulator {
             return;
         }
         if self.time < self.xtrace_from_t {
-            // Before the window: emit nothing and DON'T advance `prev`, so the
-            // first in-window write shows the true accumulated state at `from`.
+            // Before the window: emit nothing.
+            //
+            // KNOWN LIMITATION (`--xtrace-from N` with N > 0): the pending
+            // checkpoint is emitted at the first in-window *write* (the first
+            // signal change at or after N), stamped and valued at that time —
+            // not at the boundary N with the state accumulated up to N. So the
+            // interval [N, first-change) is not represented. A precise fix needs
+            // the state as-of N (different source than the settled-value read
+            // used for the common N == 0 case), so it is deliberately left for a
+            // dedicated pass rather than risk the N == 0 path. N == 0 (the
+            // default, no window) is exact.
             return;
+        }
+
+        // First in-window write: emit the deferred N,full checkpoint from the
+        // now-settled values, then fall through so any same-slot events still
+        // record. The snapshot reseeds prev, so the change loop below finds
+        // nothing to re-emit.
+        if self.xtrace_snapshot_pending {
+            self.xtrace_emit_pending_snapshot();
         }
 
         // Walk the compact trace table directly; xtrace_prev_signals is a
@@ -33250,12 +35153,41 @@ impl Simulator {
             let id = self.xtrace_trace[idx].0;
             let val = &self.signal_table[id];
             if self.xtrace_prev_signals[idx] != *val {
-                changes.push((idx, Self::xtrace_format_value(val)));
+                changes.push((
+                    idx,
+                    Self::xtrace_format_value(
+                        val,
+                        self.xtrace_real[idx],
+                        self.xtrace_string[idx],
+                    ),
+                ));
                 self.xtrace_prev_signals[idx] = val.clone();
             }
         }
 
-        if changes.is_empty() {
+        // §19.5 events. An SV `event` is a pulse, not a level: `->e1` three
+        // times in a row is THREE events. Tracing it as a 1-bit level (the old
+        // behaviour) emitted 0x1, 0x0, 0x1 — the second trigger read back as
+        // "no event", and a trigger whose 0→1→0 toggle cancelled inside one
+        // time slot emitted nothing at all. The trigger times are already
+        // tracked for VCD (`event_triggered_time`), so reuse them.
+        let now = self.time;
+        let mut fired: Vec<usize> = Vec::new();
+        for idx in 0..self.xtrace_events.len() {
+            let id = self.xtrace_events[idx].0;
+            let triggered = self
+                .id_to_name
+                .get(id)
+                .and_then(|n| self.event_triggered_time.get(n.as_ref()))
+                .copied()
+                == Some(now);
+            if triggered && self.xtrace_event_last[idx] != now {
+                self.xtrace_event_last[idx] = now;
+                fired.push(idx);
+            }
+        }
+
+        if changes.is_empty() && fired.is_empty() {
             return;
         }
 
@@ -33270,7 +35202,7 @@ impl Simulator {
         if changes.len() == 1 {
             let (idx, val) = &changes[0];
             let _ = writeln!(w, "D,{},{}", self.xtrace_trace[*idx].1, val);
-        } else {
+        } else if !changes.is_empty() {
             for chunk in changes.chunks(16) {
                 let _ = write!(w, "P");
                 for (idx, val) in chunk {
@@ -33278,6 +35210,14 @@ impl Simulator {
                 }
                 let _ = writeln!(w);
             }
+        }
+        // §10.4 `X,<event_type>[,k=v]*`. The event_type names the record family
+        // (`event` — an SV event object fired); the `sig=` attribute points at
+        // the object's own dictionary id, which is why an event keeps an `S`
+        // record even though it carries no value. `X` inherits the current time
+        // from the T record above (§19.3), so no timestamp is repeated.
+        for idx in fired {
+            let _ = writeln!(w, "X,event,sig={}", self.xtrace_events[idx].1);
         }
 
         // Periodic durable flush so a crash/SIGKILL leaves a readable partial
@@ -33296,6 +35236,30 @@ impl Simulator {
     /// Close the trace section and flush. Called once from `run()` after
     /// the event loop drains.
     fn xtrace_finish(&mut self) {
+        if self.xtrace_writer.is_none() {
+            return;
+        }
+        // Close the trace at the final simulation time. Without a trailing T the
+        // stream stops at the last CHANGE, so a run to t=40 whose last toggle was
+        // at t=30 produces a trace that simply ends at 30 — the consumer cannot
+        // tell a quiet tail from a truncated file. (The VCD path emits the same
+        // closing `#t` marker for the same reason.) A lone `T` is a well-formed
+        // trace_record per §18, and §19.3 gives it exactly this meaning: time
+        // advanced, nothing changed.
+        //
+        // `xtrace_write_changes` re-enters here when the run passes
+        // `--xtrace-to`; the window guard below keeps that path from appending a
+        // T record past the end of the window.
+        if self.time <= self.xtrace_to_t {
+            self.xtrace_write_changes();
+            if self.time > self.xtrace_last_time {
+                let delta = self.time - self.xtrace_last_time;
+                self.xtrace_last_time = self.time;
+                if let Some(ref mut w) = self.xtrace_writer {
+                    let _ = writeln!(w, "T,+{}", delta);
+                }
+            }
+        }
         if let Some(ref mut w) = self.xtrace_writer {
             let _ = writeln!(w);
             let _ = writeln!(w, "@section end");
@@ -33338,25 +35302,10 @@ impl Simulator {
         };
         self.sync_table_to_hashmap();
 
-        let mut sig_names: Vec<String> = if self.fst_scopes.is_empty() {
-            self.signals.keys().cloned().collect()
-        } else {
-            let filters: Vec<(&str, String)> = self
-                .fst_scopes
-                .iter()
-                .map(|f| (f.as_str(), format!("{}.", f)))
-                .collect();
-            self.signals
-                .keys()
-                .filter(|name| {
-                    filters
-                        .iter()
-                        .any(|(f, fdot)| name.as_str() == *f || name.starts_with(fdot.as_str()))
-                })
-                .cloned()
-                .collect()
-        };
-        sig_names.sort();
+        // Same enumeration + top-relative scope normalization as `$dumpvars`
+        // (see `dump_signal_names`): the old copy read the empty `self.signals`
+        // mirror and compared absolute filter paths against relative names.
+        let sig_names: Vec<String> = self.dump_signal_names(&self.fst_scopes, 0);
         eprintln!(
             "[FST] dumping {} signals (scopes={})",
             sig_names.len(),
@@ -33395,9 +35344,13 @@ impl Simulator {
             }
         }
         let mut root = FstNode::new();
+        // A port bound to a whole net is the SAME net (see `dump_backing_ids`) —
+        // it reuses the parent's signal id, so `header.var` declares it as an FST
+        // alias of the parent instead of a second signal with its own changes.
+        let fst_backing = self.dump_backing_ids(&sig_names);
         for name in &sig_names {
-            let tbl_id = match self.signal_name_to_id.get(name.as_str()) {
-                Some(&i) if i < self.signal_table.len() => i,
+            let tbl_id = match fst_backing.get(name.as_str()) {
+                Some(&i) => i,
                 _ => continue,
             };
             let width = self.lookup_signal_width(name).unwrap_or(1);
@@ -34363,6 +36316,7 @@ impl Simulator {
                                     targets.push((self.resolve_hier_name(hh), a.clone()));
                                 }
                             }
+                            let mut satisfied = false;
                             for attempt in 0..10 {
                                 if attempt > 0 {
                                     // Previous attempt left a (modeled)
@@ -34391,12 +36345,18 @@ impl Simulator {
                                     } else {
                                         (0, (1i64 << width) - 1)
                                     };
+                                    // §11.8.1: an unsigned target makes each of
+                                    // its relational comparisons unsigned, so a
+                                    // bound literal is read by its unsigned value
+                                    // (see `constraint_cmp_unsigned`).
+                                    self.constraint_cmp_unsigned = !signed;
                                     let mut any = false;
                                     for c in constraints {
                                         self.narrow_relational_bounds(
                                             c, name, &targets, &mut lo, &mut hi, &mut any,
                                         );
                                     }
+                                    self.constraint_cmp_unsigned = false;
                                     if any && lo <= hi {
                                         use rand::Rng;
                                         let pick =
@@ -34427,10 +36387,16 @@ impl Simulator {
                                 // ascending cross-element chain that exhausts
                                 // its headroom); a fresh seed usually escapes.
                                 if self.inline_constraints_satisfied(constraints) {
+                                    satisfied = true;
                                     break;
                                 }
                             }
-                            return Value::from_u64(1, 32);
+                            // §18.11: `std::randomize` returns 1 only if a
+                            // consistent assignment was actually found. Returning
+                            // 1 unconditionally reported success for an
+                            // unsatisfiable set (`v >= 100; v <= 5;`) and for a
+                            // narrow band the i64 interval solver cannot reach.
+                            return Value::from_u64(if satisfied { 1 } else { 0 }, 32);
                         }
                     }
                     // §18.7 `obj.randomize() with {…}` — the inline constraints
@@ -35690,7 +37656,19 @@ impl Simulator {
         if targets.iter().any(|(n, _)| ids.contains(n)) {
             return None;
         }
-        Some((0, self.eval_expr(e).to_i64()?))
+        let v = self.eval_expr(e);
+        // §11.8.1: in an unsigned comparison context read the bound by its
+        // unsigned value (`to_i64` sign-extends, turning e.g. 0xFFFFFFFA into
+        // -6). Only take the unsigned reading when it stays representable in the
+        // i64 bound domain; otherwise fall back to the signed reading.
+        if self.constraint_cmp_unsigned {
+            if let Some(u) = v.to_u64() {
+                if u <= i64::MAX as u64 {
+                    return Some((0, u as i64));
+                }
+            }
+        }
+        Some((0, v.to_i64()?))
     }
 
     /// Match `expr` (a constraint operand) to one of the randomize targets,
@@ -36217,6 +38195,28 @@ impl Simulator {
         digits.into_iter().collect()
     }
 
+    /// C-printf spelling of a non-finite float, or `None` when `x` is finite.
+    /// `%f/%e/%g` render `inf`/`nan`; `%F/%E/%G` render `INF`/`NAN`. Only
+    /// negative infinity carries a sign — matching Icarus and the LRM's
+    /// C-printf mapping. (glibc emits `-nan` for `0.0/0.0` because that value
+    /// carries a sign bit; Icarus normalises it to `nan`, which is what we
+    /// reproduce here.) The caller layers on the `+` flag for the positive
+    /// forms, exactly as it does for a finite value.
+    fn nonfinite_float(x: f64, upper: bool) -> Option<String> {
+        if x.is_nan() {
+            Some(if upper { "NAN".to_string() } else { "nan".to_string() })
+        } else if x.is_infinite() {
+            let body = if upper { "INF" } else { "inf" };
+            Some(if x < 0.0 {
+                format!("-{}", body)
+            } else {
+                body.to_string()
+            })
+        } else {
+            None
+        }
+    }
+
     /// C-printf-style scientific notation: `1.0e+02` — sign always present,
     /// at least two exponent digits (Rust's `{:e}` writes `1.0e2`).
     fn c_style_exp(x: f64, prec: usize, upper: bool) -> String {
@@ -36235,6 +38235,84 @@ impl Simulator {
             sign,
             digits
         )
+    }
+
+    /// §21.2.1.2 hex/binary/octal field padding. Icarus (and C) pad a bare
+    /// `%Nh` with SPACES around the natural full-width form (`8'h0f` -> `  0f`
+    /// for `%4h`); the leading-`0` flag both selects the minimal
+    /// (leading-zero-trimmed) form AND zero-pads it (`%04h` -> `000f`). A `-`
+    /// flag left-justifies with trailing spaces. Passing `full` (not a
+    /// pre-trimmed core) lets us honour the flag correctly.
+    fn push_radix(result: &mut String, full: &str, width: usize, left_align: bool, zero_pad: bool) {
+        // Icarus' radix-field model (matched byte-for-byte):
+        //   * No `0` flag: always the natural full-vector form, space-padded
+        //     (`%4h` of 8'h0f -> "  0f", `%-4h` -> "0f  ").
+        //   * `0` flag + right-justified + explicit width: natural form,
+        //     zero-padded — never trimmed below the natural width
+        //     (`%04b` of an 8-bit value stays "00001111", not "1111";
+        //     `%08o` of 16'o01234 -> "00001234").
+        //   * `0` flag + (bare `%0h` OR left-justified): the minimal
+        //     (leading-zero-trimmed) form (`%0h` -> "f", `%-08o` -> "1234    ").
+        let core = if zero_pad && (width == 0 || left_align) {
+            Self::trim_radix_zeros(full)
+        } else {
+            full.to_string()
+        };
+        if core.len() >= width {
+            result.push_str(&core);
+        } else if left_align {
+            result.push_str(&core);
+            result.push_str(&" ".repeat(width - core.len()));
+        } else if zero_pad {
+            result.push_str(&"0".repeat(width - core.len()));
+            result.push_str(&core);
+        } else {
+            result.push_str(&" ".repeat(width - core.len()));
+            result.push_str(&core);
+        }
+    }
+
+    /// §21.2.1.1 `%g`/`%G`: use `%e` if exponent < -4 or >= precision,
+    /// otherwise `%f`; strip trailing zeros. Precision = significant digits
+    /// (default 6).
+    fn format_g(x: f64, prec: usize, upper: bool) -> String {
+        if x == 0.0 {
+            return "0".to_string();
+        }
+        let p = prec.max(1);
+        // C `%g` decides %f-vs-%e on the exponent of the value ROUNDED to p
+        // significant digits, not the raw value. Deriving the exponent from
+        // `log10().floor()` picks wrongly at rounding boundaries (999999.5
+        // rounds to 1e6 -> exponent 6, so C uses %e) and suffers float error
+        // on exact powers of 10. Formatting via %e at precision p-1 performs
+        // the rounding for us; its printed exponent is the post-rounding
+        // decimal exponent, which is exactly what C's choice is based on.
+        let exp: i32 = format!("{:.*e}", p - 1, x)
+            .split(['e', 'E'])
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let mut raw = if exp < -4 || exp >= p as i32 {
+            Self::c_style_exp(x, p.saturating_sub(1), upper)
+        } else {
+            let decimals = (p as i32 - 1 - exp).max(0) as usize;
+            format!("{:.*}", decimals, x)
+        };
+        // Remove trailing zeros from the mantissa (C %g behavior).
+        // Works for both plain and exponential forms.
+        if let Some(ei) = raw.find(['e', 'E']) {
+            let (mant, exp) = raw.split_at(ei);
+            let mant = if mant.contains('.') {
+                mant.trim_end_matches('0').trim_end_matches('.')
+            } else {
+                mant
+            };
+            format!("{}{}", mant, exp)
+        } else if raw.contains('.') {
+            raw.trim_end_matches('0').trim_end_matches('.').to_string()
+        } else {
+            raw
+        }
     }
 
     /// §21.2.1.4 `%u`: the 2-state data (x/z read as 0) as raw little-endian
@@ -41636,8 +43714,8 @@ impl Simulator {
                         "$value$plusargs" => self.eval_value_plusargs(args),
                         "$fopen" => self.open_file_handle(args),
                         "$fclose" => self.close_file_handle(args),
-                        "$fwrite" => self.write_file_handle(args, false),
-                        "$fdisplay" => self.write_file_handle(args, true),
+                        "$fwrite" => self.write_file_handle_named(args, false, "$write"),
+                        "$fdisplay" => self.write_file_handle_named(args, true, "$display"),
                         "$readmemh" => self.read_memory_file(args, 16),
                         "$readmemb" => self.read_memory_file(args, 2),
                         "$display" | "$displayb" | "$displayh" | "$displayo" | "$write"
@@ -46776,6 +48854,83 @@ impl Simulator {
                     }
                 }
             }
+            // Plain relational bounds (`prop REL const`) become an allowed
+            // RANGE too, so the picker samples the satisfying interval directly
+            // instead of drawing a full-width random value and hoping the
+            // fixpoint repairs it — which never lands a narrow band near 2^w
+            // (issue #35: `u >= 4294967290` on a 32-bit unsigned is 6 values in
+            // 4.3 billion). The bound is read in i128 with the §11.8.1 sign of
+            // the comparison: an UNSIGNED prop makes it unsigned, so 0xFFFFFFFA
+            // is 4294967290, not the -6 that `to_i64` would sign-extend it to.
+            // Only synthesized for props that have no `inside` range (a mix
+            // would be a union here, not the intended intersection — the
+            // fixpoint still handles that case).
+            for (name, width) in &rand_props {
+                if prop_allowed_ranges.contains_key(name)
+                    || enum_prop_types.contains_key(name)
+                    || real_rand_props.contains(name)
+                {
+                    continue;
+                }
+                let sgn = signed_rand_props.contains(name);
+                let w = (*width).min(127);
+                let (dlo, dhi): (i128, i128) = if sgn {
+                    (-(1i128 << (w.saturating_sub(1))), (1i128 << (w.saturating_sub(1))) - 1)
+                } else {
+                    (0, (1i128 << w) - 1)
+                };
+                let (mut lo, mut hi) = (dlo, dhi);
+                let mut bounded = false;
+                for con in &constraints {
+                    for item in &con.items {
+                        let ConstraintItem::Expr(e) = item else { continue };
+                        let ExprKind::Binary { op, left, right } = &e.kind else { continue };
+                        if !matches!(op, BinaryOp::Geq | BinaryOp::Leq | BinaryOp::Gt | BinaryOp::Lt) {
+                            continue;
+                        }
+                        let is_prop = |ex: &Expression| matches!(&ex.kind,
+                            ExprKind::Ident(h) if h.path.last().map_or(false, |s| &s.name.name == name));
+                        let prop_left = is_prop(left);
+                        let prop_right = is_prop(right);
+                        if prop_left == prop_right {
+                            continue; // neither side, or both — not `prop REL const`
+                        }
+                        let lit_side = if prop_left { right } else { left };
+                        // The bound must reference no rand target (a pure const).
+                        let mut ids = HashSet::default();
+                        self.collect_expr_idents(lit_side, &mut ids);
+                        if rand_props.iter().any(|(n, _)| ids.contains(n)) {
+                            continue;
+                        }
+                        let bv = self.eval_expr(lit_side);
+                        let bound: i128 = if sgn {
+                            match bv.to_i64() { Some(x) => x as i128, None => continue }
+                        } else {
+                            bv.to_u128() as i128
+                        };
+                        // Normalize to the prop-on-left orientation.
+                        let eff = if prop_right {
+                            match op {
+                                BinaryOp::Geq => BinaryOp::Leq,
+                                BinaryOp::Leq => BinaryOp::Geq,
+                                BinaryOp::Gt => BinaryOp::Lt,
+                                BinaryOp::Lt => BinaryOp::Gt,
+                                o => *o,
+                            }
+                        } else { *op };
+                        match eff {
+                            BinaryOp::Geq => { lo = lo.max(bound); bounded = true; }
+                            BinaryOp::Gt  => { lo = lo.max(bound + 1); bounded = true; }
+                            BinaryOp::Leq => { hi = hi.min(bound); bounded = true; }
+                            BinaryOp::Lt  => { hi = hi.min(bound - 1); bounded = true; }
+                            _ => {}
+                        }
+                    }
+                }
+                if bounded && lo <= hi && (lo > dlo || hi < dhi) {
+                    prop_allowed_ranges.insert(name.clone(), vec![(lo, hi)]);
+                }
+            }
             // Published for the fixpoint: an affine solve and a `!=` re-pick
             // must land the target INSIDE its declared range, not just satisfy
             // the one item they are looking at (§18.5.12 — the constraint set is
@@ -50624,7 +52779,9 @@ mod vpi {
     pub const BIT_VAR: c_int = 620;
 
     // Time types.
+    pub const SCALED_REAL_TIME: c_int = 1;
     pub const SIM_TIME: c_int = 2;
+    pub const SUPPRESS_TIME: c_int = 3;
 
     // s_vpi_systf_data.type
     pub const SYS_TASK: c_int = 1;
@@ -50632,6 +52789,9 @@ mod vpi {
 
     // Callback reasons (Table 38-49).
     pub const CB_VALUE_CHANGE: c_int = 1;
+    pub const CB_NEXT_SIM_TIME: c_int = 8;
+    pub const CB_START_OF_SIMULATION: c_int = 11;
+    pub const CB_END_OF_SIMULATION: c_int = 12;
     pub const CB_START_OF_RESET: c_int = 19;
 }
 
@@ -50697,6 +52857,11 @@ thread_local! {
         std::cell::RefCell::new((0, vec![Vec::new(); 8]));
     static VPI_TIME_SCRATCH: std::cell::RefCell<s_vpi_time> =
         const { std::cell::RefCell::new(s_vpi_time { type_: 2, high: 0, low: 0, real: 0.0 }) };
+    // Storage returned from vpi_get_cb_info for cb_data_p->value/time.
+    static VPI_CB_INFO_VALUE_SCRATCH: std::cell::RefCell<s_vpi_value> =
+        const { std::cell::RefCell::new(s_vpi_value { format: 13, value: s_vpi_value_union { integer: 0 } }) };
+    static VPI_CB_INFO_TIME_SCRATCH: std::cell::RefCell<s_vpi_time> =
+        const { std::cell::RefCell::new(s_vpi_time { type_: 3, high: 0, low: 0, real: 0.0 }) };
 }
 
 /// `Value` bit code (0=0, 1=1, 2=X, 3=Z) -> one `(aval, bval)` bit pair.
@@ -50806,6 +52971,11 @@ thread_local! {
     /// Points to a `DpiScope` struct, or null if no scope is active.
     static ACTIVE_SCOPE: std::cell::Cell<*mut libc::c_void> = const { std::cell::Cell::new(std::ptr::null_mut()) };
 }
+
+/// Process-wide fallback for VPI callers that execute on a different thread
+/// than the one that installed `ACTIVE_SIMULATOR` in TLS.
+static GLOBAL_ACTIVE_SIMULATOR: std::sync::atomic::AtomicPtr<Simulator> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 
 /// What a `vpiHandle` points at. `vpiHandle` is `void *` to C, so this is
 /// entirely private; every entry point checks `kind` before using the
@@ -51087,7 +53257,10 @@ fn try_active_sim<F, R>(who: &str, f: F) -> Option<R>
 where
     F: FnOnce(&mut Simulator) -> R,
 {
-    let sim_ptr = ACTIVE_SIMULATOR.with(|cell| cell.get());
+    let mut sim_ptr = ACTIVE_SIMULATOR.with(|cell| cell.get());
+    if sim_ptr.is_null() {
+        sim_ptr = GLOBAL_ACTIVE_SIMULATOR.load(std::sync::atomic::Ordering::Acquire);
+    }
     if sim_ptr.is_null() {
         eprintln!("[VPI] {}: no active simulator (call from outside a DPI context)", who);
         return None;
@@ -51101,7 +53274,10 @@ fn with_active_sim<F, R>(f: F) -> R
 where
     F: FnOnce(&mut Simulator) -> R,
 {
-    let sim_ptr = ACTIVE_SIMULATOR.with(|cell| cell.get());
+    let mut sim_ptr = ACTIVE_SIMULATOR.with(|cell| cell.get());
+    if sim_ptr.is_null() {
+        sim_ptr = GLOBAL_ACTIVE_SIMULATOR.load(std::sync::atomic::Ordering::Acquire);
+    }
     if sim_ptr.is_null() {
         panic!("[VPI] No active simulator - VPI call outside DPI context?");
     }
@@ -52043,7 +54219,7 @@ pub extern "C" fn vpi_get_value(handle: *mut libc::c_void, value_p: *mut s_vpi_v
 /// Shared by `vpi_get_value` and the value-change dispatcher, so a
 /// callback sees its trigger object's value in exactly the format a
 /// direct read would have produced.
-fn fill_vpi_value(val: &Value, current_time: u64, vp: &mut s_vpi_value) -> bool {
+fn fill_vpi_value(val: &Value, _current_time: u64, vp: &mut s_vpi_value) -> bool {
     {
         // vpiObjTypeVal: the simulator picks the object's natural format
         // and reports which one it chose in `format`.
@@ -52096,7 +54272,12 @@ fn fill_vpi_value(val: &Value, current_time: u64, vp: &mut s_vpi_value) -> bool 
                         type_: vpi::SIM_TIME,
                         high: (t >> 32) as u32,
                         low: (t & 0xFFFF_FFFF) as u32,
-                        real: current_time as f64,
+                        // §37 vpiTimeVal: `.real` must describe the SAME value
+                        // as high/low (the value being read, `t`), not the sim
+                        // clock. Using `current_time` made the record
+                        // self-inconsistent (a `time` var holding 42 read at
+                        // tick 5 reported real=5).
+                        real: t as f64,
                     };
                     cell.as_ptr()
                 });
@@ -52125,6 +54306,7 @@ fn dispatch_vpi_cb(
     cb: &DpiCbHandle,
     reason: libc::c_int,
 ) {
+    let prev_active = ACTIVE_SIMULATOR.with(|cell| cell.get());
     ACTIVE_SIMULATOR.with(|cell| cell.set(sim_ptr));
 
     let mut value = s_vpi_value {
@@ -52159,6 +54341,7 @@ fn dispatch_vpi_cb(
     type CbFn = extern "C" fn(*mut s_cb_data);
     let cb_fn: CbFn = unsafe { std::mem::transmute(cb.cb_routine as *const ()) };
     cb_fn(&cb_data as *const s_cb_data as *mut s_cb_data);
+    ACTIVE_SIMULATOR.with(|cell| cell.set(prev_active));
 }
 
 /// Write a signal value via VPI (supports force/release).
@@ -52351,6 +54534,30 @@ pub extern "C" fn vpi_put_value(
     .unwrap_or(std::ptr::null_mut())
 }
 
+/// Read the current simulation time.
+///
+/// `object` is accepted for IEEE compatibility and currently ignored.
+/// `time_p->type` chooses the requested representation:
+/// - `vpiSimTime`: fill `high`/`low` and also mirror into `real`
+/// - `vpiScaledRealTime`: fill `real` and also mirror into `high`/`low`
+#[no_mangle]
+pub extern "C" fn vpi_get_time(_object: *mut libc::c_void, time_p: *mut s_vpi_time) {
+    if time_p.is_null() {
+        return;
+    }
+
+    let now = try_active_sim("vpi_get_time", |sim| sim.time).unwrap_or(0);
+    let tp = unsafe { &mut *time_p };
+    match tp.type_ {
+        vpi::SCALED_REAL_TIME | vpi::SIM_TIME | vpi::SUPPRESS_TIME => {}
+        _ => tp.type_ = vpi::SIM_TIME,
+    }
+
+    tp.high = (now >> 32) as u32;
+    tp.low = (now & 0xFFFF_FFFF) as u32;
+    tp.real = now as f64;
+}
+
 // ============================================================================
 // UVM VPI/DPI surface
 // ============================================================================
@@ -52407,8 +54614,9 @@ pub extern "C" fn vpi_release_handle(handle: *mut libc::c_void) -> libc::c_int {
 // --- vpi_register_cb ---------------------------------------------------------
 //
 // Registers a VPI callback. The minimum UVM-1.2/1800.2-2017 surface
-// accepts `cbValueChange` (6) and `cbStartOfReset` (15). Other reasons
-// are recorded but never fired.
+// accepts `cbValueChange` (1), `cbNextSimTime` (8),
+// `cbStartOfSimulation` (11), `cbEndOfSimulation` (12), and
+// `cbStartOfReset` (19). Other reasons are rejected.
 //
 // Returns a non-null opaque handle on success, null on failure. The
 // returned handle must be freed by `vpi_remove_cb` (which is itself
@@ -52445,7 +54653,12 @@ pub extern "C" fn vpi_register_cb(cb_p: *mut s_cb_data) -> *mut libc::c_void {
 
     // Reject a reason we will never dispatch rather than handing back a
     // handle that quietly never fires.
-    if reason != vpi::CB_VALUE_CHANGE && reason != vpi::CB_START_OF_RESET {
+    if reason != vpi::CB_VALUE_CHANGE
+        && reason != vpi::CB_NEXT_SIM_TIME
+        && reason != vpi::CB_START_OF_RESET
+        && reason != vpi::CB_START_OF_SIMULATION
+        && reason != vpi::CB_END_OF_SIMULATION
+    {
         vpi_error(vpi::ERROR, format!("vpi_register_cb: unsupported reason {} (not registered)", reason));
         return std::ptr::null_mut();
     }
@@ -52471,7 +54684,11 @@ pub extern "C" fn vpi_register_cb(cb_p: *mut s_cb_data) -> *mut libc::c_void {
                     .or_default()
                     .push(unsafe { *handle });
             }
-            _ => sim.dpi_reset_cbs.push(unsafe { *handle }),
+            vpi::CB_NEXT_SIM_TIME => sim.dpi_next_time_cbs.push((unsafe { *handle }, sim.time)),
+            vpi::CB_START_OF_RESET => sim.dpi_reset_cbs.push(unsafe { *handle }),
+            vpi::CB_START_OF_SIMULATION => sim.dpi_start_sim_cbs.push(unsafe { *handle }),
+            vpi::CB_END_OF_SIMULATION => sim.dpi_end_sim_cbs.push(unsafe { *handle }),
+            _ => {}
         }
         true
     })
@@ -52483,6 +54700,52 @@ pub extern "C" fn vpi_register_cb(cb_p: *mut s_cb_data) -> *mut libc::c_void {
     }
 
     handle as *mut libc::c_void
+}
+
+// --- vpi_get_cb_info --------------------------------------------------------
+//
+// Returns callback registration information for a handle returned by
+// `vpi_register_cb`. Mirrors the fields xezim stores internally.
+#[no_mangle]
+pub extern "C" fn vpi_get_cb_info(cb_obj: *mut libc::c_void, cb_data_p: *mut s_cb_data) -> libc::c_int {
+    if cb_obj.is_null() || cb_data_p.is_null() {
+        return 0;
+    }
+
+    let cb = unsafe { &*(cb_obj as *const DpiCbHandle) };
+    let out = unsafe { &mut *cb_data_p };
+
+    out.reason = cb.cb_type;
+    out.cb_rtn = cb.cb_routine as *mut libc::c_void;
+    out.obj = cb.obj as *mut libc::c_void;
+    out.index = 0;
+    out.user_data = cb.user_data as *mut libc::c_void;
+
+    if cb.cb_type == vpi::CB_VALUE_CHANGE {
+        let vp = VPI_CB_INFO_VALUE_SCRATCH.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            slot.format = cb.value_format;
+            slot.value = s_vpi_value_union { integer: 0 };
+            cell.as_ptr()
+        });
+        let tp = VPI_CB_INFO_TIME_SCRATCH.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            *slot = s_vpi_time {
+                type_: vpi::SUPPRESS_TIME,
+                high: 0,
+                low: 0,
+                real: 0.0,
+            };
+            cell.as_ptr()
+        });
+        out.value = vp;
+        out.time = tp;
+    } else {
+        out.value = std::ptr::null_mut();
+        out.time = std::ptr::null_mut();
+    }
+
+    1
 }
 
 // --- vpi_remove_cb -----------------------------------------------------------
@@ -52513,6 +54776,16 @@ pub extern "C" fn vpi_remove_cb(cb: *mut libc::c_void) -> libc::c_int {
                     rc = 1;
                 }
             }
+            vpi::CB_NEXT_SIM_TIME => {
+                let before = sim.dpi_next_time_cbs.len();
+                sim.dpi_next_time_cbs.retain(|(cb, _)| {
+                    cb.cb_routine != removed.cb_routine
+                        || cb.user_data != removed.user_data
+                });
+                if sim.dpi_next_time_cbs.len() != before {
+                    rc = 1;
+                }
+            }
             vpi::CB_START_OF_RESET => {
                 let before = sim.dpi_reset_cbs.len();
                 sim.dpi_reset_cbs.retain(|cb| {
@@ -52520,6 +54793,26 @@ pub extern "C" fn vpi_remove_cb(cb: *mut libc::c_void) -> libc::c_int {
                         || cb.user_data != removed.user_data
                 });
                 if sim.dpi_reset_cbs.len() != before {
+                    rc = 1;
+                }
+            }
+            vpi::CB_START_OF_SIMULATION => {
+                let before = sim.dpi_start_sim_cbs.len();
+                sim.dpi_start_sim_cbs.retain(|cb| {
+                    cb.cb_routine != removed.cb_routine
+                        || cb.user_data != removed.user_data
+                });
+                if sim.dpi_start_sim_cbs.len() != before {
+                    rc = 1;
+                }
+            }
+            vpi::CB_END_OF_SIMULATION => {
+                let before = sim.dpi_end_sim_cbs.len();
+                sim.dpi_end_sim_cbs.retain(|cb| {
+                    cb.cb_routine != removed.cb_routine
+                        || cb.user_data != removed.user_data
+                });
+                if sim.dpi_end_sim_cbs.len() != before {
                     rc = 1;
                 }
             }

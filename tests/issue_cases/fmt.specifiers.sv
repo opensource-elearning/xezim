@@ -251,7 +251,7 @@ module sv_format_specifier_compliance_tb;
             `CHECK_FORMAT("21.2.1.2: Smart Real Lowercase Path B (Scientific)", out_str, "1.23e-05")
 
             out_str = $sformatf("%G", val_scientific);
-          `CHECK_FORMAT("21.2.1.2: Smart Real Uppercase Path B (Scientific)", out_str, "1.23e-05")
+          `CHECK_FORMAT("21.2.1.2: Smart Real Uppercase Path B (Scientific)", out_str, "1.23E-05")
         end
         // --------------------------------------------------------------------
         // 21.2.1.2: Character & String Specifiers (%c, %s)

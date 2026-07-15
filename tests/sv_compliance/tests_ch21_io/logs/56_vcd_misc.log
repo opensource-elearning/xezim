@@ -1,0 +1,21 @@
+=== xezim 0.9.3 ===
+Max time: 100000
+------------------------------
+[PHASE] compilation: 0.6ms
+[EVENT-EDGE] measure (timestamp): 0 edge blocks, 0 gateable, 0 gateable-with-EMPTY-data-reads, avg data-reads/gateable=0.00
+[EVENT-EDGE] SKIP mode ON (sim_time >= 0) — skipping gateable flop fires with no data-input change
+[VCD] dumping 3 signals (filter_scopes=0, depth=0)
+TEST_PASS
+[PROF] settle=0.0ms edges=0.0ms nba=0.0ms process=0.5ms snap=0.0ms sched=0.0ms
+[PROF] edge_waiters=0.0ms edge_cg=0.0ms waiter_iters=0
+[PROF] clocks_only_detect=0 nba_elided=0 (iters with clocks-only scan / NBAs dropped at eval because value matched signal_table)
+[PROF] edge_detect=0.0ms edge_exec=0.0ms edges_fired=0 insns=0 ns_per_insn=0.0 fallbacks=0
+[PROF] settle_dc=0.0ms(0) settle_ca=0.0ms(0) settle_ab=0.0ms(0)
+[PROF] settle_calls=0 settle_iters=0 max_iters=0 entry_evals=0 unresolved_entries=0/0
+[PROF] simulation_loop=0.6ms iters=7 avg=82.89µs/iter
+[PHASE] simulation: 0.8ms
+[PHASE] total: 1.4ms
+------------------------------
+Simulation finished at time 26000
+------------------------------
+Simulation finished at time 26000

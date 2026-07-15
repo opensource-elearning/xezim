@@ -7,6 +7,7 @@ module tb;
   bit   [127:0] wide;
   logic [7:0]   xz;
   logic         one_bit;
+  time          t42;      // read via vpiTimeVal; holds 42, read at t=1
 
   // vpi_get(vpiType) must answer from the DECLARATION, so one signal of
   // each declared type.
@@ -27,6 +28,10 @@ module tb;
   import "DPI-C" context function int vc_put_xz();
   import "DPI-C" context function int vc_get_props();
   import "DPI-C" context function int vc_vlog_info();
+  import "DPI-C" context function int vc_get_time(input int expect_tick);
+  import "DPI-C" context function int vc_get_cb_info();
+  import "DPI-C" context function int vc_register_sim_phase_cbs();
+  import "DPI-C" context function int vc_check_sim_phase_cb_info();
   import "DPI-C" context function int vc_errors();
 
   int rc;
@@ -41,6 +46,7 @@ module tb;
     wide    = 128'h11223344_55667788_99AABBCC_DDEEFF00;
     xz      = 8'b1010_xzxz;
     one_bit = 1'b1;
+    t42     = 42;
     w64     = 64'h0;
     an_int  = 0;
     a_long  = 0;
@@ -49,12 +55,16 @@ module tb;
     put_x   = 8'h00;
     put_z   = 8'h00;
     untouched = 8'hA5;
+    rc = vc_register_sim_phase_cbs();
     #1;
 
     rc = vc_names();
     rc = vc_get_value();
     rc = vc_get_props();
     rc = vc_vlog_info();
+    rc = vc_get_time(1);
+    rc = vc_get_cb_info();
+    rc = vc_check_sim_phase_cb_info();
 
     // vpi_put_value must keep the upper word of a 64-bit signal. The old
     // code read only vec[0].aval for anything <= 64 bits wide.
@@ -65,6 +75,7 @@ module tb;
     // ...and must carry bval through, so X and Z survive a deposit.
     rc = vc_put_xz();
     #1;
+    rc = vc_get_time(3);
     `check(put_x === 8'bxxxx1111, "aval=1,bval=1 must deposit X")
     `check(put_z === 8'bzzzz1111, "aval=0,bval=1 must deposit Z")
     // An undecodable format writes nothing rather than writing the signal

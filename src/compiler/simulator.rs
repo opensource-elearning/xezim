@@ -44103,6 +44103,45 @@ impl Simulator {
                         return self.exec_method_call(handle, method_name, args);
                     }
                 }
+                // IEEE 1800-2023 §8.15/§13.5.5: a method reached through a
+                // flattened multi-segment path — `o.in.getval()` parses as
+                // Ident([o, in, getval]). The receiver is the FULL prefix
+                // `path[0..len-1]`, NOT `path[0]`: each intermediate segment
+                // is a class-handle property that must be dereferenced to
+                // reach the object that actually OWNS the method. Without
+                // this, the fallthrough below resolved only `path[0]` (the
+                // OUTER object), bound `this` to it, and looked the method up
+                // there — so `o.in.getval()` ran getval on `o` (Outer has no
+                // getval) and silently returned 0; `o.in.setval(x)` wrote
+                // nothing. Walk the prefix through the heap to the real owner
+                // and dispatch on it. Path[0] may be a local, a signal, or
+                // `this`; intermediate segments are heap-object properties.
+                // (The mailbox/array-builtin/rand_mode special cases above
+                // already `return` for their own >=3-segment shapes, so this
+                // only catches ordinary user methods on nested objects.)
+                if hier.path.len() >= 3 {
+                    let head = hier.path[0].name.name.as_str();
+                    let mut handle = if head == "this" {
+                        self.this_stack.last().copied().flatten().unwrap_or(0)
+                    } else {
+                        self.eval_ident_handle(head).unwrap_or(0)
+                    };
+                    for seg in &hier.path[1..hier.path.len() - 1] {
+                        if handle == 0 {
+                            break;
+                        }
+                        handle = self
+                            .heap
+                            .get(handle)
+                            .and_then(|o| o.as_ref())
+                            .and_then(|i| i.properties.get(&seg.name.name))
+                            .and_then(|v| v.to_u64())
+                            .unwrap_or(0) as usize;
+                    }
+                    if handle != 0 && handle < self.heap.len() && self.heap[handle].is_some() {
+                        return self.exec_method_call(handle, method_name, args);
+                    }
+                }
                 let obj_val = if let Some(locals) = self.local_stack.last() {
                     locals.get(obj_name).cloned()
                 } else {

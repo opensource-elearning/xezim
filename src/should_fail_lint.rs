@@ -47,6 +47,8 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                     check_module_item(it, elab, &mut errs);
                 }
                 check_proc_net_assign(&m.items, &mut errs);
+                check_enum_assign(&m.items, elab, &mut errs);
+                check_dynarray_assign(&m.items, elab, &mut errs);
                 check_stream_widths(&m.items, elab, &mut errs);
                 check_wildcard_cmp(&m.items, elab, &mut errs);
                 check_instantiations(&m.items, &port_map, &mut errs);
@@ -236,6 +238,187 @@ fn check_proc_net_assign(items: &[ModuleItem], errs: &mut Vec<String>) {
                 }
             }
         });
+    }
+}
+
+/// True if `dt` is an enum type, resolving one typedef reference against the
+/// elaborated typedef table (`typedef enum {...} e; e v;`).
+fn resolves_to_enum(dt: &DataType, elab: &ElaboratedModule) -> bool {
+    match dt {
+        DataType::Enum(_) => true,
+        // An enum typedef is registered in `enum_members` (keyed by the typedef
+        // name), not `typedef_types` — see elaborate::process_typedef.
+        DataType::TypeReference { name, .. } => {
+            elab.enum_members.contains_key(&name.name.name)
+                || elab
+                    .typedef_types
+                    .get(&name.name.name)
+                    .map_or(false, |inner| matches!(inner, DataType::Enum(_)))
+        }
+        _ => false,
+    }
+}
+
+/// §6.19.3: the RHS of an enum assignment must itself be enum-typed or an
+/// explicit cast. A *bare integer literal* (optionally parenthesised / negated)
+/// is the unambiguous illegal case — enum members and same-type enum variables
+/// parse as `Ident`, and a cast parses as a `SystemCall`, so neither is flagged.
+fn is_bare_integer_rhs(e: &Expression) -> bool {
+    match &e.kind {
+        ExprKind::Number(NumberLiteral::Integer { .. }) => true,
+        ExprKind::Paren(inner) => is_bare_integer_rhs(inner),
+        ExprKind::Unary { operand, .. } => is_bare_integer_rhs(operand),
+        _ => false,
+    }
+}
+
+/// §6.19.3: reject `enum_var = <integer literal>` (no explicit cast). Covers
+/// both procedural (`e = 1;`) and continuous (`assign e = 1;`) assignments.
+/// Deliberately narrow — only a bare integer-literal RHS to a WHOLE enum
+/// variable fires, so legal enum-member / same-type / cast assignments are
+/// untouched.
+fn check_enum_assign(items: &[ModuleItem], elab: &ElaboratedModule, errs: &mut Vec<String>) {
+    use std::collections::HashSet;
+    let mut enum_vars: HashSet<String> = HashSet::new();
+    for it in items {
+        match it {
+            ModuleItem::DataDeclaration(d) if resolves_to_enum(&d.data_type, elab) => {
+                for decl in &d.declarators {
+                    enum_vars.insert(decl.name.name.clone());
+                }
+            }
+            ModuleItem::NetDeclaration(nd) if resolves_to_enum(&nd.data_type, elab) => {
+                for decl in &nd.declarators {
+                    enum_vars.insert(decl.name.name.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    if enum_vars.is_empty() {
+        return;
+    }
+    fn flag(
+        lv: &Expression,
+        rv: &Expression,
+        enum_vars: &HashSet<String>,
+        errs: &mut Vec<String>,
+    ) {
+        // Only a whole-variable target (`e = ...`), never `e[i] = ...`.
+        if matches!(lv.kind, ExprKind::Ident(_)) {
+            if let Some(b) = base_ident(lv) {
+                if enum_vars.contains(&b) && is_bare_integer_rhs(rv) {
+                    errs.push(format!(
+                        "assignment to enum variable '{}' requires an explicit cast \
+                         (LRM 1800-2017 §6.19.3)",
+                        b
+                    ));
+                }
+            }
+        }
+    }
+    for it in items {
+        let stmt = match it {
+            ModuleItem::AlwaysConstruct(a) => &a.stmt,
+            ModuleItem::InitialConstruct(i) => &i.stmt,
+            _ => continue,
+        };
+        for_each_assign_pair(stmt, &mut |lv, rv| flag(lv, rv, &enum_vars, errs));
+    }
+    for it in items {
+        if let ModuleItem::ContinuousAssign(ca) = it {
+            for (l, r) in &ca.assignments {
+                flag(l, r, &enum_vars, errs);
+            }
+        }
+    }
+}
+
+/// A definitely-scalar RHS: an integer literal or a scalar operator expression
+/// (arithmetic / shift / bitwise / comparison / reduction). Excludes idents,
+/// assignment patterns, concatenations and calls — the shapes that legally
+/// produce an aggregate — so only an unambiguous scalar fires the array check.
+fn is_scalar_rhs(e: &Expression) -> bool {
+    match &e.kind {
+        ExprKind::Number(_) => true,
+        ExprKind::Binary { .. } | ExprKind::Unary { .. } => true,
+        ExprKind::Paren(inner) => is_scalar_rhs(inner),
+        _ => false,
+    }
+}
+
+/// §6.24 / §10.7: a scalar value cannot be implicitly assigned to an unpacked
+/// (dynamic / queue) array target — it needs an assignment pattern or a cast.
+/// Narrow: only a whole dynamic-array LHS with a clearly-scalar RHS fires.
+fn check_dynarray_assign(items: &[ModuleItem], elab: &ElaboratedModule, errs: &mut Vec<String>) {
+    if elab.dynamic_arrays.is_empty() {
+        return;
+    }
+    fn flag(lv: &Expression, rv: &Expression, elab: &ElaboratedModule, errs: &mut Vec<String>) {
+        if matches!(lv.kind, ExprKind::Ident(_)) {
+            if let Some(b) = base_ident(lv) {
+                if elab.dynamic_arrays.contains(&b) && is_scalar_rhs(rv) {
+                    errs.push(format!(
+                        "scalar expression cannot be implicitly cast to unpacked-array \
+                         variable '{}' (LRM 1800-2017 §10.7)",
+                        b
+                    ));
+                }
+            }
+        }
+    }
+    for it in items {
+        let stmt = match it {
+            ModuleItem::AlwaysConstruct(a) => &a.stmt,
+            ModuleItem::InitialConstruct(i) => &i.stmt,
+            _ => continue,
+        };
+        for_each_assign_pair(stmt, &mut |lv, rv| flag(lv, rv, elab, errs));
+    }
+    for it in items {
+        if let ModuleItem::ContinuousAssign(ca) = it {
+            for (l, r) in &ca.assignments {
+                flag(l, r, elab, errs);
+            }
+        }
+    }
+}
+
+/// Call `f(lvalue, rvalue)` for each procedural blocking/nonblocking assignment.
+fn for_each_assign_pair(stmt: &Statement, f: &mut dyn FnMut(&Expression, &Expression)) {
+    match &stmt.kind {
+        StatementKind::BlockingAssign { lvalue, rvalue }
+        | StatementKind::NonblockingAssign { lvalue, rvalue, .. } => f(lvalue, rvalue),
+        StatementKind::If {
+            then_stmt,
+            else_stmt,
+            ..
+        } => {
+            for_each_assign_pair(then_stmt, f);
+            if let Some(e) = else_stmt {
+                for_each_assign_pair(e, f);
+            }
+        }
+        StatementKind::Case { items, .. } => {
+            for item in items {
+                for_each_assign_pair(&item.stmt, f);
+            }
+        }
+        StatementKind::For { body, .. }
+        | StatementKind::Foreach { body, .. }
+        | StatementKind::While { body, .. }
+        | StatementKind::DoWhile { body, .. }
+        | StatementKind::Repeat { body, .. }
+        | StatementKind::Forever { body } => for_each_assign_pair(body, f),
+        StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+            for s in stmts {
+                for_each_assign_pair(s, f);
+            }
+        }
+        StatementKind::TimingControl { stmt, .. } | StatementKind::Wait { stmt, .. } => {
+            for_each_assign_pair(stmt, f)
+        }
+        _ => {}
     }
 }
 

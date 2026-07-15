@@ -1697,6 +1697,10 @@ pub struct Simulator {
     /// Set of signal IDs that are signed.
     signal_signed: Vec<bool>,
     signal_real: Vec<bool>,
+    /// Signal ids whose declared type is 2-state (`bit`/`byte`/`int`/…). Per
+    /// §6.11.1/§10.7 an implicit conversion of a 4-state RHS into such a target
+    /// maps X/Z to 0 — enforced in `fit_value_to_signal`.
+    signal_two_state: Vec<bool>,
     /// Signal ids that carry a CONTINUOUS driver — the whole-name LHS of an
     /// `assign` (including the continuous-assigns that inlining synthesizes for
     /// instance port connections). §6.5 forbids mixing continuous and procedural
@@ -3569,6 +3573,21 @@ impl Simulator {
                 signal_signed_vec.extend(std::iter::repeat(false).take(count));
                 signal_real_vec.extend(std::iter::repeat(false).take(count));
             }
+            // §6.11.1: the array's elements inherit the declared element type's
+            // signedness (`byte foo[8]` elements are signed). The push helpers
+            // default every element to unsigned, so a signed-element array would
+            // otherwise read its cells as unsigned.
+            if module
+                .var_decl_types
+                .get(base)
+                .map_or(false, |dt| {
+                    super::elaborate::is_type_signed_resolved(dt, &module.typedef_types)
+                })
+            {
+                for id in first_id..signal_table.len() {
+                    signal_signed_vec[id] = true;
+                }
+            }
         }
         // An array whose elements already carry values from elaboration — an
         // unpacked-array PARAMETER (`u32_t A[N] = {a, b}`, §6.20.2) — must keep
@@ -3659,6 +3678,38 @@ impl Simulator {
         // (we skip pushing for unnamed large-array elements) but
         // signal_table grows for every element, so use signal_table.len().
         let num_signals = signal_table.len();
+        // §6.11.1/§10.7: mark 2-state signal ids so implicit conversions of a
+        // 4-state RHS drop X/Z at the destination. `two_state_signals` stores
+        // bare declaration names, while signal_name_to_id keys are scoped and
+        // array elements carry `[idx]`; match on the leaf base of each name.
+        let mut signal_two_state = vec![false; num_signals];
+        if !module.two_state_signals.is_empty() {
+            for (name, &id) in signal_name_to_id.iter() {
+                if id >= num_signals {
+                    continue;
+                }
+                let name_ref: &str = name.as_ref();
+                let leaf = name_ref.rsplit('.').next().unwrap_or(name_ref);
+                let base = leaf.split('[').next().unwrap_or(leaf);
+                if module.two_state_signals.contains(name_ref)
+                    || module.two_state_signals.contains(base)
+                {
+                    signal_two_state[id] = true;
+                }
+            }
+            for (base_name, &(first_id, lo, hi)) in array_first_id.iter() {
+                let base_ref: &str = base_name.as_ref();
+                let leaf = base_ref.rsplit('.').next().unwrap_or(base_ref);
+                if module.two_state_signals.contains(base_ref)
+                    || module.two_state_signals.contains(leaf)
+                {
+                    let n = (hi - lo + 1).max(0) as usize;
+                    for id in first_id..(first_id + n).min(num_signals) {
+                        signal_two_state[id] = true;
+                    }
+                }
+            }
+        }
         // prev_{val,xz} represent "before time 0" state. Per IEEE 1800,
         // variable initializers `reg x = <v>;` are equivalent to
         // initial-block assignments, so X→<v> at t=0 must generate an edge
@@ -3737,6 +3788,7 @@ impl Simulator {
             signal_widths: signal_widths_vec,
             signal_signed: signal_signed_vec,
             signal_real: signal_real_vec,
+            signal_two_state,
             cont_driven: HashSet::default(),
             signal_type_names,
             time: 0,
@@ -8020,12 +8072,12 @@ impl Simulator {
                         }
                     }
                     if !handled {
-                        let src_val = view[*src_id].clone();
-                        let resized = if src_val.width != *width {
-                            src_val.resize(*width)
-                        } else {
-                            src_val
-                        };
+                        // §10.7: fit the source to the destination NET's type —
+                        // drop X/Z for a 2-state net, sign/X-extend a signed
+                        // source, real<->int convert, and stamp the net's own
+                        // signedness (a bare `resize` kept the source's, so an
+                        // unsigned net driven by a signed value read negative).
+                        let resized = self.fit_value_to_signal(*dst_id, &view[*src_id]);
                         if view[*dst_id] != resized {
                             view[*dst_id] = resized;
                             dirtied.push(*dst_id as u32);
@@ -12025,7 +12077,13 @@ impl Simulator {
                 Insn::BlockingAssign(sig_id, val_reg, width) => {
                     let id = *sig_id;
                     let mut handled = false;
-                    if *width <= 64 && self.signal_widths[id] == *width && !self.signal_real[id] {
+                    // 2-state targets take the slow path so X/Z is dropped
+                    // (§6.11.1/§10.7); the raw-bit fast path would keep it.
+                    if *width <= 64
+                        && self.signal_widths[id] == *width
+                        && !self.signal_real[id]
+                        && !self.signal_two_state.get(id).copied().unwrap_or(false)
+                    {
                         let mask = if *width >= 64 {
                             u64::MAX
                         } else {
@@ -12050,8 +12108,7 @@ impl Simulator {
                         }
                     }
                     if !handled {
-                        let mut val = self.vm_regs[*val_reg as usize].resize(*width);
-                        val.is_signed = self.signal_signed[id];
+                        let val = self.fit_value_to_signal(id, &self.vm_regs[*val_reg as usize]);
                         if self.signal_table[id] != val {
                             if !self.dirty_signals[id] {
                                 self.dirty_signals[id] = true;
@@ -17537,15 +17594,50 @@ impl Simulator {
     /// apply (per-LP thread + unsafe disjoint writes) will call this
     /// from worker threads via the SendExecContext / raw-pointer
     /// pattern.
+    /// §10.7 implicit-conversion fit: coerce `val` to the type of signal `id`
+    /// (real target, 2-state X/Z drop, sign/X-Z-aware width padding, signedness)
+    /// exactly as an assignment / continuous-assign RHS is converted to its LHS.
+    /// The single chokepoint used by every commit path so blocking, nonblocking
+    /// and continuous assignments agree byte-for-byte.
+    #[inline]
+    fn fit_value_to_signal(&self, id: usize, val: &Value) -> Value {
+        let width = self.signal_widths[id];
+        if self.signal_real[id] {
+            let mut r = if val.is_real {
+                val.clone()
+            } else {
+                Value::from_f64(val.to_f64())
+            };
+            // Match the destination's stored signedness so an unchanged real
+            // write elides (a mismatched is_signed made the value compare
+            // unequal and emitted a spurious duplicate VCD record).
+            r.is_signed = self.signal_signed[id];
+            return r;
+        }
+        if width == 0 {
+            // Untracked class-handle var — never truncate to nothing.
+            return val.clone();
+        }
+        let mut v = if val.is_real {
+            Self::real_to_int(val.to_f64(), width)
+        } else {
+            val.resize_for_assign(width)
+        };
+        if self.signal_two_state.get(id).copied().unwrap_or(false) {
+            v = v.to_two_state();
+        }
+        v.is_signed = self.signal_signed[id];
+        v
+    }
+
     #[inline]
     fn apply_nba_entry(&mut self, entry: NbaFast) {
         let id = entry.signal_id;
-        let width = self.signal_widths[id];
         let signed = self.signal_signed[id];
-        let mut val = entry.value;
-        if val.width != width {
-            val = val.resize(width);
-        }
+        // §10.7: fit the queued value to the destination type (real / 2-state /
+        // width / signedness). A bare `resize` here dropped real conversions
+        // (integer bits reinterpreted as a double) and left X/Z in 2-state nets.
+        let mut val = self.fit_value_to_signal(id, &entry.value);
         if val.is_signed != signed {
             val.is_signed = signed;
         }
@@ -20000,14 +20092,16 @@ impl Simulator {
             // Copies are always handled by the isolated path; reaching here for
             // them would be a logic error, but eval them correctly regardless.
             CombItem::FastDirectCopy { dst_id, src_id } => {
-                let v = self.signal_table[*src_id].clone();
+                // §10.7: fit to the destination net type (2-state X/Z drop,
+                // real<->int, signedness) — same as DirectCopy.
+                let v = self.fit_value_to_signal(*dst_id, &self.signal_table[*src_id].clone());
                 if self.signal_table[*dst_id] != v {
                     self.mark_dirty_id(*dst_id);
                     write_sig!(self, *dst_id, v);
                 }
             }
-            CombItem::DirectCopy { dst_id, src_id, width } => {
-                let v = self.signal_table[*src_id].clone().resize(*width);
+            CombItem::DirectCopy { dst_id, src_id, .. } => {
+                let v = self.fit_value_to_signal(*dst_id, &self.signal_table[*src_id].clone());
                 if self.signal_table[*dst_id] != v {
                     self.mark_dirty_id(*dst_id);
                     write_sig!(self, *dst_id, v);
@@ -20212,9 +20306,14 @@ impl Simulator {
                         // (need a true resize), or Wide values.
                         let dst_w = self.signal_widths[*dst_id];
                         let mut handled = false;
+                        // 2-state / real destinations take the slow (fit) path so
+                        // X/Z is dropped and real<->int converts (§10.7); the
+                        // raw-bit fast path would copy them verbatim.
                         if *width <= 64
                             && dst_w == *width
                             && self.signal_widths[*src_id] == *width
+                            && !self.signal_real[*dst_id]
+                            && !self.signal_two_state.get(*dst_id).copied().unwrap_or(false)
                             && (self.sdf_delays.is_empty()
                                 || self.sdf_delays.get(*dst_id).copied().unwrap_or(0) == 0)
                         {
@@ -20255,11 +20354,9 @@ impl Simulator {
                         }
                         if !handled {
                             let src_val = self.signal_table[*src_id].clone();
-                            let resized = if src_val.width != *width {
-                                src_val.resize(*width)
-                            } else {
-                                src_val
-                            };
+                            // §10.7 fit to the destination net type (2-state X/Z
+                            // drop, real<->int, sign/X-extend, net signedness).
+                            let resized = self.fit_value_to_signal(*dst_id, &src_val);
                             if self.signal_table[*dst_id] != resized {
                                 let delay = self.sdf_delays.get(*dst_id).copied().unwrap_or(0);
                                 if delay > 0 && self.time > 0 {
@@ -20738,21 +20835,7 @@ impl Simulator {
                     hier.path.len() == 1 && !hier.path[0].name.name.contains('.');
                 if let Some(id) = hier.cached_signal_id.get() {
                     if !is_ambiguous_leaf {
-                        let width = self.signal_widths[id];
-                        let mut resized = if self.signal_real[id] {
-                            if val.is_real {
-                                val.clone()
-                            } else {
-                                Value::from_f64(val.to_f64())
-                            }
-                        } else {
-                            if val.is_real {
-                                Self::real_to_int(val.to_f64(), width)
-                            } else {
-                                val.resize(width)
-                            }
-                        };
-                        resized.is_signed = self.signal_signed[id];
+                        let resized = self.fit_value_to_signal(id, val);
                         let changed = self.signal_table[id] != resized;
                         if changed {
                             self.mark_dirty_id(id);
@@ -20765,26 +20848,7 @@ impl Simulator {
                 let name = self.resolve_hier_name(hier);
                 if let Some(&id) = self.signal_name_to_id.get(name.as_str()) {
                     hier.cached_signal_id.set(Some(id));
-                    let width = self.signal_widths[id];
-                    let mut resized = if self.signal_real[id] {
-                        if val.is_real {
-                            val.clone()
-                        } else {
-                            Value::from_f64(val.to_f64())
-                        }
-                    } else if width == 0 {
-                        // Untracked class-handle var (width 0) — never truncate
-                        // to 0; keep the value's natural width so a handle
-                        // (`c = factory.create_...()`) survives the store.
-                        val.clone()
-                    } else {
-                        if val.is_real {
-                            Self::real_to_int(val.to_f64(), width)
-                        } else {
-                            val.resize(width)
-                        }
-                    };
-                    resized.is_signed = self.signal_signed[id];
+                    let resized = self.fit_value_to_signal(id, val);
                     let changed = self.signal_table[id] != resized;
                     if changed {
                         self.mark_dirty_id(id);
@@ -21123,7 +21187,11 @@ impl Simulator {
                             if idx >= lo && idx <= hi {
                                 let id = first_id + (idx - lo) as usize;
                                 let width = self.signal_widths[id];
-                                let resized = val.resize(width);
+                                let mut resized = val.resize(width);
+                                // Adopt the element's declared signedness — a
+                                // signed RHS (e.g. an `integer`) stored verbatim
+                                // made `reg [15:0] a[]` elements read as signed.
+                                resized.is_signed = self.signal_signed[id];
                                 let changed = self.signal_table[id] != resized;
                                 if changed {
                                     if !self.dirty_signals[id] {
@@ -21140,7 +21208,8 @@ impl Simulator {
                         let elem_name = format!("{}[{}]", name, idx_str);
                         if let Some(&id) = self.signal_name_to_id.get(elem_name.as_str()) {
                             let width = self.signal_widths[id];
-                            let resized = val.resize(width);
+                            let mut resized = val.resize(width);
+                            resized.is_signed = self.signal_signed[id];
                             let changed = self.signal_table[id] != resized;
                             if changed {
                                 if !self.dirty_signals[id] {
@@ -24543,6 +24612,72 @@ impl Simulator {
                     };
                     out.is_signed = super::elaborate::is_type_signed(&dt);
                     out
+                }
+                // §6.24.1 `id'(x)` where `id` is a bare identifier: a TYPE cast
+                // when `id` names a typedef, otherwise a SIZE cast (the constant
+                // `id` gives the target width). Parser-lowered; resolved here
+                // where both the typedef and parameter tables are visible.
+                "$__xz_named_cast" => {
+                    let inner_v = args
+                        .get(1)
+                        .map(|a| self.eval_expr(a))
+                        .unwrap_or_else(|| Value::zero(1));
+                    let leaf = args.first().and_then(|a| {
+                        if let ExprKind::Ident(h) = &a.kind {
+                            h.path.last().map(|s| s.name.name.clone())
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some(nm) = leaf {
+                        // (a) Full typedef (carries signedness / real-ness).
+                        if let Some(dt) = self.module.typedef_types.get(&nm).cloned() {
+                            if super::elaborate::is_type_real(&dt) {
+                                return Value::from_f64(inner_v.to_f64());
+                            }
+                            let w = super::elaborate::resolve_type_width(
+                                &dt,
+                                Some(&self.module.parameters),
+                                Some(&self.module.typedefs),
+                            )
+                            .max(1);
+                            let mut out = if inner_v.is_real {
+                                Self::real_to_int(inner_v.to_f64(), w)
+                            } else {
+                                inner_v.resize(w)
+                            };
+                            out.is_signed = super::elaborate::is_type_signed(&dt);
+                            return out;
+                        }
+                        // (b) A typedef/enum known only by width (e.g. an enum
+                        // typedef `state_e'(2)`) — resize to that width. Without
+                        // this the enum name fell to the size-cast branch below
+                        // and evaluated to 0.
+                        if let Some(&w) = self.module.typedefs.get(&nm) {
+                            let mut out = if inner_v.is_real {
+                                Self::real_to_int(inner_v.to_f64(), w.max(1))
+                            } else {
+                                inner_v.resize(w.max(1))
+                            };
+                            out.is_signed = false;
+                            return out;
+                        }
+                        // (c) SIZE cast: the identifier is a constant giving the
+                        // width. Only when it actually names a parameter — an
+                        // unknown identifier stays a pass-through (its old
+                        // behaviour) rather than resizing to a garbage width.
+                        if self.module.parameters.contains_key(&nm)
+                            || self.get_signal_value_by_name(&nm).is_some()
+                        {
+                            let n = self
+                                .eval_expr(&args[0])
+                                .to_u64()
+                                .unwrap_or(32) as u32;
+                            return inner_v.resize(n.max(1));
+                        }
+                    }
+                    // Unknown cast target: pass the operand through unchanged.
+                    return inner_v;
                 }
                 // §20.8.2 real math library.
                 "$sin" | "$cos" | "$tan" | "$asin" | "$acos" | "$atan"
@@ -44281,13 +44416,56 @@ impl Simulator {
             if is_out && i < args.len() {
                 output_bindings.push((port.name.name.clone(), args[i].clone()));
             }
-            let val = if i < args.len() {
+            let mut val = if i < args.len() {
                 self.eval_expr(&args[i])
             } else if let Some(def) = &port.default {
                 self.eval_expr(def)
             } else {
                 Value::zero(32)
             };
+            // §13.5.2 / §6.10 / §10.7: a scalar integral formal adopts its
+            // declared port's width and signedness, so `input signed [5:0] v`
+            // sign-extends `v` in later arithmetic and a `real` actual bound to
+            // an integral formal rounds to an integer. Only plain integral port
+            // types qualify — real / string / chandle / struct / class formals
+            // keep the caller value untouched (resizing a string to its
+            // 1024-bit storage width would corrupt it).
+            // A bare `Implicit` with no dimensions is a shared-type second
+            // declarator (`input int a, b;` — `b` inherits `a`'s type) whose
+            // width can't be resolved standalone; skip it so the caller value
+            // isn't truncated. Implicit WITH dims (`input signed [5:0] v`) still
+            // qualifies.
+            if matches!(
+                &port.data_type,
+                crate::ast::types::DataType::IntegerVector { .. }
+                    | crate::ast::types::DataType::IntegerAtom { .. }
+            ) || matches!(
+                &port.data_type,
+                crate::ast::types::DataType::Implicit { dimensions, .. }
+                    if !dimensions.is_empty()
+            ) {
+                let pw = super::elaborate::resolve_type_width(
+                    &port.data_type,
+                    Some(&self.module.parameters),
+                    Some(&self.module.typedefs),
+                );
+                val = if val.is_real {
+                    Self::real_to_int(val.to_f64(), pw.max(1))
+                } else if pw > 0 && pw != val.width {
+                    // resize_for_assign (not resize) so a signed source with an
+                    // X/Z MSB widens with X/Z, matching assignment to the formal.
+                    // pw == 0 means the width couldn't be resolved (e.g. a
+                    // shared-type second declarator `input int a, b`) — keep the
+                    // caller value rather than truncating it to nothing.
+                    val.resize_for_assign(pw)
+                } else {
+                    val
+                };
+                val.is_signed = super::elaborate::is_type_signed_resolved(
+                    &port.data_type,
+                    &self.module.typedef_types,
+                );
+            }
             locals.insert(port.name.name.clone(), val);
         }
         // Initialize return variable (function name)
@@ -44551,11 +44729,37 @@ impl Simulator {
                     } else {
                         Value::zero(32)
                     };
-                    // Preserve the formal's declared signedness so a negative
-                    // default/arg compares signed (`this_priority < -1` must be
-                    // false for -1); without it the param reads unsigned and
-                    // UVM's start() fatals SEQPRI. Mirrors the for-loop var fix.
-                    if super::elaborate::is_type_signed(&port.data_type) {
+                    // §13.5.1/§10.7: a scalar integral formal adopts the port's
+                    // width and signedness. Widen with the ARG's own signedness
+                    // first (so an unsigned x-MSB actual zero-extends, not X-
+                    // extends), THEN stamp the formal's signedness — otherwise a
+                    // negative default/arg reads unsigned (UVM start() SEQPRI).
+                    if matches!(
+                        &port.data_type,
+                        crate::ast::types::DataType::IntegerVector { .. }
+                            | crate::ast::types::DataType::IntegerAtom { .. }
+                    ) || matches!(
+                        &port.data_type,
+                        crate::ast::types::DataType::Implicit { dimensions, .. }
+                            if !dimensions.is_empty()
+                    ) {
+                        let pw = super::elaborate::resolve_type_width(
+                            &port.data_type,
+                            Some(&self.module.parameters),
+                            Some(&self.module.typedefs),
+                        );
+                        val = if val.is_real {
+                            Self::real_to_int(val.to_f64(), pw.max(1))
+                        } else if pw > 0 && pw != val.width {
+                            val.resize_for_assign(pw)
+                        } else {
+                            val
+                        };
+                        val.is_signed = super::elaborate::is_type_signed_resolved(
+                            &port.data_type,
+                            &self.module.typedef_types,
+                        );
+                    } else if super::elaborate::is_type_signed(&port.data_type) {
                         val.is_signed = true;
                     }
                     locals.insert(port.name.name.clone(), val);

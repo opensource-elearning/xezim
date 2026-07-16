@@ -21212,6 +21212,37 @@ impl Simulator {
                         }
                     }
                 }
+                // Nested packed multi-D element write (`a[i][j] = v` on
+                // `reg [1:0][15:0][7:0] a;`) — splice the slice into the flat
+                // backing vector, normalizing each index against its declared
+                // dimension bounds (ascending / non-zero-based / negative,
+                // LRM §7.4.1).
+                if let Some((base, lo_opt, w)) = self.packed_nested_select(expr, index) {
+                    let lo = match lo_opt {
+                        Some(lo) => lo,
+                        None => return false, // out-of-range write dropped §11.5.1
+                    };
+                    if let Some(cur_sig) = self.get_signal_value_by_name(&base) {
+                        let total_w = cur_sig.width as usize;
+                        if lo + w as usize <= total_w {
+                            let mut nv = cur_sig.clone();
+                            let piece = val.resize(w);
+                            let mut changed = false;
+                            for i in 0..w as usize {
+                                let nb = piece.get_bit(i);
+                                if nv.get_bit(lo + i) != nb {
+                                    nv.set_bit(lo + i, nb);
+                                    changed = true;
+                                }
+                            }
+                            if changed {
+                                self.set_signal_value_by_name(&base, nv);
+                                self.mark_dirty(&base);
+                            }
+                            return changed;
+                        }
+                    }
+                }
                 // Packed multi-D element bit-select write: `p2d[i][j] = bit`
                 // where `p2d` is `logic [..][W-1:0]`. The inner Index selects
                 // element i (a W-bit slice at bits [i*W +: W]); the outer index
@@ -23712,6 +23743,18 @@ impl Simulator {
                         let i = self.eval_expr(index).to_u64().unwrap_or(0) as usize;
                         let byte = content.as_bytes().get(i).copied().unwrap_or(0);
                         return Value::from_u64(byte as u64, 8);
+                    }
+                }
+                // Nested packed multi-D select (`a[i][j]` on
+                // `reg [1:0][15:0][7:0] a;`) — resolve the whole index chain
+                // against the signal's full packed dims, normalizing indices
+                // for ascending / non-zero-based / negative ranges (§7.4.1).
+                if let Some((base, lo_opt, w)) = self.packed_nested_select(expr, index) {
+                    if let Some(base_v) = self.get_signal_value_by_name(&base) {
+                        return match lo_opt {
+                            Some(lo) => base_v.range_select(lo + w as usize - 1, lo),
+                            None => Value::new(w), // out-of-range: all-x §11.5.1
+                        };
                     }
                 }
                 // Packed multi-D signal element select (LRM §7.4.1): for
@@ -29324,6 +29367,16 @@ impl Simulator {
                                 .insert(d.name.name.clone(), elem_w);
                         } else {
                             self.module.packed_signal_elem_widths.remove(&d.name.name);
+                        }
+                        if let Some(fdims) = super::elaborate::packed_full_dims_of(
+                            data_type,
+                            &self.module.parameters,
+                        ) {
+                            self.module
+                                .packed_full_dims
+                                .insert(d.name.name.clone(), fdims);
+                        } else {
+                            self.module.packed_full_dims.remove(&d.name.name);
                         }
                         // Per-field element widths (`u.n[i]` where the member
                         // is itself a packed array) — mirrors the module-scope
@@ -35698,6 +35751,97 @@ impl Simulator {
     /// `(container, offset, width)`. Such a dotted name parses as ONE
     /// hierarchical identifier, so the field lookups that key off the ROOT
     /// (`a`) never see it.
+    /// Resolve a nested packed-vector index chain `base[i0][i1]...` (LRM
+    /// §7.4.1) to the flat bit slice it selects, using the signal's full
+    /// packed dimension list (`packed_full_dims`, outermost first) with
+    /// per-dimension index normalization (ascending ranges, non-zero /
+    /// negative bounds). Returns `(base_name, Some(lo_bit), slice_width)`;
+    /// an out-of-range index yields `(base_name, None, slice_width)` so
+    /// reads produce all-x and writes are dropped (§11.5.1) instead of
+    /// corrupting neighboring bits.
+    fn packed_nested_select(
+        &mut self,
+        base_expr: &Expression,
+        outer_index: &Expression,
+    ) -> Option<(String, Option<usize>, u32)> {
+        let mut idx_exprs: Vec<&Expression> = vec![outer_index];
+        let mut cur = base_expr;
+        while let ExprKind::Index { expr: inner, index } = &cur.kind {
+            idx_exprs.push(index);
+            cur = inner;
+        }
+        let base_name = match &cur.kind {
+            ExprKind::Ident(h) => {
+                let n = self.resolve_hier_name(h);
+                if !self.module.packed_full_dims.contains_key(&n) && h.path.len() >= 2 {
+                    let dotted: String = h
+                        .path
+                        .iter()
+                        .map(|s| s.name.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(".");
+                    if self.module.packed_full_dims.contains_key(&dotted) {
+                        dotted
+                    } else {
+                        n
+                    }
+                } else {
+                    n
+                }
+            }
+            ExprKind::MemberAccess { expr: e, member } => {
+                if let ExprKind::Ident(h) = &e.kind {
+                    format!("{}.{}", self.resolve_hier_name(h), member.name)
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        };
+        let dims = self.module.packed_full_dims.get(&base_name)?.clone();
+        let k = idx_exprs.len();
+        if k > dims.len() {
+            return None;
+        }
+        idx_exprs.reverse(); // outermost dimension's index first
+        let counts: Vec<u64> = dims
+            .iter()
+            .map(|(l, r)| (l - r).unsigned_abs() + 1)
+            .collect();
+        let total: u64 = counts.iter().product();
+        let elem_w: u64 = counts[k..].iter().product::<u64>().max(1);
+        let mut msb_off: u64 = 0;
+        let mut oob = false;
+        for (j, ie) in idx_exprs.iter().enumerate() {
+            let iv = self.eval_expr(ie);
+            if iv.has_xz() {
+                oob = true;
+                break;
+            }
+            let i = if iv.is_signed {
+                iv.to_i64().unwrap_or(i64::MIN)
+            } else {
+                iv.to_u64().map(|v| v as i64).unwrap_or(i64::MIN)
+            };
+            let (l, r) = dims[j];
+            let (lo_b, hi_b) = if l <= r { (l, r) } else { (r, l) };
+            if i < lo_b || i > hi_b {
+                oob = true;
+                break;
+            }
+            // Position of the selected element counted from the MSB end:
+            // the LEFT bound labels the most-significant element (§7.4.1).
+            let slot = if l >= r { (l - i) as u64 } else { (i - l) as u64 };
+            let w_j: u64 = counts[j + 1..].iter().product::<u64>().max(1);
+            msb_off += slot * w_j;
+        }
+        if oob {
+            return Some((base_name, None, elem_w as u32));
+        }
+        let lo = total - msb_off - elem_w;
+        Some((base_name, Some(lo as usize), elem_w as u32))
+    }
+
     fn packed_leaf_of_hier(&self, full: &str) -> Option<(String, u32, u32)> {
         let (base, field) = full.rsplit_once('.')?;
         let fields = self.module.packed_struct_fields.get(base)?;

@@ -3124,6 +3124,146 @@ impl Simulator {
         }
     }
 
+    /// Unpacked dims carried by the typedef `tn`, resolved the way §6.18
+    /// scoping does: the class `start_class` and its ancestors first (their
+    /// `typedef_unpacked_dims`, exported by core dd4e161), then the
+    /// module/package table, following typedef alias chains. `None` when `tn`
+    /// is not a dimensioned typedef anywhere in scope.
+    fn typedef_dims_via_tables(
+        module: &ElaboratedModule,
+        start_class: &str,
+        tn0: &str,
+    ) -> Option<Vec<crate::ast::types::UnpackedDimension>> {
+        let mut tn = tn0.to_string();
+        for _ in 0..8 {
+            let mut cur = Some(start_class.to_string());
+            while let Some(cn) = cur {
+                let Some(cd) = module.classes.get(&cn) else { break };
+                if let Some(d) = cd.typedef_unpacked_dims.get(&tn) {
+                    return Some(d.clone());
+                }
+                cur = cd.extends.clone();
+            }
+            if let Some(d) = module.typedef_unpacked_dims.get(&tn) {
+                return Some(d.clone());
+            }
+            match module.typedef_types.get(&tn) {
+                Some(DataType::TypeReference { name, dimensions, .. })
+                    if dimensions.is_empty() =>
+                {
+                    tn = name.name.name.clone();
+                }
+                _ => break,
+            }
+        }
+        None
+    }
+
+    /// §6.18: classify class PROPERTIES declared with a typedef'd collection
+    /// type (`typedef int q_t[$]; … q_t m_q;`) into the
+    /// queue/assoc/array-property maps. `elaborate_class` resolves such dims
+    /// only from the class's OWN local typedefs; a MODULE/package-level
+    /// typedef (or one inherited from an ancestor class) left the property a
+    /// scalar. The member then got no per-instance `<handle>#<member>`
+    /// storage: `push_back` inside a method landed on an unregistered bare
+    /// global, `foreach` over the member missed the data entirely and
+    /// iterated a junk fallback, and a `ref`-writeback caller saw one zero
+    /// element instead of the pushed contents.
+    fn classify_typedef_collection_properties(module: &mut ElaboratedModule) {
+        use crate::ast::types::{SimpleType, UnpackedDimension as UD};
+        let mut classes: Vec<String> = module.classes.keys().cloned().collect();
+        classes.sort();
+        let params = module.parameters.clone();
+        for cn in classes {
+            let Some(cd) = module.classes.get(&cn) else { continue };
+            // (prop, width, is_static, dims), gathered immutably first.
+            let mut found: Vec<(String, u32, bool, Vec<UD>)> = Vec::new();
+            for (pname, sig) in &cd.properties {
+                if cd.queue_properties.contains_key(pname)
+                    || cd.assoc_properties.contains_key(pname)
+                    || cd.array_properties.contains_key(pname)
+                    || cd.static_collections.iter().any(|(n, ..)| n == pname)
+                {
+                    continue;
+                }
+                let Some(tn) = &sig.type_name else { continue };
+                let Some(dims) = Self::typedef_dims_via_tables(module, &cn, tn) else {
+                    continue;
+                };
+                found.push((
+                    pname.clone(),
+                    sig.width.max(1),
+                    cd.static_properties.contains(pname),
+                    dims,
+                ));
+            }
+            if found.is_empty() {
+                continue;
+            }
+            found.sort_by(|a, b| a.0.cmp(&b.0));
+            let Some(cd) = module.classes.get_mut(&cn) else { continue };
+            for (pname, w, is_static, dims) in found {
+                // Mirrors elaborate_class's `effective_dims` classification,
+                // but with the live parameter table for const bounds.
+                if is_static {
+                    match dims.first() {
+                        Some(UD::Associative { .. }) => {
+                            cd.static_collections.push((pname, true, w));
+                        }
+                        Some(UD::Queue { .. }) | Some(UD::Unsized(_)) => {
+                            cd.static_collections.push((pname, false, w));
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+                match dims.first() {
+                    Some(UD::Associative { data_type: key_dt, .. }) => {
+                        let is_string_key = key_dt.as_ref().map_or(false, |dt| {
+                            matches!(
+                                dt.as_ref(),
+                                DataType::Simple { kind: SimpleType::String, .. }
+                            )
+                        });
+                        cd.assoc_properties.insert(pname, is_string_key);
+                    }
+                    Some(UD::Queue { max_size, .. }) => {
+                        let cap = max_size
+                            .as_ref()
+                            .and_then(|e| {
+                                super::elaborate::const_eval_i64_with_params(e, Some(&params))
+                            })
+                            .map(|n| (n + 1).max(1) as u32);
+                        cd.queue_properties.insert(pname, (w, cap));
+                    }
+                    Some(UD::Unsized(_)) => {
+                        cd.queue_properties.insert(pname, (w, None));
+                    }
+                    Some(UD::Expression { expr, .. }) => {
+                        match super::elaborate::const_eval_i64_with_params(expr, Some(&params)) {
+                            Some(n) if n > 0 => {
+                                cd.array_properties.insert(pname, (0, n - 1, w));
+                            }
+                            _ => {
+                                cd.queue_properties.insert(pname, (w, None));
+                            }
+                        }
+                    }
+                    Some(UD::Range { left, right, .. }) => {
+                        if let (Some(l), Some(r)) = (
+                            super::elaborate::const_eval_i64_with_params(left, Some(&params)),
+                            super::elaborate::const_eval_i64_with_params(right, Some(&params)),
+                        ) {
+                            cd.array_properties
+                                .insert(pname, (l.min(r), l.max(r), w));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
     /// Minimal constant folder for an enum member's `= expr` initializer at
     /// construction time (before any `Simulator` exists): literals, named
     /// parameters/enum constants already registered, and the arithmetic that
@@ -3398,6 +3538,10 @@ impl Simulator {
         // types into the module type tables so a rand property declared with
         // one gets its enum-member domain / packed bit layout.
         Self::hoist_class_local_typedefs(&mut module);
+        // §6.18: a property typed by a module/package-level (or inherited)
+        // collection typedef must be classified as a queue/assoc/array member
+        // — elaborate_class only saw the class's OWN local typedefs.
+        Self::classify_typedef_collection_properties(&mut module);
         let materialize_ms = phase_materialize.elapsed().as_secs_f64() * 1000.0;
 
         // Collect just *names* from the two source maps and sort them
@@ -30048,6 +30192,41 @@ impl Simulator {
                                     .typedef_unpacked_dims
                                     .get(&concrete)
                                     .cloned()
+                                    .or_else(|| {
+                                        // CLASS-LOCAL typedef: an explicit
+                                        // `C::t_t v;` scope, else the class
+                                        // whose method is executing — a
+                                        // `Ph::d_t dd;` local bound as a
+                                        // scalar, so a later `ref` call saw
+                                        // no collection to write back to.
+                                        let start = name
+                                            .scope
+                                            .as_ref()
+                                            .map(|s| s.name.clone())
+                                            .or_else(|| {
+                                                self.class_context_stack
+                                                    .last()
+                                                    .cloned()
+                                                    .flatten()
+                                            })
+                                            .or_else(|| {
+                                                self.this_stack
+                                                    .last()
+                                                    .copied()
+                                                    .flatten()
+                                                    .and_then(|h| {
+                                                        self.heap
+                                                            .get(h)
+                                                            .and_then(|x| x.as_ref())
+                                                            .map(|i| i.class_name.clone())
+                                                    })
+                                            })?;
+                                        Self::typedef_dims_via_tables(
+                                            &self.module,
+                                            &start,
+                                            &concrete,
+                                        )
+                                    })
                                     .unwrap_or_default()
                             } else {
                                 Vec::new()
@@ -54105,11 +54284,20 @@ impl Simulator {
                                             .and_then(|i| i.type_bindings.get(tn).cloned())
                                             .or_else(|| self.resolve_type_param_binding(tn))
                                             .unwrap_or_else(|| tn.clone());
-                                        self.module
-                                            .typedef_unpacked_dims
-                                            .get(&concrete)
-                                            .cloned()
-                                            .unwrap_or_default()
+                                        // CLASS-LOCAL typedef (`typedef int
+                                        // q_t[$];` inside the class): the dims
+                                        // live on the callee class's own
+                                        // typedef table, walked before the
+                                        // module's — a `ref q_t out_q` formal
+                                        // was bound as a scalar, so the
+                                        // callee's push_backs never reached
+                                        // the caller (§13.5.2).
+                                        Self::typedef_dims_via_tables(
+                                            &self.module,
+                                            &cname,
+                                            &concrete,
+                                        )
+                                        .unwrap_or_default()
                                     } else {
                                         Vec::new()
                                     }

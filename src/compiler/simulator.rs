@@ -9930,11 +9930,18 @@ impl Simulator {
                     } => (d, stmt.as_ref()),
                     _ => return None,
                 };
-                // Evaluate the delay expression at extraction time. Handles
-                // Paren-wrapped integers, parameter references, and
-                // `CLK_PERIOD/2`-style constant folding without having to
-                // teach the matcher every AST shape.
-                let delay = self.eval_expr(d_expr).to_u64()?;
+                // Evaluate the delay at extraction time. Route through
+                // `eval_delay_ticks`, which handles a REAL-valued half-period
+                // (`#(real_period/2)`) — a plain `eval_expr(..).to_u64()` reads
+                // a real's raw IEEE-754 bits as the tick count (a huge number,
+                // so the clock never fired) — and applies §3.14.3 module-
+                // precision rounding, matching the normal `#delay` path. A
+                // zero (or unevaluable) delay is NOT a valid clock-gen
+                // half-period; fall back to the general forever path.
+                let delay = self.eval_delay_ticks(d_expr);
+                if delay == 0 {
+                    return None;
+                }
                 // assign_body (or inner SeqBlock): BA VAR = ~VAR
                 let ba_target = match &assign_body.kind {
                     StatementKind::BlockingAssign { lvalue, rvalue } => (lvalue, rvalue),

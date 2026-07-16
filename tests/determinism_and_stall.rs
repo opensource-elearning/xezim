@@ -244,8 +244,8 @@ fn stall_report_names_the_rtl_behind_each_spinner() {
         .expect("run xezim");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("(top.u_mid.u_leaf)"),
-        "offender must be named by its instance path:\n{}",
+        stderr.contains("(top.u_mid.u_leaf, module leaf)"),
+        "offender must be named by its instance path AND defining module:\n{}",
         stderr
     );
     assert!(
@@ -307,6 +307,11 @@ fn stall_report_resolves_file_line_in_multi_file_designs() {
     assert!(
         stderr.contains(&format!("always block at {}:4", f1.display())),
         "multi-file offender must resolve to its OWN file's line:\n{}",
+        stderr
+    );
+    assert!(
+        stderr.contains("(top.u_dut, module dut)"),
+        "instance path must carry the defining module's name:\n{}",
         stderr
     );
     assert!(

@@ -14875,10 +14875,22 @@ impl Simulator {
                     }
                 }
                 // Instance path: the scope hint under the top module's name;
-                // a process with no hint runs in the top scope itself.
+                // a process with no hint runs in the top scope itself. When
+                // the DEFINING module is known and isn't the top, name it too
+                // — the instance path alone doesn't say which module body to
+                // open: `(top.u_fifo.u_sync, module sync_cell)`.
                 match self.process_scope_hint.get(pid) {
                     Some(s) if !s.is_empty() => {
-                        line.push_str(&format!(" ({}.{})", self.module.name, s))
+                        let def_mod = self
+                            .stall_pid_def_module(*pid)
+                            .filter(|m| *m != self.module.name);
+                        match def_mod {
+                            Some(m) => line.push_str(&format!(
+                                " ({}.{}, module {})",
+                                self.module.name, s, m
+                            )),
+                            None => line.push_str(&format!(" ({}.{})", self.module.name, s)),
+                        }
                     }
                     _ => line.push_str(&format!(" ({})", self.module.name)),
                 }

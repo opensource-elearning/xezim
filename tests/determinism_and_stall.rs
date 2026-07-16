@@ -256,6 +256,71 @@ fn stall_report_names_the_rtl_behind_each_spinner() {
     assert!(stderr.contains("re-arming via #0 delay"), "{}", stderr);
 }
 
+/// A MULTI-FILE design must still get file:line in the stall report. Spans
+/// are per-file byte offsets, so with several files an offset alone cannot
+/// name its file — the report used to silently drop the location whenever
+/// more than one file was long enough to contain the offset. The offender's
+/// instance scope names its defining module, and the elaborator now records
+/// which file defined each module, so the span resolves against exactly that
+/// file's text.
+#[test]
+fn stall_report_resolves_file_line_in_multi_file_designs() {
+    use std::process::Command;
+
+    fn xezim_bin() -> std::path::PathBuf {
+        let mut p = std::env::current_exe().expect("current_exe");
+        p.pop();
+        if p.ends_with("deps") {
+            p.pop();
+        }
+        p.join("xezim")
+    }
+
+    let dir = std::env::temp_dir().join("xezim_stall_report_multifile_test");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+
+    // f1: an uninitialized-real clock period — the classic accidental
+    // zero-delay livelock. The `always` sits on line 4 of f1.
+    let f1 = dir.join("stall_mf_dut.sv");
+    std::fs::write(
+        &f1,
+        "module dut;\n  real p;\n  reg clk = 0;\n  always #(p/2) clk = ~clk;\nendmodule\n",
+    )
+    .expect("write f1");
+    // f2: the top, PADDED so it is longer than f1's span offsets — the
+    // exact-fit fallback alone would then refuse to resolve (ambiguous).
+    let f2 = dir.join("stall_mf_top.sv");
+    std::fs::write(
+        &f2,
+        "module top;\n  localparam int PAD0 = 0;\n  localparam int PAD1 = 1;\n  localparam int PAD2 = 2;\n  localparam int PAD3 = 3;\n  dut u_dut();\nendmodule\n",
+    )
+    .expect("write f2");
+
+    let out = Command::new(xezim_bin())
+        .env("XEZIM_STALL_LIMIT", "1000")
+        .arg(&f1)
+        .arg(&f2)
+        .output()
+        .expect("run xezim");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("simulation STALLED"), "no stall report:\n{}", stderr);
+    assert!(
+        stderr.contains(&format!("always block at {}:4", f1.display())),
+        "multi-file offender must resolve to its OWN file's line:\n{}",
+        stderr
+    );
+    assert!(
+        stderr.contains("re-arming via"),
+        "offender line must classify the re-arm:\n{}",
+        stderr
+    );
+    assert!(
+        stderr.contains("ran 1000 times at this timestamp"),
+        "the established count phrasing must survive:\n{}",
+        stderr
+    );
+}
+
 /// The detector must not fire on a design that merely uses several delta cycles
 /// at one timestamp — NBA settling, `#0` used once, zero-delay fork/join are all
 /// legal and common.

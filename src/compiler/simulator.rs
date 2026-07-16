@@ -14862,11 +14862,14 @@ impl Simulator {
             eprintln!("               Most frequently scheduled processes:");
             for (pid, count) in &top {
                 let mut line = format!("                 process {}", pid);
+                // Which source file this pid's spans live in (multi-file
+                // designs), via its instance scope's defining module.
+                let src_file = self.stall_pid_src_file(*pid);
                 // Origin: what construct spawned this pid, and where.
                 if let Some(&(span, kind)) = self.process_origin.get(pid) {
                     line.push_str(" — ");
                     line.push_str(kind);
-                    if let Some(loc) = self.span_file_line(span) {
+                    if let Some(loc) = self.span_file_line_in(span, src_file) {
                         line.push_str(" at ");
                         line.push_str(&loc);
                     }
@@ -14880,7 +14883,7 @@ impl Simulator {
                     _ => line.push_str(&format!(" ({})", self.module.name)),
                 }
                 // Re-arm reason, from the pid's pending continuation.
-                if let Some(reason) = self.describe_stall_offender(*pid, running) {
+                if let Some(reason) = self.describe_stall_offender(*pid, running, src_file) {
                     line.push_str(" — ");
                     line.push_str(&reason);
                 }
@@ -14897,28 +14900,65 @@ impl Simulator {
         );
     }
 
+    /// Which retained source file the spans of `pid`'s statements index
+    /// into. A span is a byte offset into its OWN file's preprocessed text,
+    /// so a multi-file design needs this to resolve one at all: the pid's
+    /// scope hint names the elaborated instance it runs in (empty = the top
+    /// module itself), `module.instances` maps that path to the DEFINING
+    /// module, and `src_file_of_module` records which file defined it.
+    /// `None` when any link is missing (library module, class/object scope,
+    /// .xzb run) — callers then fall back to the exact-fit rule.
+    fn stall_pid_src_file(&self, pid: usize) -> Option<u32> {
+        self.stall_pid_def_module(pid)
+            .and_then(|m| self.module.src_file_of_module.get(&m).copied())
+    }
+
+    /// The module whose definition `pid`'s originating block was written in,
+    /// via the same scope→instance lookup as `stall_pid_src_file`.
+    fn stall_pid_def_module(&self, pid: usize) -> Option<String> {
+        match self.process_scope_hint.get(&pid).map(String::as_str) {
+            None | Some("") => Some(self.module.name.clone()),
+            Some(scope) => self
+                .module
+                .instances
+                .iter()
+                .find(|inst| inst.path == scope)
+                .map(|inst| inst.def_name.clone()),
+        }
+    }
+
     /// Best-effort `file:line` for a statement span. A span is a byte offset
-    /// into its OWN file's preprocessed text, and the elaborated module does
-    /// not record which file each statement came from — so resolve only when
-    /// it is unambiguous: exactly ONE retained source is long enough to
+    /// into its OWN file's preprocessed text; `src_file` says which file
+    /// that is when the offender's originating module is known (see
+    /// `stall_pid_src_file`). Without it — untagged origins — resolve only
+    /// when it is unambiguous: exactly ONE retained source is long enough to
     /// contain the offset (trivially true for the single-source case). When
     /// several files could contain it, print nothing rather than risk a
     /// wrong location.
-    fn span_file_line(&self, span: crate::ast::Span) -> Option<String> {
+    fn span_file_line_in(&self, span: crate::ast::Span, src_file: Option<u32>) -> Option<String> {
         if span.start == 0 && span.end == 0 {
             return None; // Span::dummy() — synthesized statement, no source
         }
         let texts = &self.module.source_texts;
-        let mut hit: Option<usize> = None;
-        for (i, t) in texts.iter().enumerate() {
-            if span.start < t.len() {
-                if hit.is_some() {
-                    return None; // ambiguous across files
+        let i = match src_file
+            .map(|s| s as usize)
+            .filter(|&s| texts.get(s).is_some_and(|t| span.start < t.len()))
+        {
+            Some(i) => i,
+            None => {
+                // Exact-fit fallback: unambiguous only.
+                let mut hit: Option<usize> = None;
+                for (i, t) in texts.iter().enumerate() {
+                    if span.start < t.len() {
+                        if hit.is_some() {
+                            return None; // ambiguous across files
+                        }
+                        hit = Some(i);
+                    }
                 }
-                hit = Some(i);
+                hit?
             }
-        }
-        let i = hit?;
+        };
         let line = 1 + texts[i].as_bytes()[..span.start]
             .iter()
             .filter(|&&b| b == b'\n')
@@ -14933,24 +14973,37 @@ impl Simulator {
         Some(format!("{}:{}", file, line))
     }
 
-    /// The source text a span covers, when it resolves to exactly one file
-    /// (same rule as `span_file_line`). Whitespace-collapsed and capped, for
-    /// inline display of e.g. a `wait (...)` condition.
-    fn span_source_snippet(&self, span: crate::ast::Span) -> Option<String> {
-        if span.start == 0 && span.end == 0 {
+    /// The source text a span covers: the `src_file`'s text when the
+    /// offender's file is known, else exactly-one-file fallback (same rule
+    /// as `span_file_line_in`). Whitespace-collapsed and capped, for inline
+    /// display of e.g. a `wait (...)` condition or a `#(...)` delay.
+    fn span_source_snippet_in(
+        &self,
+        span: crate::ast::Span,
+        src_file: Option<u32>,
+    ) -> Option<String> {
+        if span.start == 0 && span.end == 0 || span.start >= span.end {
             return None;
         }
         let texts = &self.module.source_texts;
-        let mut hit: Option<usize> = None;
-        for (i, t) in texts.iter().enumerate() {
-            if span.end <= t.len() && span.start < span.end {
-                if hit.is_some() {
-                    return None;
+        let i = match src_file
+            .map(|s| s as usize)
+            .filter(|&s| texts.get(s).is_some_and(|t| span.end <= t.len()))
+        {
+            Some(i) => i,
+            None => {
+                let mut hit: Option<usize> = None;
+                for (i, t) in texts.iter().enumerate() {
+                    if span.end <= t.len() {
+                        if hit.is_some() {
+                            return None;
+                        }
+                        hit = Some(i);
+                    }
                 }
-                hit = Some(i);
+                hit?
             }
-        }
-        let i = hit?;
+        };
         let raw = texts[i].get(span.start..span.end)?;
         let mut s = raw.split_whitespace().collect::<Vec<_>>().join(" ");
         if s.len() > 60 {
@@ -14960,8 +15013,8 @@ impl Simulator {
         Some(s)
     }
 
-    fn expr_snippet(&self, e: &Expression) -> String {
-        self.span_source_snippet(e.span)
+    fn expr_snippet_in(&self, e: &Expression, src_file: Option<u32>) -> String {
+        self.span_source_snippet_in(e.span, src_file)
             .unwrap_or_else(|| "…".to_string())
     }
 
@@ -14973,13 +15026,14 @@ impl Simulator {
         &mut self,
         pid: usize,
         running: Option<(usize, &[Statement])>,
+        src_file: Option<u32>,
     ) -> Option<String> {
         // The process that tripped the limit is mid-execution: its
         // continuation is on the Rust stack, not in any queue.
         if let Some((rpid, rstmts)) = running {
             if rpid == pid {
                 return Some(
-                    self.classify_stall_stmts(rstmts, 0)
+                    self.classify_stall_stmts(rstmts, 0, src_file)
                         .unwrap_or_else(|| "currently executing".to_string()),
                 );
             }
@@ -15016,12 +15070,12 @@ impl Simulator {
             .find(|(p, _)| *p == pid)
         {
             let cont = cont.clone();
-            return self.classify_stall_stmts(&cont, 0);
+            return self.classify_stall_stmts(&cont, 0, src_file);
         }
         // A delta continuation sitting in the event queue.
         if let Some(stmts) = self.event_queue.pending_stmts_for(pid) {
             let stmts = stmts.to_vec();
-            return self.classify_stall_stmts(&stmts, 0);
+            return self.classify_stall_stmts(&stmts, 0, src_file);
         }
         None
     }
@@ -15032,7 +15086,12 @@ impl Simulator {
     /// body never yields. Descends into `forever` / `begin..end` bodies a
     /// few levels; evaluates only call-free expressions so a terminal
     /// diagnostic can't run user side effects.
-    fn classify_stall_stmts(&mut self, stmts: &[Statement], depth: u32) -> Option<String> {
+    fn classify_stall_stmts(
+        &mut self,
+        stmts: &[Statement],
+        depth: u32,
+        src_file: Option<u32>,
+    ) -> Option<String> {
         if depth > 4 {
             return None;
         }
@@ -15050,12 +15109,12 @@ impl Simulator {
                     TimingControl::Event(ev) => {
                         return Some(format!(
                             "waiting on @({}) — event ping-pong suspected",
-                            self.render_event_control(ev)
+                            self.render_event_control(ev, src_file)
                         ));
                     }
                 },
                 StatementKind::Wait { condition, .. } => {
-                    let cond_src = self.expr_snippet(condition);
+                    let cond_src = self.expr_snippet_in(condition, src_file);
                     let already_true = !Self::expr_contains_call(condition)
                         && self.eval_expr(condition).is_true();
                     return Some(if already_true {
@@ -15069,12 +15128,15 @@ impl Simulator {
                         StatementKind::SeqBlock { stmts, .. } => stmts,
                         _ => std::slice::from_ref(&**body),
                     };
-                    return Some(self.classify_stall_stmts(inner, depth + 1).unwrap_or_else(
-                        || "loop body has no timing control — never yields".to_string(),
-                    ));
+                    return Some(
+                        self.classify_stall_stmts(inner, depth + 1, src_file)
+                            .unwrap_or_else(|| {
+                                "loop body has no timing control — never yields".to_string()
+                            }),
+                    );
                 }
                 StatementKind::SeqBlock { stmts: inner, .. } => {
-                    if let Some(r) = self.classify_stall_stmts(inner, depth + 1) {
+                    if let Some(r) = self.classify_stall_stmts(inner, depth + 1, src_file) {
                         return Some(r);
                     }
                 }
@@ -15085,11 +15147,11 @@ impl Simulator {
     }
 
     /// Render an `@(...)` event control for the stall report.
-    fn render_event_control(&self, ev: &EventControl) -> String {
+    fn render_event_control(&self, ev: &EventControl, src_file: Option<u32>) -> String {
         match ev {
             EventControl::Star | EventControl::ParenStar => "*".to_string(),
             EventControl::Identifier(id) => id.name.clone(),
-            EventControl::HierIdentifier(e) => self.expr_snippet(e),
+            EventControl::HierIdentifier(e) => self.expr_snippet_in(e, src_file),
             EventControl::EventExpr(terms) => terms
                 .iter()
                 .map(|t| {
@@ -15099,7 +15161,7 @@ impl Simulator {
                         Some(Edge::Edge) => "edge ",
                         None => "",
                     };
-                    format!("{}{}", edge, self.expr_snippet(&t.expr))
+                    format!("{}{}", edge, self.expr_snippet_in(&t.expr, src_file))
                 })
                 .collect::<Vec<_>>()
                 .join(" or "),

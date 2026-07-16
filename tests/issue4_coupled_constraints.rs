@@ -290,3 +290,33 @@ endmodule
         );
     }
 }
+
+/// §18.3: `std::randomize` of an enum-typed variable draws only DECLARED
+/// member values — a raw width draw yielded out-of-member encodings (8..15
+/// for an 8-member `enum bit [3:0]`), breaking bounds checks and `.name()`.
+#[test]
+fn std_randomize_enum_draws_declared_members_only() {
+    const SRC: &str = r#"
+package p;
+  typedef enum bit [3:0] { A0=0, A1=1, A2=2, A3=3, A4=4, A5=5, A6=6, A7=7 } op_e;
+endpackage
+module tb;
+  import p::*;
+  op_e op;
+  int bad = 0;
+  int uniq = 0;
+  bit seen [16];
+  initial begin
+    repeat (200) begin
+      void'(std::randomize(op));
+      if (!(op inside {A0,A1,A2,A3,A4,A5,A6,A7})) bad++;
+      seen[op] = 1;
+    end
+    foreach (seen[i]) if (seen[i]) uniq++;
+  end
+endmodule
+"#;
+    let sim = simulate(SRC, 10_000).expect("simulate failed");
+    assert_eq!(u(&sim, "bad"), 0, "every draw must be a declared enum member");
+    assert!(u(&sim, "uniq") > 1, "distribution must cover multiple members");
+}

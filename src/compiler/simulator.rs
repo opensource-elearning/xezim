@@ -41733,6 +41733,29 @@ impl Simulator {
                 }
                 continue;
             }
+            // §18.3: an enum-typed variable randomizes over its DECLARED
+            // members only. The raw width-masked draw below yields encodings
+            // outside the member set (an 8-member `enum bit [3:0]` came back
+            // 8..15 nearly half the time), which also breaks `.name()` on the
+            // result. Constraints in a `with {}` clause still refine the value
+            // afterwards, exactly as for a plain integral target.
+            if let ExprKind::Ident(h) = &a.kind {
+                if h.path.last().map(|s| s.selects.is_empty()).unwrap_or(false) {
+                    let bare = h.path.last().unwrap().name.name.clone();
+                    let members = self
+                        .type_name_of_var(&bare)
+                        .and_then(|tn| self.module.enum_members.get(&tn).cloned());
+                    if let Some(members) = members {
+                        if !members.is_empty() {
+                            let w = self.infer_lhs_width(a).max(1);
+                            let i = self.cur_rng().gen_range(0..members.len());
+                            let rv = Value::from_u64(members[i].1, w);
+                            self.assign_value(a, &rv);
+                            continue;
+                        }
+                    }
+                }
+            }
             let w = self.infer_lhs_width(a).max(1);
             let rv = if w <= 64 {
                 let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };

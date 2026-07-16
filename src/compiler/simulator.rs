@@ -41699,18 +41699,58 @@ impl Simulator {
         Some(out)
     }
 
+    /// §18.3: enum-member domain of the DECLARED type of `name` — a scalar
+    /// variable, an array/queue name (whose `var_decl_types` entry is already
+    /// the ELEMENT type) or a flattened struct-member path (`s.op`). Follows
+    /// typedef alias chains so an aliased enum still resolves. `None` (or an
+    /// empty domain, which callers must treat the same) for non-enum types.
+    fn declared_enum_members(&self, name: &str) -> Option<Vec<(String, u64)>> {
+        if let Some(tn) = self.type_name_of_var(name) {
+            if let Some(m) = self.module.enum_members.get(&tn) {
+                return Some(m.clone());
+            }
+        }
+        let mut cur = self.p_elem_type(name)?;
+        for _ in 0..8 {
+            let DataType::TypeReference { name: tn, .. } = &cur else { break };
+            let tn = tn.name.name.clone();
+            if let Some(m) = self.module.enum_members.get(&tn) {
+                return Some(m.clone());
+            }
+            match self.module.typedef_types.get(&tn) {
+                Some(next) => cur = next.clone(),
+                None => break,
+            }
+        }
+        None
+    }
+
     /// `std::randomize(v1, v2, ...)` — assign each listed lvalue a fresh random
     /// value sized to its inferred width. Struct targets are randomized member
     /// by member. Best-effort: inline `with` constraints are solved separately
     /// in `eval_randomize_with`. Always reports success.
+    ///
+    /// §18.3: every path here (scalar, struct field, array/queue element) must
+    /// draw an ENUM-typed destination from its DECLARED member list only — a
+    /// raw width-masked draw yields encodings outside the member set (an
+    /// 8-member `enum bit [3:0]` came back 8..15 nearly half the time) and
+    /// breaks `.name()` on the result. Constraints in a `with {}` clause still
+    /// refine the value afterwards, exactly as for a plain integral target.
     fn exec_std_randomize(&mut self, args: &[Expression]) -> Value {
         use rand::Rng;
         for a in args {
-            // Struct target: randomize each field individually.
+            // Struct target: randomize each field individually. An enum FIELD
+            // (`struct { op_e op; int x; }`) draws a declared member.
             if let Some(fields) = self.expand_struct_target(a) {
-                for (_name, fexpr) in &fields {
+                for (name, fexpr) in &fields {
                     let w = self.infer_lhs_width(fexpr).max(1);
-                    let rv = if w <= 64 {
+                    let members = self
+                        .declared_enum_members(name)
+                        .filter(|m| !m.is_empty());
+                    let rv = if let Some(ms) = members {
+                        let i = self.cur_rng().gen_range(0..ms.len());
+                        Value::from_u64(ms[i].1, w)
+                    } else if w <= 64 {
                         let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
                         Value::from_u64(self.cur_rng().gen::<u64>() & mask, w)
                     } else {
@@ -41723,36 +41763,40 @@ impl Simulator {
             // Array/queue target: randomize each element (a scalar assign to the
             // array name would corrupt it). A `with { foreach … inside {…} }`
             // clause, if present, then refines each element via Foreach below.
+            // An enum ELEMENT type (`op_e arr[4]`, `op_e q[$]`) draws declared
+            // members — `var_decl_types[nm]` is already the element type.
             if let Some(nm) = self.array_operand_name(a) {
                 let size = self.get_queue_size(&nm);
                 let w = self.module.arrays.get(&nm).map(|t| t.2).unwrap_or(32).max(1);
+                let members = self
+                    .declared_enum_members(&nm)
+                    .filter(|m| !m.is_empty());
                 for i in 0..size {
-                    let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
-                    let rv = Value::from_u64(self.cur_rng().gen::<u64>() & mask, w);
+                    let rv = if let Some(ms) = &members {
+                        let k = self.cur_rng().gen_range(0..ms.len());
+                        Value::from_u64(ms[k].1, w)
+                    } else {
+                        let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+                        Value::from_u64(self.cur_rng().gen::<u64>() & mask, w)
+                    };
                     self.set_signal_value_by_name(&format!("{}[{}]", nm, i), rv);
                 }
                 continue;
             }
-            // §18.3: an enum-typed variable randomizes over its DECLARED
-            // members only. The raw width-masked draw below yields encodings
-            // outside the member set (an 8-member `enum bit [3:0]` came back
-            // 8..15 nearly half the time), which also breaks `.name()` on the
-            // result. Constraints in a `with {}` clause still refine the value
-            // afterwards, exactly as for a plain integral target.
+            // Scalar enum-typed variable (§18.3, commit 18b8534) — now via
+            // `declared_enum_members`, which also chases typedef aliases.
             if let ExprKind::Ident(h) = &a.kind {
                 if h.path.last().map(|s| s.selects.is_empty()).unwrap_or(false) {
                     let bare = h.path.last().unwrap().name.name.clone();
                     let members = self
-                        .type_name_of_var(&bare)
-                        .and_then(|tn| self.module.enum_members.get(&tn).cloned());
+                        .declared_enum_members(&bare)
+                        .filter(|m| !m.is_empty());
                     if let Some(members) = members {
-                        if !members.is_empty() {
-                            let w = self.infer_lhs_width(a).max(1);
-                            let i = self.cur_rng().gen_range(0..members.len());
-                            let rv = Value::from_u64(members[i].1, w);
-                            self.assign_value(a, &rv);
-                            continue;
-                        }
+                        let w = self.infer_lhs_width(a).max(1);
+                        let i = self.cur_rng().gen_range(0..members.len());
+                        let rv = Value::from_u64(members[i].1, w);
+                        self.assign_value(a, &rv);
+                        continue;
                     }
                 }
             }

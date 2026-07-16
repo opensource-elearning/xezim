@@ -320,3 +320,52 @@ endmodule
     assert_eq!(u(&sim, "bad"), 0, "every draw must be a declared enum member");
     assert!(u(&sim, "uniq") > 1, "distribution must cover multiple members");
 }
+
+/// §18.3 siblings of `std_randomize_enum_draws_declared_members_only`: the
+/// STRUCT-field, ARRAY-element and QUEUE-element paths of `exec_std_randomize`
+/// still drew raw width-masked bits for an enum-typed destination, yielding
+/// out-of-member encodings (8..15 for an 8-member `enum bit [3:0]`).
+#[test]
+fn std_randomize_enum_struct_array_queue_declared_members_only() {
+    const SRC: &str = r#"
+package p;
+  typedef enum bit [3:0] { A0=0, A1=1, A2=2, A3=3, A4=4, A5=5, A6=6, A7=7 } op_e;
+endpackage
+module tb;
+  import p::*;
+  typedef struct { op_e op; int x; } s_t;
+  s_t s;
+  op_e arr [4];
+  op_e q [$];
+  int bad_s = 0, bad_a = 0, bad_q = 0;
+  int uniq = 0;
+  bit seen [16];
+  initial begin
+    q.push_back(A0); q.push_back(A0);
+    repeat (50) begin
+      void'(std::randomize(s));
+      if (!(s.op inside {A0,A1,A2,A3,A4,A5,A6,A7})) bad_s++;
+      seen[s.op] = 1;
+      void'(std::randomize(arr));
+      foreach (arr[i]) begin
+        if (!(arr[i] inside {A0,A1,A2,A3,A4,A5,A6,A7})) bad_a++;
+        seen[arr[i]] = 1;
+      end
+      void'(std::randomize(q));
+      foreach (q[i]) begin
+        if (!(q[i] inside {A0,A1,A2,A3,A4,A5,A6,A7})) bad_q++;
+        seen[q[i]] = 1;
+      end
+    end
+    foreach (seen[i]) if (seen[i]) uniq++;
+  end
+endmodule
+"#;
+    for seed in [1u64, 7, 42] {
+        let sim = run_seed(SRC, seed);
+        assert_eq!(u(&sim, "bad_s"), 0, "seed {}: struct enum field out of member set", seed);
+        assert_eq!(u(&sim, "bad_a"), 0, "seed {}: array enum element out of member set", seed);
+        assert_eq!(u(&sim, "bad_q"), 0, "seed {}: queue enum element out of member set", seed);
+        assert!(u(&sim, "uniq") > 1, "seed {}: distribution must cover multiple members", seed);
+    }
+}

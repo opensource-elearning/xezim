@@ -314,6 +314,14 @@ fn stall_report_resolves_file_line_in_multi_file_designs() {
         "offender line must classify the re-arm:\n{}",
         stderr
     );
+    // The zero-valued delay EXPRESSION must be quoted — `#(p/2)` with an
+    // uninitialized real period is the classic accidental livelock, and
+    // "re-arming via #0 delay" alone hides where the zero comes from.
+    assert!(
+        stderr.contains("re-arming via #(p/2) — currently 0"),
+        "the delay expression and its zero value must be shown:\n{}",
+        stderr
+    );
     assert!(
         stderr.contains("ran 1000 times at this timestamp"),
         "the established count phrasing must survive:\n{}",

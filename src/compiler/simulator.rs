@@ -15039,7 +15039,21 @@ impl Simulator {
             }
         }
         // Parked in the Inactive region — only a `#0` puts a process here.
-        if self.inactive_queue.iter().any(|(p, _)| *p == pid) {
+        // Its continuation usually loops back through the timing control that
+        // re-arms it (a `forever`/`always` body), so classify that first to
+        // recover the actual delay expression (`#(p/2) — currently 0`);
+        // degrade to the plain form when the continuation says nothing.
+        if let Some((_, cont)) = self.inactive_queue.iter().find(|(p, _)| *p == pid) {
+            let cont = cont.clone();
+            if let Some(r) = self.classify_stall_stmts(&cont, 0, src_file) {
+                // Being parked here PROVES the re-arm was a zero delay; take
+                // the classification only when it agrees (it then carries the
+                // delay's source text), lest a later suspension point in the
+                // continuation (an @(...) after the #0) misattribute the spin.
+                if r.starts_with("re-arming via #") {
+                    return Some(r);
+                }
+            }
             return Some("re-arming via #0 delay".to_string());
         }
         // Blocked on @(...) — if it is also a top spinner, something keeps
@@ -15100,6 +15114,19 @@ impl Simulator {
                 StatementKind::TimingControl { control, .. } => match control {
                     TimingControl::Delay(d) => {
                         if !Self::expr_contains_call(d) && self.eval_delay_ticks(d) == 0 {
+                            // Quote the delay EXPRESSION when it is more than
+                            // a literal `0` (mirroring how the wait case
+                            // quotes its condition) — `#(p/2)` evaluating to
+                            // zero is the classic uninitialized-period clock,
+                            // and the report should make that legible.
+                            if let Some(src) = self.span_source_snippet_in(d.span, src_file) {
+                                if src != "0" {
+                                    return Some(format!(
+                                        "re-arming via #({}) — currently 0",
+                                        src
+                                    ));
+                                }
+                            }
                             return Some("re-arming via #0 delay".to_string());
                         }
                         // A real (nonzero/unknown) delay ahead would advance

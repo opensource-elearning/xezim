@@ -2373,6 +2373,15 @@ pub struct Simulator {
     /// m_select_sequence do-while's m_choose_next_request call).
     return_flag: bool,
     rs_return_flag: bool,
+    /// Set when `exec_statement`'s Wait handler parks the process via
+    /// `exec_park_cont`. Must propagate through method-frame save/restore.
+    parked_from_exec: bool,
+    /// When `exec_statement` encounters a blocking `wait(cond)` with a
+    /// FALSE condition inside a loop body (foreach/while/for), it cannot park
+    /// (it has no continuation). `run_process_stmts` sets this to the full
+    /// continuation `[stmt, stmts[i+1..]]` before calling `exec_statement`, and
+    /// `exec_statement`'s Wait handler reads it to park the process.
+    exec_park_cont: Option<Vec<Statement>>,
     /// SV-2023: target named block for `disable <name>` propagation.
     disable_target: Option<String>,
     /// Label of a process-level named block (`initial begin : worker`) -> its
@@ -4239,6 +4248,8 @@ impl Simulator {
             continue_flag: false,
             return_flag: false,
             rs_return_flag: false,
+            parked_from_exec: false,
+            exec_park_cont: None,
             disable_target: None,
             disable_labels: HashMap::default(),
             fork_block_children: HashMap::default(),
@@ -16526,6 +16537,11 @@ impl Simulator {
     }
 
     fn run_scheduled_process(&mut self, pid: usize, stmts: &[Statement]) {
+        // Flags from a prior process must not leak into this one.
+        self.break_flag = false;
+        self.return_flag = false;
+        self.continue_flag = false;
+        self.parked_from_exec = false;
         // A process terminated by `disable fork` (LRM §9.6.2) must not run any
         // remaining queued continuation (e.g. the resume of a `#delay` it was
         // parked on when killed). Pids are monotonic and never reused, so it is
@@ -17112,8 +17128,8 @@ impl Simulator {
             // tasks with no top-level wait) keep the synchronous path.
             if let StatementKind::Expr(expr) = &stmt.kind {
                 if let ExprKind::Call { func, args } = &expr.kind {
-                    // (receiver_handle, method_name, this_changes)
                     let resolved: Option<(usize, String, bool)> = match &func.kind {
+                        // (receiver_handle, method_name, this_changes)
                         ExprKind::Ident(h) if h.path.len() == 1 => self
                             .this_stack
                             .last()
@@ -17397,13 +17413,13 @@ impl Simulator {
                 continue;
             }
 
-            // Check for wait statement — blocks until condition is true
             if let StatementKind::Wait {
                 condition,
                 stmt: body,
             } = &stmt.kind
             {
-                if self.eval_expr(condition).is_true() {
+                let cond_val = self.eval_expr(condition);
+                if cond_val.is_true() {
                     self.cond_progress = self.cond_progress.wrapping_add(1);
                     self.exec_statement(body);
                     i += 1;
@@ -17729,7 +17745,22 @@ impl Simulator {
                         // target already terminated — fall through
                     }
                 }
+                // Set up a parking continuation for blocking waits inside
+                // loop bodies (foreach) processed by exec_statement's
+                // synchronous path. exec_statement's Wait handler reads this
+                // to park the process with `[stmt, rest]` when a wait
+                // condition is false, so the process re-runs this statement
+                // when resumed.
+                if matches!(&stmt.kind, StatementKind::Foreach { .. }) {
+                    self.exec_park_cont = Some({
+                        let mut c = vec![stmt.clone()];
+                        c.extend_from_slice(&stmts[i + 1..]);
+                        c
+                    });
+                }
                 self.exec_statement(stmt);
+                self.exec_park_cont = None;
+                self.parked_from_exec = false;
             }
 
             // Check for WaitFork
@@ -17957,6 +17988,7 @@ impl Simulator {
                     | "do_get"
                     | "do_peek"
                     | "transport"
+                    | "wait_for_state"
             )
         )
     }
@@ -29847,6 +29879,19 @@ impl Simulator {
             StatementKind::Wait { condition, stmt } => {
                 if self.eval_expr(condition).is_true() {
                     self.exec_statement(stmt);
+                } else {
+                    // IEEE 1800-2023 §9.7.4: `wait(cond)` must block when the
+                    // condition is false. `exec_statement` is the synchronous
+                    // path (used for loop bodies), so it normally can't park.
+                    // But `run_process_stmts` may have set `exec_park_cont` to
+                    // the full continuation. If so, park the process and set
+                    // return_flag to unwind all the way back to run_process_stmts.
+                    if let Some(cont) = self.exec_park_cont.take() {
+                        self.condition_waiters.push((self.current_pid, cont));
+                        self.parked_from_exec = true;
+                        self.return_flag = true;
+                        self.break_flag = true;
+                    }
                 }
             }
             StatementKind::Assertion(a) => {
@@ -46279,15 +46324,6 @@ impl Simulator {
                     return Value::zero(32);
                 }
                 if name == "run_test" && real_uvm {
-                    // Real UVM 1.2 is in the design. Its uvm_root::run_test
-                    // drives phasing via `fork m_run_phases join_none; wait(
-                    // m_phase_all_done)`, which needs blocking task/method-call
-                    // suspension the scheduler doesn't provide for inlined task
-                    // calls — so the forked phase runner never advances and the
-                    // initial process falls straight through to $finish. Drive
-                    // the standard phase methods directly over the component
-                    // tree instead, reusing the factory (already working) for
-                    // component construction.
                     let test_name = args.first().and_then(|a| {
                         if let ExprKind::StringLiteral(s) = &a.kind { Some(s.clone()) } else { None }
                     });
@@ -54807,7 +54843,6 @@ impl Simulator {
         while let Some(cname) = cur_class {
             if let Some(class_def) = self.module.classes.get(&cname).cloned() {
                 if let Some(method) = class_def.methods.get(method_name) {
-                    let mut locals = HashMap::default();
                     let (ports, body) = match &method.kind {
                         ClassMethodKind::Function(f) => (&f.ports, &f.items),
                         ClassMethodKind::Task(t) => (&t.ports, &t.items),
@@ -54816,6 +54851,7 @@ impl Simulator {
                             continue;
                         }
                     };
+                    let mut locals: HashMap<String, Value> = HashMap::default();
                     // §13.5.3: reorder named args into formal order and fill any
                     // omitted (`.name()` / positional `,,`) slot from the formal's
                     // default before positional binding below.
@@ -55115,9 +55151,15 @@ impl Simulator {
                     }
                     self.current_spec = saved_spec;
                     self.local_iface_aliases.pop();
-                    self.break_flag = saved_break;
-                    self.continue_flag = saved_continue;
-                    self.return_flag = saved_return;
+                    if self.parked_from_exec {
+                        // The process was parked by exec_statement's Wait handler.
+                        // Keep break/return flags set so they propagate up to
+                        // run_process_stmts. Don't restore the saved values.
+                    } else {
+                        self.break_flag = saved_break;
+                        self.continue_flag = saved_continue;
+                        self.return_flag = saved_return;
+                    }
                     self.class_context_stack.pop();
                     let implicit = fn_ret_name.as_ref().and_then(|rn| {
                         let lv = self.local_stack.last().and_then(|m| m.get(rn).cloned());

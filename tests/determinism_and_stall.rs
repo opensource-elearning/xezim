@@ -176,6 +176,164 @@ endmodule
     assert_eq!(sim.time, 0, "wait-on-true livelock cannot advance time");
 }
 
+/// The stall report must name the RTL behind each spinner, not just a bare
+/// pid: the creating construct's kind + file:line, the instance path, and the
+/// re-arm reason. Asserted through the CLI binary (the report goes to stderr,
+/// which the in-process `simulate_multi` harness can't capture) — same
+/// subprocess pattern as tests/log_redirect.rs.
+#[test]
+fn stall_report_names_the_rtl_behind_each_spinner() {
+    use std::process::Command;
+
+    fn xezim_bin() -> std::path::PathBuf {
+        // target/release/deps/<test binary> -> target/release/xezim
+        let mut p = std::env::current_exe().expect("current_exe");
+        p.pop();
+        if p.ends_with("deps") {
+            p.pop();
+        }
+        p.join("xezim")
+    }
+
+    let dir = std::env::temp_dir().join("xezim_stall_report_test");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+
+    // Shape (a): `initial forever begin #0; ... end` in the top module.
+    // The `initial` sits on line 3 of the file.
+    let sv_a = dir.join("stall_shape_a.sv");
+    std::fs::write(
+        &sv_a,
+        "module tb;\n  int n = 0;\n  initial forever begin\n    #0;\n    n++;\n  end\nendmodule\n",
+    )
+    .expect("write sv");
+    let out = Command::new(xezim_bin())
+        .env("XEZIM_STALL_LIMIT", "1000")
+        .arg(&sv_a)
+        .output()
+        .expect("run xezim");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("simulation STALLED"), "no stall report:\n{}", stderr);
+    assert!(
+        stderr.contains(&format!("initial block at {}:3", sv_a.display())),
+        "offender line must carry the construct kind and file:line:\n{}",
+        stderr
+    );
+    assert!(
+        stderr.contains("re-arming via #0 delay"),
+        "offender line must classify the #0 re-arm:\n{}",
+        stderr
+    );
+    assert!(
+        stderr.contains("ran 1000 times at this timestamp"),
+        "the established count phrasing must survive:\n{}",
+        stderr
+    );
+
+    // The same livelock buried two instances deep: the offender must be
+    // located by INSTANCE PATH, not just by module/file.
+    let sv_d = dir.join("stall_shape_d.sv");
+    std::fs::write(
+        &sv_d,
+        "module leaf;\n  int n = 0;\n  initial forever begin\n    #0;\n    n++;\n  end\nendmodule\nmodule mid;\n  leaf u_leaf();\nendmodule\nmodule top;\n  mid u_mid();\nendmodule\n",
+    )
+    .expect("write sv");
+    let out = Command::new(xezim_bin())
+        .env("XEZIM_STALL_LIMIT", "1000")
+        .arg(&sv_d)
+        .output()
+        .expect("run xezim");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("(top.u_mid.u_leaf, module leaf)"),
+        "offender must be named by its instance path AND defining module:\n{}",
+        stderr
+    );
+    assert!(
+        stderr.contains(&format!("initial block at {}:3", sv_d.display())),
+        "nested offender must still resolve to file:line:\n{}",
+        stderr
+    );
+    assert!(stderr.contains("re-arming via #0 delay"), "{}", stderr);
+}
+
+/// A MULTI-FILE design must still get file:line in the stall report. Spans
+/// are per-file byte offsets, so with several files an offset alone cannot
+/// name its file — the report used to silently drop the location whenever
+/// more than one file was long enough to contain the offset. The offender's
+/// instance scope names its defining module, and the elaborator now records
+/// which file defined each module, so the span resolves against exactly that
+/// file's text.
+#[test]
+fn stall_report_resolves_file_line_in_multi_file_designs() {
+    use std::process::Command;
+
+    fn xezim_bin() -> std::path::PathBuf {
+        let mut p = std::env::current_exe().expect("current_exe");
+        p.pop();
+        if p.ends_with("deps") {
+            p.pop();
+        }
+        p.join("xezim")
+    }
+
+    let dir = std::env::temp_dir().join("xezim_stall_report_multifile_test");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+
+    // f1: an uninitialized-real clock period — the classic accidental
+    // zero-delay livelock. The `always` sits on line 4 of f1.
+    let f1 = dir.join("stall_mf_dut.sv");
+    std::fs::write(
+        &f1,
+        "module dut;\n  real p;\n  reg clk = 0;\n  always #(p/2) clk = ~clk;\nendmodule\n",
+    )
+    .expect("write f1");
+    // f2: the top, PADDED so it is longer than f1's span offsets — the
+    // exact-fit fallback alone would then refuse to resolve (ambiguous).
+    let f2 = dir.join("stall_mf_top.sv");
+    std::fs::write(
+        &f2,
+        "module top;\n  localparam int PAD0 = 0;\n  localparam int PAD1 = 1;\n  localparam int PAD2 = 2;\n  localparam int PAD3 = 3;\n  dut u_dut();\nendmodule\n",
+    )
+    .expect("write f2");
+
+    let out = Command::new(xezim_bin())
+        .env("XEZIM_STALL_LIMIT", "1000")
+        .arg(&f1)
+        .arg(&f2)
+        .output()
+        .expect("run xezim");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("simulation STALLED"), "no stall report:\n{}", stderr);
+    assert!(
+        stderr.contains(&format!("always block at {}:4", f1.display())),
+        "multi-file offender must resolve to its OWN file's line:\n{}",
+        stderr
+    );
+    assert!(
+        stderr.contains("(top.u_dut, module dut)"),
+        "instance path must carry the defining module's name:\n{}",
+        stderr
+    );
+    assert!(
+        stderr.contains("re-arming via"),
+        "offender line must classify the re-arm:\n{}",
+        stderr
+    );
+    // The zero-valued delay EXPRESSION must be quoted — `#(p/2)` with an
+    // uninitialized real period is the classic accidental livelock, and
+    // "re-arming via #0 delay" alone hides where the zero comes from.
+    assert!(
+        stderr.contains("re-arming via #(p/2) — currently 0"),
+        "the delay expression and its zero value must be shown:\n{}",
+        stderr
+    );
+    assert!(
+        stderr.contains("ran 1000 times at this timestamp"),
+        "the established count phrasing must survive:\n{}",
+        stderr
+    );
+}
+
 /// The detector must not fire on a design that merely uses several delta cycles
 /// at one timestamp — NBA settling, `#0` used once, zero-delay fork/join are all
 /// legal and common.

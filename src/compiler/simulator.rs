@@ -46174,12 +46174,34 @@ impl Simulator {
             let concrete = self
                 .resolve_type_param_binding(tn)
                 .unwrap_or_else(|| tn.clone());
-            return self
-                .module
-                .typedef_unpacked_dims
-                .get(&concrete)
-                .map(|dims| dims.iter().any(|d| matches!(d, UD::Associative { .. })))
-                .unwrap_or(false);
+            if let Some(dims) = self.module.typedef_unpacked_dims.get(&concrete) {
+                return dims.iter().any(|d| matches!(d, UD::Associative { .. }));
+            }
+            // CLASS-LOCAL typedef (`typedef bit edges_t[Node];` inside the
+            // class — UVM's phase-DAG `edges_t` shape): the dim lives on the
+            // class's own typedef table, not the module's. Walk the current
+            // class context and its ancestors.
+            let mut cur = self
+                .class_context_stack
+                .last()
+                .cloned()
+                .flatten()
+                .or_else(|| {
+                    self.this_stack.last().copied().flatten().and_then(|h| {
+                        self.heap.get(h).and_then(|x| x.as_ref()).map(|i| i.class_name.clone())
+                    })
+                });
+            while let Some(cn) = cur {
+                if let Some(cd) = self.module.classes.get(&cn) {
+                    if let Some(dims) = cd.typedef_unpacked_dims.get(&concrete) {
+                        return dims.iter().any(|d| matches!(d, UD::Associative { .. }));
+                    }
+                    cur = cd.extends.clone();
+                } else {
+                    break;
+                }
+            }
+            return false;
         }
         false
     }

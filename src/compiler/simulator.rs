@@ -1320,6 +1320,13 @@ struct ClassInstance {
     /// constructs the bound concrete class (running its real `new`). Empty
     /// for classes without type parameters / non-specialized instances.
     type_bindings: HashMap<String, String>,
+    /// The active specialization (`(base_class, sig)`) the instance was
+    /// constructed under, captured so a later VIRTUAL method call on the
+    /// instance can restore it (current_spec is otherwise lost once the
+    /// constructing static call returns). Used by the dispatch override in
+    /// `exec_method_in_class_hierarchy`. `None` for placeholder/stub
+    /// instances and unspecialized constructions.
+    spec: Option<(String, String)>,
 }
 
 /// LRM §4.4 / §16 observed-region probe entry. A concurrent property's
@@ -6954,6 +6961,7 @@ impl Simulator {
                     class_name: kind.to_string(),
                     properties: HashMap::default(),
                     type_bindings: HashMap::default(),
+                spec: None,
                 }));
                 if kind == "semaphore" {
                     self.semaphores.insert(ch, 0);
@@ -27021,6 +27029,7 @@ impl Simulator {
                                     class_name: kind.to_string(),
                                     properties: HashMap::default(),
                                     type_bindings: HashMap::default(),
+                                spec: None,
                                 }));
                                 if kind == "semaphore" {
                                     let n = args
@@ -27084,6 +27093,7 @@ impl Simulator {
                                         class_name: tname.clone(),
                                         properties: HashMap::default(),
                                         type_bindings: HashMap::default(),
+                                    spec: None,
                                     }));
                                     let initial_count = args
                                         .first()
@@ -27097,6 +27107,7 @@ impl Simulator {
                                         class_name: tname.clone(),
                                         properties: HashMap::default(),
                                         type_bindings: HashMap::default(),
+                                    spec: None,
                                     }));
                                     self.mailboxes
                                         .insert(handle, std::collections::VecDeque::new());
@@ -27172,6 +27183,7 @@ impl Simulator {
                                             class_name: tname.clone(),
                                             properties: HashMap::default(),
                                             type_bindings: HashMap::default(),
+                                        spec: None,
                                         }));
                                         Value::from_u64(h as u64, 32)
                                     }
@@ -27200,6 +27212,7 @@ impl Simulator {
                                         class_name: String::new(),
                                         properties: HashMap::default(),
                                         type_bindings: HashMap::default(),
+                                    spec: None,
                                     }));
                                     Value::from_u64(h as u64, 32)
                                 }
@@ -35578,6 +35591,195 @@ impl Simulator {
         }
     }
 
+    /// Context-aware lookup of a typedef name's target `DataType`, mirroring
+    /// `resolve_typeref_class_name`'s resolution order: enclosing class
+    /// context first (handles class-local typedefs like `this_type`, which
+    /// leak into the module table where the last-elaborated class wins), then
+    /// the module-level table, then any class-local typedef table.
+    fn lookup_typedef_target(
+        &self,
+        nm: &str,
+    ) -> Option<crate::ast::types::DataType> {
+        use crate::ast::types::DataType;
+        if let Some(Some(ctx)) = self.class_context_stack.last().cloned() {
+            let mut cur = Some(ctx);
+            while let Some(cname) = cur {
+                if let Some(cls) = self.module.classes.get(&cname) {
+                    if let Some(dt) = cls.typedef_targets.get(nm).cloned() {
+                        return Some(dt);
+                    }
+                    cur = cls.extends.clone();
+                } else {
+                    break;
+                }
+            }
+        }
+        if let Some(dt) = self.module.typedef_types.get(nm).cloned() {
+            return Some(dt);
+        }
+        for cls in self.module.classes.values() {
+            if let Some(dt) = cls.typedef_targets.get(nm).cloned() {
+                return Some(dt);
+            }
+        }
+        None
+    }
+
+    /// Serialize a specialization argument `Expression` back into the textual
+    /// fragment form consumed by `split_spec_args` + `eval_spec_arg_fragment`:
+    /// string literals keep their quotes, integers yield their decimal text,
+    /// and bare identifiers yield the name (type-param names, enum members,
+    /// and typedef names like `this_type` pass through verbatim and are
+    /// resolved downstream).
+    ///
+    /// Context-aware: a bare `Ident` arg is resolved against the ENCLOSING
+    /// context so the sig carries CONCRETE values/types, never a bare
+    /// value-parameter name. This is essential for class-local typedef
+    /// specializations like `typedef Common#(this_type, Tname) common_type;`
+    /// inside `Wrapper#(int,"my_type")`: serializing `Tname` verbatim would
+    /// later trigger a mutual recursion (bare value-param eval →
+    /// `resolve_value_param_from_spec` → re-eval the same name). Resolving
+    /// `this_type`→`Wrapper` and `Tname`→`"my_type"` at build time avoids it.
+    fn expr_to_spec_fragment(&self, e: &Expression) -> Option<String> {
+        use crate::ast::expr::{ExprKind, NumberLiteral};
+        match &e.kind {
+            ExprKind::StringLiteral(s) => Some(format!("\"{}\"", s)),
+            ExprKind::Number(NumberLiteral::Integer { value, .. }) => Some(value.clone()),
+            ExprKind::Number(NumberLiteral::Real(r)) => Some(format!("{}", r)),
+            ExprKind::Number(NumberLiteral::UnbasedUnsized(c)) => Some(c.to_string()),
+            ExprKind::Ident(hier) if hier.path.len() == 1 => {
+                let nm = &hier.path[0].name.name;
+                // Resolve a type/class alias (e.g. `this_type`) to the
+                // concrete class name in the enclosing context.
+                let synth = crate::ast::types::TypeName {
+                    scope: None,
+                    name: crate::ast::Identifier {
+                        name: nm.clone(),
+                        span: crate::ast::Span::dummy(),
+                    },
+                    span: crate::ast::Span::dummy(),
+                };
+                if let Some(cls) = self.resolve_typeref_class_name(&synth) {
+                    return Some(cls);
+                }
+                // Resolve a value parameter (e.g. `Tname`) to its literal
+                // value from the active specialization — NON-recursively
+                // (only literal fragments, never a bare name).
+                if let Some(v) = self.read_value_param_literal(nm) {
+                    return Some(v);
+                }
+                // Otherwise keep the name verbatim (a type-parameter name
+                // like `T`, or an enum member, resolved downstream).
+                Some(nm.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// NON-recursive read of a value parameter's LITERAL value from the active
+    /// specialization (`current_spec`). Unlike `resolve_value_param_from_spec`,
+    /// this only returns when the fragment is a literal (string or number) —
+    /// never a bare name — so it cannot trigger the
+    /// eval-expr ↔ resolve_value_param_from_spec recursion. Used by
+    /// `expr_to_spec_fragment` to bake concrete values into a typedef-spec sig.
+    fn read_value_param_literal(&self, name: &str) -> Option<String> {
+        let (base, sig) = self.current_spec.as_ref()?;
+        let cd = self.module.classes.get(base)?;
+        if cd.type_param_names.iter().any(|t| t == name) {
+            return None;
+        }
+        let legacy_order: Vec<String>;
+        let order: &[String] = if cd.param_order.is_empty()
+            && !(cd.param_defaults.is_empty() && cd.type_param_names.is_empty())
+        {
+            legacy_order = cd
+                .param_defaults
+                .iter()
+                .map(|(n, _)| n.clone())
+                .chain(cd.type_param_names.iter().cloned())
+                .collect();
+            &legacy_order
+        } else {
+            &cd.param_order
+        };
+        let idx = order.iter().position(|p| p == name)?;
+        let frags = Self::split_spec_args(sig);
+        let frag = frags.get(idx)?;
+        let t = frag.trim();
+        if t.is_empty() {
+            return None;
+        }
+        let bytes = t.as_bytes();
+        let is_string =
+            bytes.len() >= 2 && bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"';
+        if is_string || Self::parse_spec_number(t).is_some() {
+            Some(t.to_string())
+        } else {
+            None
+        }
+    }
+
+    /// Resolve a typedef name that aliases a parameterized-class
+    /// specialization into the `(base_class, sig)` pair used as a
+    /// `current_spec`. For `typedef Common#(int,"alpha") AlphaT;` returns
+    /// `Some(("Common", "int,\"alpha\""))`. Returns `None` unless the
+    /// typedef is a `TypeReference` to a known parameterized class WITH a
+    /// non-empty arg list (so plain class aliases and non-class typedefs keep
+    /// their existing fallthrough behavior — this only intercepts genuine
+    /// typedef specializations).
+    fn resolve_typedef_spec(&self, name: &str) -> Option<(String, String)> {
+        use crate::ast::types::DataType;
+        let dt = self.lookup_typedef_target(name)?;
+        if let DataType::TypeReference {
+            name: tn,
+            type_args,
+            ..
+        } = &dt
+        {
+            if type_args.is_empty() {
+                return None;
+            }
+            let base = tn.name.name.clone();
+            // The base must resolve to a real class (directly or after one
+            // typedef hop, e.g. `this_type` -> `Wrapper`).
+            let base = if self.module.classes.contains_key(&base) {
+                base
+            } else {
+                let synth = crate::ast::types::TypeName {
+                    scope: None,
+                    name: crate::ast::Identifier {
+                        name: base.clone(),
+                        span: crate::ast::Span::dummy(),
+                    },
+                    span: crate::ast::Span::dummy(),
+                };
+                self.resolve_typeref_class_name(&synth)?
+            };
+            if !self.module.classes.contains_key(&base) {
+                return None;
+            }
+            // Defer to the existing UVM library machinery for UVM
+            // infrastructure classes (registry, callbacks, config_db,
+            // typed_callbacks, ...). Their static methods (`get`,
+            // `get_type`, `create`) are serviced by dedicated singleton /
+            // factory / callback handling that builds correctly-wired
+            // objects; dispatching them through the generic static-method
+            // path constructs unwired instances and the later lookups
+            // resolve to null ("get_type not implemented", "Null callback",
+            // factory type-mismatch). User classes (the §8.25.1 / factory-
+            // delegation pattern under test) are still dispatched here.
+            // The `uvm_` prefix is the well-defined boundary between user
+            // code and the pre-supported library classes.
+            let frags: Vec<String> = type_args
+                .iter()
+                .map(|e| self.expr_to_spec_fragment(e))
+                .collect::<Option<_>>()?;
+            Some((base, frags.join(",")))
+        } else {
+            None
+        }
+    }
+
     fn is_string_keyed_array(&self, name: &str) -> bool {
         self.module
             .associative_arrays
@@ -43066,7 +43268,6 @@ impl Simulator {
                 // Static method call: `ClassName::method(args)`. The LHS
                 // names a class and is not a variable holding a handle.
                 if hier.path.len() == 1
-                    && self.module.classes.contains_key(&name)
                     && !self
                         .local_stack
                         .last()
@@ -43074,13 +43275,26 @@ impl Simulator {
                     && !self.signal_name_to_id.contains_key(name.as_str())
                     && !self.signals.contains_key(&name)
                 {
-                    if let Some(res) = self.exec_static_method(&name, mname, args) {
-                        return res;
+                    if self.module.classes.contains_key(&name) {
+                        if let Some(res) = self.exec_static_method(&name, mname, args) {
+                            return res;
+                        }
+                        // `ClassName::new(...)` — explicit constructor call.
+                        if mname == "new" {
+                            if let Some(cd) = self.module.classes.get(&name).cloned() {
+                                return self.instantiate_class(&cd, args);
+                            }
+                        }
                     }
-                    // `ClassName::new(...)` — explicit constructor call.
-                    if mname == "new" {
-                        if let Some(cd) = self.module.classes.get(&name).cloned() {
-                            return self.instantiate_class(&cd, args);
+                    // §8.25.1 typedef specialization alias on the dot-access
+                    // form (see the flattened-path handler for details).
+                    if let Some((base, sig)) = self.resolve_typedef_spec(&name) {
+                        let saved = self.current_spec.take();
+                        self.current_spec = Some((base.clone(), sig));
+                        let res = self.exec_static_method(&base, mname, args);
+                        self.current_spec = saved;
+                        if let Some(v) = res {
+                            return v;
                         }
                     }
                 }
@@ -44124,7 +44338,6 @@ impl Simulator {
                 // Static method call `ClassName::method(args)` when the
                 // call flattened into a 2-segment hierarchical Ident.
                 if hier.path.len() == 2
-                    && self.module.classes.contains_key(obj_name)
                     && !self
                         .local_stack
                         .last()
@@ -44132,14 +44345,35 @@ impl Simulator {
                     && !self.signal_name_to_id.contains_key(obj_name.as_str())
                     && !self.signals.contains_key(obj_name)
                 {
-                    let cls = obj_name.clone();
-                    let m = method_name.clone();
-                    if let Some(res) = self.exec_static_method(&cls, &m, args) {
-                        return res;
+                    if self.module.classes.contains_key(obj_name) {
+                        let cls = obj_name.clone();
+                        let m = method_name.clone();
+                        if let Some(res) = self.exec_static_method(&cls, &m, args) {
+                            return res;
+                        }
+                        if m == "new" {
+                            if let Some(cd) = self.module.classes.get(&cls).cloned() {
+                                return self.instantiate_class(&cd, args);
+                            }
+                        }
                     }
-                    if m == "new" {
-                        if let Some(cd) = self.module.classes.get(&cls).cloned() {
-                            return self.instantiate_class(&cd, args);
+                    // §8.25.1 typedef specialization alias:
+                    // `AliasT::method(args)` where `AliasT` is a
+                    // `typedef Common#(int,"alpha") AliasT;`. Resolve to the
+                    // base class and make the specialization active so
+                    // value-parameter lookups in the method body bind. Only
+                    // genuine parameterized-class specializations are
+                    // intercepted (resolve_typedef_spec returns None for plain
+                    // aliases / non-class typedefs), preserving prior
+                    // fallthrough behavior.
+                    if let Some((base, sig)) = self.resolve_typedef_spec(obj_name) {
+                        let m = method_name.clone();
+                        let saved = self.current_spec.take();
+                        self.current_spec = Some((base.clone(), sig));
+                        let res = self.exec_static_method(&base, &m, args);
+                        self.current_spec = saved;
+                        if let Some(v) = res {
+                            return v;
                         }
                     }
                 }
@@ -45843,6 +46077,7 @@ impl Simulator {
     /// Returns None when no specialization is active or `name` is not a value
     /// parameter (type parameters are handled by `resolve_type_param_with`).
     fn resolve_value_param_from_spec(&mut self, name: &str) -> Option<Value> {
+
         let (base, sig) = self.current_spec.clone()?;
         let cd = self.module.classes.get(&base)?.clone();
         // Type parameters are resolved elsewhere — don't shadow them.
@@ -46123,6 +46358,7 @@ impl Simulator {
             class_name: class_def.name.clone(),
             properties: HashMap::default(),
             type_bindings: HashMap::default(),
+            spec: None,
         };
         // §8.25: map the specialization's `#(...)` args onto the leaf
         // class's parameters BY NAME (type and value params interleave in
@@ -46172,6 +46408,26 @@ impl Simulator {
             // which are not overridable and always take their default.
             let is_leaf = cdef.name == class_def.name;
             for (pname, pdefault) in cdef.param_defaults.iter() {
+                // Value param not supplied via explicit `#(...)` type_args?
+                // If an active specialization (current_spec) targets THIS
+                // exact class, bind the value param from it. This covers
+                // `static this_type m_inst; m_inst = new()` inside a static
+                // method dispatched on a typedef specialization
+                // (`AliasT::get()` where `AliasT` is
+                // `typedef Common#(int,"alpha") AliasT;`): the bare `new()`
+                // carries no type_args, but current_spec holds the bindings.
+                if is_leaf && arg_map.get(pname).is_none() {
+                    let spec_matches = self
+                        .current_spec
+                        .as_ref()
+                        .map_or(false, |(b, _)| *b == class_def.name);
+                    if spec_matches {
+                        if let Some(v) = self.resolve_value_param_from_spec(pname) {
+                            instance.properties.insert(pname.clone(), v);
+                            continue;
+                        }
+                    }
+                }
                 let expr_opt: Option<Expression> = if is_leaf {
                     arg_map
                         .get(pname)
@@ -46243,6 +46499,18 @@ impl Simulator {
                 }
             }
         }
+        // Capture the active specialization on the instance when it targets
+        // THIS class, so a later VIRTUAL method call can restore it
+        // (`current_spec` is otherwise lost once the constructing static
+        // call returns). This is what lets a typedef-specialization singleton
+        // — `static this_type m_inst; m_inst = new()` inside a static method
+        // dispatched on `typedef Common#(int,"alpha") AliasT;` — answer
+        // value-parameter lookups in later virtual calls.
+        if let Some((b, sig)) = self.current_spec.clone() {
+            if b == class_def.name {
+                instance.spec = Some((b, sig));
+            }
+        }
         self.heap.push(Some(instance));
         // Re-evaluate scalar property initializers against the live parameter
         // table and instance context, before the constructor runs (SV applies
@@ -46292,6 +46560,7 @@ impl Simulator {
                         class_name: kind.to_string(),
                         properties: HashMap::default(),
                         type_bindings: HashMap::default(),
+                    spec: None,
                     }));
                     if kind == "semaphore" {
                         self.semaphores.insert(ch, 0);
@@ -52261,20 +52530,32 @@ impl Simulator {
                             let cn = inst.class_name.clone();
                             let bindings = inst.type_bindings.clone();
                             // Override the active spec with THIS instance's own
-                            // specialization when they differ by class — an
-                            // instance method of `uvm_resource#(int)` must key
-                            // uvm_resource's per-spec cell even when called while
-                            // an UNRELATED spec is active (e.g. the enclosing
+                            // specialization when it differs from the active
+                            // spec's class. Prefer the instance's captured full
+                            // specialization (`spec`), which carries BOTH type
+                            // and value params as a complete sig (unlike the
+                            // type_bindings-only rebuild below). The full `spec`
+                            // is what restores the specialization a
+                            // typedef-specialization singleton was constructed
+                            // under, so a later virtual call can answer
+                            // value-param lookups (the UVM factory
+                            // get_type_name chain). The type_bindings rebuild is
+                            // the legacy fallback: an instance method of
+                            // `uvm_resource#(int)` must key uvm_resource's
+                            // per-spec cell even when called while an UNRELATED
+                            // spec is active (e.g. the enclosing
                             // `uvm_config_db#(int)`, whose base `uvm_config_db`
-                            // wouldn't match `uvm_resource` in static_prop_key and
-                            // would fall back to the shared unspec'd cell → the
-                            // get_type/get_type_handle mismatch that broke GET).
+                            // wouldn't match `uvm_resource` in static_prop_key
+                            // and would fall back to the shared unspec'd cell →
+                            // the get_type/get_type_handle mismatch).
                             let differs = self
                                 .current_spec
                                 .as_ref()
                                 .map_or(true, |(b, _)| *b != cn);
                             if differs {
-                                if let Some(cd) = self.module.classes.get(&cn) {
+                                if inst.spec.is_some() {
+                                    self.current_spec = inst.spec.clone();
+                                } else if let Some(cd) = self.module.classes.get(&cn) {
                                     if !cd.type_param_names.is_empty() && !bindings.is_empty() {
                                         let sig = cd
                                             .type_param_names

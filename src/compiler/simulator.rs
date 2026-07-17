@@ -3255,6 +3255,7 @@ impl Simulator {
                 if cd.queue_properties.contains_key(pname)
                     || cd.assoc_properties.contains_key(pname)
                     || cd.array_properties.contains_key(pname)
+                    || cd.array_nd_properties.contains_key(pname)
                     || cd.static_collections.iter().any(|(n, ..)| n == pname)
                 {
                     continue;
@@ -3289,6 +3290,36 @@ impl Simulator {
                         _ => {}
                     }
                     continue;
+                }
+                // Multi-dim fixed member via typedef dims: record the FULL
+                // shape (the `first()`-only match below drops inner dims).
+                if dims.len() >= 2 {
+                    let shape: Option<Vec<(i64, i64)>> = dims
+                        .iter()
+                        .map(|dm| match dm {
+                            UD::Range { left, right, .. } => match (
+                                super::elaborate::const_eval_i64_with_params(left, Some(&params)),
+                                super::elaborate::const_eval_i64_with_params(right, Some(&params)),
+                            ) {
+                                (Some(l), Some(r)) => Some((l.min(r), l.max(r))),
+                                _ => None,
+                            },
+                            UD::Expression { expr, .. } => {
+                                match super::elaborate::const_eval_i64_with_params(
+                                    expr,
+                                    Some(&params),
+                                ) {
+                                    Some(n) if n > 0 => Some((0, n - 1)),
+                                    _ => None,
+                                }
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    if let Some(shape) = shape {
+                        cd.array_nd_properties.insert(pname, (shape, w));
+                        continue;
+                    }
                 }
                 match dims.first() {
                     Some(UD::Associative { data_type: key_dt, .. }) => {
@@ -22351,7 +22382,14 @@ impl Simulator {
                         cur = inner_e.as_ref();
                     }
                     if let ExprKind::Ident(hier) = &cur.kind {
-                        let base_name = self.resolve_hier_name(hier);
+                        let mut base_name = self.resolve_hier_name(hier);
+                        // Bare class-member N-D array inside a method:
+                        // resolve to its per-instance `<handle>#<member>`.
+                        if !self.module.arrays_nd.contains_key(&base_name) {
+                            if let Some(s) = self.instance_assoc_member(&base_name) {
+                                base_name = s;
+                            }
+                        }
                         if let Some((shape, _w)) = self.module.arrays_nd.get(&base_name).cloned() {
                             if rev_idxs.len() == shape.len() {
                                 let mut name = base_name.clone();
@@ -22392,7 +22430,14 @@ impl Simulator {
                 } = &expr.kind
                 {
                     if let ExprKind::Ident(hier) = &inner_expr.kind {
-                        let name = self.resolve_hier_name(hier);
+                        let mut name = self.resolve_hier_name(hier);
+                        // Bare class-member 2D array inside a method:
+                        // resolve to its per-instance `<handle>#<member>`.
+                        if !self.module.arrays_2d.contains_key(&name) {
+                            if let Some(s) = self.instance_assoc_member(&name) {
+                                name = s;
+                            }
+                        }
                         if self.module.arrays_2d.contains_key(&name) {
                             let i = self.eval_expr(inner_idx).to_u64().unwrap_or(0) as i64;
                             let j = self.eval_expr(index).to_u64().unwrap_or(0) as i64;
@@ -24821,7 +24866,14 @@ impl Simulator {
                         cur = inner_e.as_ref();
                     }
                     if let ExprKind::Ident(hier) = &cur.kind {
-                        let base_name = self.resolve_hier_name(hier);
+                        let mut base_name = self.resolve_hier_name(hier);
+                        // Bare class-member N-D array inside a method:
+                        // resolve to its per-instance `<handle>#<member>`.
+                        if !self.module.arrays_nd.contains_key(&base_name) {
+                            if let Some(s) = self.instance_assoc_member(&base_name) {
+                                base_name = s;
+                            }
+                        }
                         if let Some((shape, w)) = self.module.arrays_nd.get(&base_name).cloned() {
                             if rev_idxs.len() == shape.len() {
                                 let mut name = base_name.clone();
@@ -24852,7 +24904,14 @@ impl Simulator {
                 } = &expr.kind
                 {
                     if let ExprKind::Ident(hier) = &inner_expr.kind {
-                        let name = self.resolve_hier_name(hier);
+                        let mut name = self.resolve_hier_name(hier);
+                        // Bare class-member 2D array inside a method:
+                        // resolve to its per-instance `<handle>#<member>`.
+                        if !self.module.arrays_2d.contains_key(&name) {
+                            if let Some(s) = self.instance_assoc_member(&name) {
+                                name = s;
+                            }
+                        }
                         if self.module.arrays_2d.contains_key(&name) {
                             let i = self.eval_expr(inner_idx).to_u64().unwrap_or(0) as i64;
                             let j = self.eval_expr(index).to_u64().unwrap_or(0) as i64;
@@ -27728,7 +27787,14 @@ impl Simulator {
                         _ => false,
                     };
                     if is_new {
-                        if let ExprKind::Ident(bh) = &base.kind {
+                        // Walk a chained-Index base (`foo[i][j] = new(...)` on a
+                        // multi-dim member) to the root Ident — the element
+                        // class is keyed by the base collection's name.
+                        let mut root = base.as_ref();
+                        while let ExprKind::Index { expr: inner, .. } = &root.kind {
+                            root = inner.as_ref();
+                        }
+                        if let ExprKind::Ident(bh) = &root.kind {
                             let bname =
                                 bh.path.last().map(|s| s.name.name.clone()).unwrap_or_default();
                             let elem_cls = self
@@ -27780,8 +27846,11 @@ impl Simulator {
                                 // allocated nested handles instead of the
                                 // source's. The same guards as the plain-handle
                                 // path (`h = new src`): exactly one argument,
-                                // and it must be a handle expression naming a
-                                // live object — never `new(size)`.
+                                // and it must be a STATICALLY class-typed
+                                // handle expression naming a live object —
+                                // never `new(size)` / `new(int_var)` (an int
+                                // whose value collides with a live heap index
+                                // is construction, not a copy).
                                 let arg_could_be_handle = ctor_args
                                     .first()
                                     .map(|a| matches!(
@@ -27789,7 +27858,7 @@ impl Simulator {
                                         ExprKind::Ident(_)
                                             | ExprKind::MemberAccess { .. }
                                             | ExprKind::Index { .. }
-                                    ))
+                                    ) && self.expr_is_class_handle(a))
                                     .unwrap_or(false);
                                 if ctor_args.len() == 1 && arg_could_be_handle {
                                     let src_h =
@@ -28604,11 +28673,13 @@ impl Simulator {
                             // argument that resolves to a live object handle is
                             // shallow-copied into a fresh instance. riscv-dv's
                             // get_rand_instr does `new instr_template[name]`.
-                            // Guard against confusing a small integer literal
-                            // with a handle: only treat the arg as a copy
-                            // source when it's clearly a handle expression
-                            // (Ident/MemberAccess/Index path) — never a
-                            // bare Number, Binary, or SystemCall.
+                            // Guard against confusing an integer with a
+                            // handle: only treat the arg as a copy source
+                            // when it's a STATICALLY class-typed handle
+                            // expression (Ident/MemberAccess/Index path) —
+                            // never a Number, Binary, SystemCall, or an
+                            // int var whose value collides with a live
+                            // heap index (`new(i)` in a loop).
                             let arg_could_be_handle = args
                                 .first()
                                 .map(|a| matches!(
@@ -28616,7 +28687,7 @@ impl Simulator {
                                     ExprKind::Ident(_)
                                         | ExprKind::MemberAccess { .. }
                                         | ExprKind::Index { .. }
-                                ))
+                                ) && self.expr_is_class_handle(a))
                                 .unwrap_or(false);
                             if args.len() == 1 && arg_could_be_handle {
                                 let src_h = self.eval_expr(&args[0]).to_u64().unwrap_or(0) as usize;
@@ -29647,6 +29718,27 @@ impl Simulator {
                             self.restore_loop_vars(&fe_saved);
                             return;
                         }
+                        // Multi-var foreach over a FIXED multi-dim class member
+                        // (`foreach (foo[ia,ib])` on `test_t foo[0:3][0:7]`):
+                        // its per-instance shape is registered in
+                        // arrays_2d/arrays_nd — iterate the rectangle. The
+                        // single-var key-scan below would leave the inner
+                        // index X and mis-parse `i][j` composite keys.
+                        if vars.len() >= 2 {
+                            if let Some(dims) = self.foreach_dims(&an) {
+                                if dims.len() >= vars.len() {
+                                    self.exec_foreach_nested(
+                                        &dims[..vars.len()],
+                                        vars,
+                                        body,
+                                        None,
+                                    );
+                                    self.auto_loop_vars.truncate(fe_auto_len);
+                                    self.restore_loop_vars(&fe_saved);
+                                    return;
+                                }
+                            }
+                        }
                         if let Some(var) = vars.first().and_then(|v| v.as_ref()) {
                             // A queue / dynamic array carries an authoritative
                             // `<name>.size` shadow and is DENSE: iterate the
@@ -29765,6 +29857,26 @@ impl Simulator {
                             if self.module.dynamic_arrays.contains(&name) {
                                 let sz = self.get_queue_size(&name) as i64;
                                 dims[0] = (0, sz - 1);
+                            }
+                            // §12.7.3: a loop var BEYOND the unpacked dims maps
+                            // to the element's packed dimension — `foreach
+                            // (array[i,j,k])` on `reg [3:0] array[0:1][0:2]`
+                            // iterates k over the 4 bits.
+                            if dims.len() + 1 == vars.len() {
+                                let ew = self
+                                    .module
+                                    .arrays
+                                    .get(&name)
+                                    .map(|&(_, _, w)| w)
+                                    .or_else(|| {
+                                        self.module.arrays_2d.get(&name).map(|&(_, _, w)| w)
+                                    })
+                                    .or_else(|| {
+                                        self.module.arrays_nd.get(&name).map(|(_, w)| *w)
+                                    });
+                                if let Some(w) = ew.filter(|&w| w > 1) {
+                                    dims.push((0, w as i64 - 1));
+                                }
                             }
                             if dims.len() >= vars.len() {
                                 self.exec_foreach_nested(
@@ -44306,6 +44418,7 @@ impl Simulator {
             if cd.assoc_properties.contains_key(name)
                 || cd.queue_properties.contains_key(name)
                 || cd.array_properties.contains_key(name)
+                || cd.array_nd_properties.contains_key(name)
             {
                 return Some(format!("{}#{}", handle, name));
             }
@@ -48802,6 +48915,49 @@ impl Simulator {
                     self.signals
                         .insert(format!("{}[{}]", scoped, i), Value::zero(width));
                     self.widths.insert(format!("{}[{}]", scoped, i), width);
+                }
+            }
+            // Per-instance MULTI-dim fixed array members (`test_t foo[0:3][0:7]`):
+            // register the full shape so nested index access and multi-var
+            // foreach resolve, and default every element to 0 (a class-handle
+            // element's default is null). Oversized shapes stay lazy.
+            for (prop, (shape, width)) in &cdef.array_nd_properties {
+                let scoped = format!("{}#{}", handle, prop);
+                if shape.len() == 2 {
+                    self.module
+                        .arrays_2d
+                        .insert(scoped.clone(), (shape[0], shape[1], *width));
+                } else {
+                    self.module
+                        .arrays_nd
+                        .insert(scoped.clone(), (shape.clone(), *width));
+                }
+                let total: i64 = shape
+                    .iter()
+                    .map(|&(lo, hi)| (hi - lo + 1).max(0))
+                    .product();
+                if total > 0 && total <= 65536 {
+                    let mut idx: Vec<i64> = shape.iter().map(|d| d.0).collect();
+                    'fill: loop {
+                        let mut name = scoped.clone();
+                        for v in &idx {
+                            name = format!("{}[{}]", name, v);
+                        }
+                        self.widths.insert(name.clone(), *width);
+                        self.signals.insert(name, Value::zero(*width));
+                        let mut k = shape.len();
+                        loop {
+                            if k == 0 {
+                                break 'fill;
+                            }
+                            k -= 1;
+                            idx[k] += 1;
+                            if idx[k] <= shape[k].1 {
+                                break;
+                            }
+                            idx[k] = shape[k].0;
+                        }
+                    }
                 }
             }
         }
@@ -55278,6 +55434,21 @@ impl Simulator {
             }
         }
         best.map(|(_, n)| n)
+    }
+
+    /// Is `e` STATICALLY a class-handle expression? Guards the §8.12
+    /// copy-constructor reading of `new <src>`: construction vs copy is
+    /// decided by the operand's DECLARED type, never its runtime value —
+    /// an int arg (`new(i)`) whose value collides with a live heap index
+    /// must construct, not shallow-copy heap object #i.
+    fn expr_is_class_handle(&self, e: &Expression) -> bool {
+        if matches!(e.kind, ExprKind::This) {
+            return true;
+        }
+        self.get_expr_type_name(e).is_some_and(|t| {
+            let t = self.resolve_type_param_binding(&t).unwrap_or(t);
+            self.module.classes.contains_key(&t)
+        })
     }
 
     fn get_expr_type_name(&self, expr: &Expression) -> Option<String> {

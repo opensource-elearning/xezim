@@ -176,3 +176,105 @@ module test();
 endmodule
 "#));
 }
+
+/// §8.12 vs constructor call: `foo[i] = new(i)` with an INT arg constructs —
+/// it must never be read as the shallow-copy form `new <src>` just because
+/// the int's value collides with a live heap index (ivtest sv_foreach3/4).
+#[test]
+fn class_new_int_arg_is_construction_not_copy() {
+    assert!(passes(r#"
+module main;
+   class test_t;
+      reg [7:0] a;
+      function new (int ax); a = ax; endfunction
+   endclass
+   class container_t;
+      test_t foo [0:3];
+      task run();
+	 test_t tmp;
+	 for (int i = 0 ; i < 4 ; i++) foo[i] = new(i);
+	 for (int i = 0 ; i < 4 ; i++) begin
+	    tmp = foo[i];
+	    if (tmp == null) begin $display("FAILED -- null %0d", i); $finish; end
+	    if (tmp.a !== 8'(i)) begin $display("FAILED -- a %0d %0d", i, tmp.a); $finish; end
+	 end
+	 $display("PASSED");
+      endtask
+   endclass
+   container_t dut;
+   initial begin dut = new; dut.run; end
+endmodule
+"#));
+}
+
+/// Multi-dim fixed class-array member: element writes/reads (`foo[i][j]`)
+/// and multi-var `foreach (foo[ia,ib])` resolve per-instance storage —
+/// previously only the first dimension was recorded (ivtest sv_foreach3/4).
+#[test]
+fn class_member_2d_array_rw_and_foreach() {
+    assert!(passes(r#"
+module main;
+   class test_t;
+      reg [1:0] a;
+      reg [2:0] b;
+      function new (int ax, int bx); a = ax; b = bx; endfunction
+   endclass
+   class container_t;
+      test_t foo [0:3][0:7];
+      function new();
+	 for (int i = 0 ; i < 4 ; i++)
+	    for (int j = 0 ; j < 8 ; j++)
+	       foo[i][j] = new(i,j);
+      endfunction
+      task run();
+	 test_t tmp;
+	 foreach (foo[ia,ib]) begin
+	    if (ia > 3 || ib > 7) begin
+	       $display("FAILED -- range ia=%0d ib=%0d", ia, ib); $finish;
+	    end
+	    tmp = foo[ia][ib];
+	    if (tmp.a !== ia[1:0] || tmp.b !== ib[2:0]) begin
+	       $display("FAILED -- foo[%0d][%0d] = %b", ia, ib, {tmp.a, tmp.b}); $finish;
+	    end
+	    foo[ia][ib] = null;
+	 end
+	 for (int i = 0 ; i < 4 ; i++)
+	    for (int j = 0 ; j < 8 ; j++)
+	       if (foo[i][j] != null) begin
+		  $display("FAILED -- not visited %0d %0d", i, j); $finish;
+	       end
+	 $display("PASSED");
+      endtask
+   endclass
+   container_t dut;
+   initial begin dut = new; dut.run; end
+endmodule
+"#));
+}
+
+/// §12.7.3: a foreach loop var BEYOND the unpacked dims iterates the
+/// element's packed dimension (ivtest sv_foreach5).
+#[test]
+fn foreach_packed_dim_loop_var() {
+    assert!(passes(r#"
+module test();
+reg [3:0] array[0:1][0:2];
+reg [3:0] expected;
+reg failed = 0;
+initial begin
+  for (int i = 0; i < 2; i++)
+    for (int j = 0; j < 3; j++)
+      array[i][j] = i * 4 + j;
+  foreach (array[i,j,k]) begin
+    expected = i * 4 + j;
+    if (array[i][j][k] !== expected[k]) failed = 1;
+  end
+  foreach (array[i,j]) begin
+    expected = i * 4 + j;
+    if (array[i][j] !== expected) failed = 1;
+  end
+  if (failed) $display("FAILED"); else $display("PASSED");
+end
+endmodule
+"#));
+}

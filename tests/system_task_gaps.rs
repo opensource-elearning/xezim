@@ -44,6 +44,28 @@ endmodule
     assert_eq!(u(&sim, "n"), 0);
 }
 
+// ---------------------------------------------------------------- group 2
+
+#[test]
+fn exit_terminates_like_finish() {
+    let src = r#"
+module tb;
+  initial begin
+    $display("before");
+    #5 $exit;
+    $display("after");
+  end
+  initial #20 $display("late");
+endmodule
+"#;
+    let sim = simulate(src, 1000).expect("simulate failed");
+    let outs: Vec<&str> = sim.output.iter().map(|o| o.message.as_str()).collect();
+    assert!(outs.contains(&"before"), "outs: {:?}", outs);
+    assert!(!outs.contains(&"after"), "$exit must stop the process: {:?}", outs);
+    assert!(!outs.contains(&"late"), "$exit must end simulation: {:?}", outs);
+    assert!(sim.warned_system_task_names().is_empty());
+}
+
 #[test]
 fn handled_names_do_not_trip_unknown_warning() {
     // Function-only names in statement position (result discarded) and

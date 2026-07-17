@@ -32217,7 +32217,11 @@ impl Simulator {
                 self.monitor_arg_prev = None; // force immediate print
                 self.check_monitor();
             }
-            "$finish" | "$stop" => {
+            // §20.2 `$exit` waits for all program blocks to finish and then
+            // behaves as `$finish`. xezim models program blocks loosely (their
+            // initial blocks run in the reactive region of the same event
+            // loop), so plain `$finish` semantics are the accurate mapping.
+            "$finish" | "$stop" | "$exit" => {
                 if std::env::var("XEZIM_TRACE_FINISH").is_ok() {
                     let bt = std::backtrace::Backtrace::force_capture();
                     eprintln!("[xezim][trace] {} called at sim_time={}\n{}",

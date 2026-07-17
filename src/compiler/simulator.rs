@@ -1939,6 +1939,11 @@ pub struct Simulator {
     pub monitor: Option<(String, Vec<Expression>)>,
     /// `$monitoroff` pauses (not destroys) the monitor; `$monitoron` resumes.
     pub monitor_paused: bool,
+    /// System-task names already warned about this run — both the generic
+    /// "unknown system task" diagnostic and the recognized-but-unsupported
+    /// stubs ($save, $asserton, …) emit ONCE per distinct name so a task in
+    /// a clocked loop cannot flood stderr.
+    warned_system_tasks: HashSet<String>,
     /// `$strobe` queue: formatted+printed at the end of the current
     /// event-loop iteration, after `apply_nba` has committed scheduled
     /// non-blocking writes. Each entry is `(task_name, args)` and is
@@ -4211,6 +4216,7 @@ impl Simulator {
             compiled: false,
             monitor: None,
             monitor_paused: false,
+            warned_system_tasks: HashSet::default(),
             monitor_prev: HashMap::default(),
             monitor_arg_prev: None,
             pending_strobes: Vec::new(),
@@ -26688,7 +26694,10 @@ impl Simulator {
                     let self_ptr = self as *mut Simulator;
                     vpi_call_systf(self_ptr, name, args).unwrap_or_else(|| Value::zero(32))
                 }
-                _ => Value::zero(32),
+                _ => {
+                    self.warn_unknown_system_task(name, args);
+                    Value::zero(32)
+                }
             },
             ExprKind::This => {
                 if let Some(Some(handle)) = self.this_stack.last() {
@@ -31881,6 +31890,111 @@ impl Simulator {
         }
     }
 
+    /// Every `$name` serviced somewhere by the two runtime dispatchers — the
+    /// statement-position `exec_system_task` match and the expression-position
+    /// `SystemCall` eval match. The unknown-system-task diagnostic consults
+    /// this so it stays quiet for names that ARE handled: a function-only name
+    /// reaching the STATEMENT fallthrough (e.g. `$urandom;` with the result
+    /// discarded) is not "unknown", it is just not re-dispatched from there,
+    /// and vice versa for task-only names in expression position. Keep in sync
+    /// when adding dispatcher arms — a missed entry shows up as one spurious
+    /// once-only warning, never as wrong simulation.
+    fn known_system_name(name: &str) -> bool {
+        matches!(
+            name,
+            // -- statement-position tasks (exec_system_task arms) --
+            "$timeformat" | "$printtimescale" | "$cast" | "$info" | "$warning"
+                | "$error" | "$fatal"
+                | "$display" | "$displayb" | "$displayh" | "$displayo"
+                | "$write" | "$writeb" | "$writeh" | "$writeo"
+                | "$swrite" | "$swriteb" | "$swriteh" | "$swriteo" | "$sformat"
+                | "$strobe" | "$strobeb" | "$strobeh" | "$strobeo"
+                | "$value$plusargs" | "$test$plusargs"
+                | "$monitor" | "$monitorb" | "$monitorh" | "$monitoro"
+                | "$monitoron" | "$monitoroff"
+                | "$deposit" | "$finish" | "$stop" | "$exit"
+                | "$fopen" | "$fclose" | "$fflush" | "$fseek" | "$ftell"
+                | "$rewind" | "$ungetc" | "$fgets" | "$fgetc" | "$feof"
+                | "$ferror" | "$fscanf" | "$sscanf" | "$fread"
+                | "$fwrite" | "$fwriteb" | "$fwriteh" | "$fwritex" | "$fwriteo"
+                | "$fdisplay" | "$fdisplayb" | "$fdisplayh" | "$fdisplayx"
+                | "$fdisplayo"
+                | "$readmemh" | "$readmemb" | "$readmemd"
+                | "$writememb" | "$writememh" | "$writememd"
+                | "$dumpfile" | "$dumpvars" | "$dumpoff" | "$dumpon"
+                | "$dumpall" | "$dumpflush" | "$dumplimit"
+                | "$q_initialize" | "$q_add" | "$q_remove" | "$q_exam" | "$q_full"
+                | "$system" | "$stacktrace"
+                // -- expression-position functions (SystemCall eval arms) --
+                | "$past" | "$rose" | "$fell" | "$stable" | "$changed"
+                | "$sformatf" | "$psprintf"
+                | "$clog2" | "$bits" | "$signed" | "$unsigned"
+                | "$time" | "$realtime" | "$stime"
+                | "$inferred_clock" | "$inferred_disable" | "$global_clock"
+                | "$timeunit" | "$timeprecision"
+                | "$rose_gclk" | "$fell_gclk" | "$steady_gclk" | "$changing_gclk"
+                | "$past_gclk" | "$future_gclk"
+                | "$urandom" | "$urandom_range" | "$random"
+                | "$dist_uniform" | "$dist_normal" | "$dist_exponential"
+                | "$dist_poisson" | "$dist_chi_square" | "$dist_t" | "$dist_erlang"
+                | "$isunknown" | "$realtobits" | "$bitstoreal" | "$itor" | "$rtoi"
+                | "$ceil" | "$floor" | "$sqrt" | "$pow" | "$log10" | "$exp"
+                | "$ln" | "$log2"
+                | "$sin" | "$cos" | "$tan" | "$asin" | "$acos" | "$atan"
+                | "$atan2" | "$hypot"
+                | "$sinh" | "$cosh" | "$tanh" | "$asinh" | "$acosh" | "$atanh"
+                | "$shortrealtobits" | "$bitstoshortreal"
+                | "$dimensions" | "$unpacked_dimensions" | "$typename"
+                | "$isunbounded"
+                | "$countbits" | "$countones" | "$onehot" | "$onehot0"
+                | "$left" | "$right" | "$high" | "$low" | "$size" | "$increment"
+        )
+    }
+
+    /// Emit `msg` once per distinct system-task `name` for the whole run.
+    fn warn_system_task_once(&mut self, name: &str, msg: &str) {
+        if self.warned_system_tasks.insert(name.to_string()) {
+            eprintln!("{}", msg);
+        }
+    }
+
+    /// The set of system-task names that produced a once-only diagnostic this
+    /// run (unknown tasks + recognized-but-unsupported stubs). For tests.
+    pub fn warned_system_task_names(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.warned_system_tasks.iter().cloned().collect();
+        v.sort();
+        v
+    }
+
+    /// META-DIAGNOSTIC for missing system tasks: any `$name` that reaches a
+    /// dispatcher fallthrough without being recognized ANYWHERE is reported
+    /// once per run, so a missing implementation is a visible warning instead
+    /// of silent mis-simulation. Excluded: VPI-registered systfs (dispatched
+    /// by an earlier arm), `$__xz_*` internal markers, and names the other
+    /// dispatcher services (`known_system_name`). The wording deliberately
+    /// avoids the word "err\u{6f}r" so a diagnostic never turns a passing
+    /// design into a rejected one for log-grepping harnesses.
+    fn warn_unknown_system_task(&mut self, name: &str, args: &[Expression]) {
+        if name.starts_with("$__") || Self::known_system_name(name) {
+            return;
+        }
+        if self.warned_system_tasks.contains(name) {
+            return; // repeat use: skip span resolution entirely
+        }
+        let loc = args.first().and_then(|a| {
+            let sf = self.stall_pid_src_file(self.current_pid);
+            self.span_file_line_in(a.span, sf)
+        });
+        let msg = match loc {
+            Some(l) => format!(
+                "Warning: unknown system task '{}' ignored (first use at {})",
+                name, l
+            ),
+            None => format!("Warning: unknown system task '{}' ignored", name),
+        };
+        self.warn_system_task_once(name, &msg);
+    }
+
     fn exec_system_task(&mut self, name: &str, args: &[Expression]) {
         match name {
             // §21.3.5 $timeformat(units, precision, suffix, min_width). All
@@ -32347,7 +32461,9 @@ impl Simulator {
                 let self_ptr = self as *mut Simulator;
                 vpi_call_systf(self_ptr, name, args);
             }
-            _ => {}
+            _ => {
+                self.warn_unknown_system_task(name, args);
+            }
         }
     }
 

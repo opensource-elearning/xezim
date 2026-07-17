@@ -31658,7 +31658,24 @@ impl Simulator {
                         {
                             continue;
                         }
-                        let key = format!("{}::{}", sub_name, nm);
+                        // Build the persistent key. A free function keeps
+                        // `"<subroutine>::<var>"` (its class context is None).
+                        // A METHOD of a parameterized class appends the active
+                        // specialization: `static this_type m_inst;` inside
+                        // `C#(P)::get()` must be one shared cell per
+                        // specialization (shared across calls of the SAME spec,
+                        // distinct across DIFFERENT specs) — IEEE 1800-2023
+                        // §8.25/§6.21. The class prefix also keeps two classes'
+                        // same-named method locals from colliding.
+                        let key =
+                            match (self.class_context_stack.last().and_then(|c| c.as_ref()),
+                                   self.current_spec.as_ref()) {
+                                (Some(cn), Some((spec_base, sig))) if spec_base == cn => {
+                                    format!("{}#{}::{}::{}", cn, sig, sub_name, nm)
+                                }
+                                (Some(cn), _) => format!("{}::{}::{}", cn, sub_name, nm),
+                                _ => format!("{}::{}", sub_name, nm),
+                            };
                         if let Some(pv) = self.static_local_vars.get(&key).cloned() {
                             if let Some(l) = self.local_stack.last_mut() {
                                 l.insert(nm.clone(), pv);
@@ -44468,6 +44485,21 @@ impl Simulator {
         None
     }
 
+    /// Whether `class_name` declares any parameters (type or value). Used to
+    /// decide per-specialization static storage: only a PARAMETERIZED class's
+    /// statics vary per specialization. A static inherited from a
+    /// NON-parameterized ancestor (e.g. a plain `class Base; static int c;`)
+    /// is a single shared cell across every specialization of a derived
+    /// parameterized class — keying it per-spec would wrongly split it.
+    fn class_is_parameterized(&self, class_name: &str) -> bool {
+        let Some(cd) = self.module.classes.get(class_name) else {
+            return false;
+        };
+        !cd.param_order.is_empty()
+        || !cd.type_param_names.is_empty()
+        || !cd.param_defaults.is_empty()
+    }
+
     /// Check if `derived` extends `ancestor` (directly or transitively).
     fn class_extends(&self, derived: &str, ancestor: &str) -> bool {
         let mut cur = Some(derived.to_string());
@@ -44570,13 +44602,21 @@ impl Simulator {
                     // inherited by `uvm_object_registry#(T,Tname)`).
                     return Some(match &self.current_spec {
                         Some((base, sig))
-                            // Only per-spec when the declaring class IS the
-                            // spec base or the spec base extends it (i.e.
-                            // cname is in the inheritance chain below base).
-                            // This avoids incorrectly per-spec keying unrelated
-                            // statics accessed during a spec'd method call.
-                            if *base == cname
-                                || self.class_extends(base, &cname) =>
+                            // Per-spec only when (a) the declaring class is
+                            // the spec base or an ancestor of it (cname is in
+                            // the inheritance chain below `base`), AND (b) the
+                            // declaring class itself is PARAMETERIZED. Without
+                            // (b), a static inherited from a plain
+                            // non-parameterized ancestor (e.g. `Base::counter`)
+                            // would be wrongly split into one cell per derived
+                            // specialization instead of the single shared
+                            // cell IEEE 1800-2023 §8.25 requires: "To share
+                            // static member variables among several class
+                            // specializations, they need to be placed in a
+                            // nonparameterized base class."
+                            if (*base == cname
+                                || self.class_extends(base, &cname))
+                                && self.class_is_parameterized(&cname) =>
                         {
                             format!("{}#{}::{}", base, sig, prop)
                         }
@@ -56158,12 +56198,24 @@ impl Simulator {
                     self.local_stack.push(locals);
                     self.class_context_stack.push(Some(cname.clone()));
                     self.local_iface_aliases.push(iface_alias_frame);
+                    // §6.21: open a static-local sync frame so a `static`
+                    // local declared in the method body persists across calls.
+                    // (Class methods previously never opened one — only free
+                    // functions/tasks did — so a `static this_type m_inst;`
+                    // inside `get()` was re-initialized every call and the
+                    // UVM factory singleton never survived.) The key itself is
+                    // made class/spec-aware at the declaration site above.
+                    self.static_local_syncs
+                        .push((method_name.to_string(), Vec::new()));
                     for stmt in body {
                         self.exec_statement(stmt);
                         if self.break_flag || self.return_flag {
                             break;
                         }
                     }
+                    // Write back any static locals declared in this body before
+                    // the locals frame is dropped.
+                    self.sync_static_locals();
                     self.current_spec = saved_spec;
                     self.local_iface_aliases.pop();
                     if self.parked_from_exec {

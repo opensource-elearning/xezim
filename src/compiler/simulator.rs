@@ -29020,7 +29020,7 @@ impl Simulator {
                         }
                     }
                 }
-                let resolve_coll = |sim: &Self, e: &Expression| -> Option<(String, bool)> {
+                let resolve_coll = |sim: &mut Self, e: &Expression| -> Option<(String, bool)> {
                     if let ExprKind::Ident(h) = &e.kind {
                         let n = Self::resolve_hier_name_static(h, &sim.module);
                         if sim.module.dynamic_arrays.contains(&n) {
@@ -29035,12 +29035,13 @@ impl Simulator {
                         .filter(|an| !sim.is_associative_array(an))
                         .map(|an| (an, true))
                 };
+                let l_res = resolve_coll(self, lvalue);
+                let r_res = resolve_coll(self, rvalue);
                 if std::env::var("XZ_CP_DBG").is_ok() {
-                    eprintln!("[CPDBG] l={:?} r={:?}",
-                        resolve_coll(self, lvalue), resolve_coll(self, rvalue));
+                    eprintln!("[CPDBG] l={:?} r={:?}", l_res, r_res);
                 }
                 if let (Some((lname, l_is_prop)), Some((rname, r_is_prop))) =
-                    (resolve_coll(self, lvalue), resolve_coll(self, rvalue))
+                    (l_res, r_res)
                 {
                     // `r = q` between queues / dynamic arrays (§7.6): copy every
                     // element and the size. Nothing did this — the RHS was read as
@@ -39306,7 +39307,7 @@ impl Simulator {
 
     /// If `expr` names a queue/array (possibly an instance-scoped member),
     /// return its resolved storage name — used for `inside {arr}` membership.
-    fn array_operand_name(&self, expr: &Expression) -> Option<String> {
+    fn array_operand_name(&mut self, expr: &Expression) -> Option<String> {
         if let ExprKind::Ident(h) = &expr.kind {
             let mut nm = self.resolve_hier_name(h);
             if let Some(s) = self.instance_assoc_member(&nm) {
@@ -45223,10 +45224,38 @@ impl Simulator {
         false
     }
 
+    /// Resolve an instance-scoped collection (`<handle>#member`) from a known
+    /// heap handle and member name. Returns Some only if `member` is an
+    /// associative-array / queue / dynamic-array property of the object's
+    /// class. Shared by the MemberAccess-Index base arm and the flattened
+    /// `Ident([arr[idx], member])` arm of `expr_assoc_name` so that
+    /// `arr[i].coll` and `foreach (arr[i].coll[k])` (parsed as a flattened
+    /// Ident) both resolve the CORRECT element's collection — without this,
+    /// UVM's `foreach (successors[s].m_predecessors[pred])` iterates
+    /// `this.m_predecessors` instead of `successors[s].m_predecessors`, so
+    /// the phase sibling graph reads the wrong object's edges.
+    fn handle_collection_name(&self, handle: usize, member: &str) -> Option<String> {
+        if handle == 0 {
+            return None;
+        }
+        let cn = self
+            .heap
+            .get(handle)
+            .and_then(|x| x.as_ref())
+            .map(|i| i.class_name.clone())?;
+        if self.class_assoc_member(&cn, member)
+            || self.prop_bound_collection(handle, &cn, member)
+        {
+            Some(format!("{}#{}", handle, member))
+        } else {
+            None
+        }
+    }
+
     /// Instance-scoped storage name for an associative-array access whose
     /// base expression is either a bare member (`m` — uses `this`) or a
     /// member of another object (`obj.m`). Returns `<handle>#<member>`.
-    fn expr_assoc_name(&self, expr: &Expression) -> Option<String> {
+    fn expr_assoc_name(&mut self, expr: &Expression) -> Option<String> {
         // `obj`/`member` pair → instance-scoped name if `member` is an
         // associative property of the object the handle points at.
         let obj_member = |sim: &Self, obj: &str, member: &str| -> Option<String> {
@@ -45267,17 +45296,71 @@ impl Simulator {
                 ExprKind::Ident(bh) if bh.path.len() == 1 => {
                     obj_member(self, &bh.path[0].name.name, &member.name)
                 }
+                // `arr[i].member` — base is an array INDEX expression.
+                // Evaluate the element to a class handle and resolve the
+                // instance-scoped collection `<handle>#member` (an
+                // associative array / queue / dynamic array owned by that
+                // object). Without this, UVM's phase-graph traversal
+                // `successors[s].m_predecessors` resolves to nothing, so the
+                // sibling graph reads the wrong object's edges. Restricted to
+                // an Index base (not every complex base) so `a.b.member` /
+                // `f().member` keep their prior fall-through behavior. Scalar
+                // members are unaffected (class_assoc_member returns false →
+                // None → caller falls through to the property read).
+                ExprKind::Index { .. } => {
+                    let h = self.eval_expr(base).to_u64().unwrap_or(0) as usize;
+                    self.handle_collection_name(h, &member.name)
+                }
                 _ => None,
             },
             ExprKind::Ident(h) if h.path.len() == 1 => {
                 self.instance_assoc_member(&h.path[0].name.name)
             }
             // Flattened `obj.member` as a 2-segment hierarchical Ident.
-            ExprKind::Ident(h) if h.path.len() == 2 => obj_member(
-                self,
-                &h.path[0].name.name,
-                &h.path[1].name.name,
-            ),
+            ExprKind::Ident(h) if h.path.len() == 2 => {
+                // `arr[i].member` flattened to `Ident([arr[selects], member])` —
+                // the parser keeps the index in `path[0].selects`. Evaluate
+                // the indexed element to a handle and resolve its collection
+                // (the bare `obj_member` path below only works for a plain
+                // object name and would resolve `arr` itself, not `arr[i]`).
+                if !h.path[0].selects.is_empty() {
+                    // Build `arr[i]` (or `arr[i][j]`) as a nested Index
+                    // expression — eval_expr resolves an Index base to the
+                    // element HANDLE, whereas a flattened
+                    // `Ident([seg(arr, selects=[i])])` reads 0 for a
+                    // dynamic-array-of-handles element.
+                    let arr_ident = Expression::new(
+                        ExprKind::Ident(HierarchicalIdentifier {
+                            root: h.root.clone(),
+                            path: vec![HierPathSegment {
+                                name: h.path[0].name.clone(),
+                                selects: Vec::new(),
+                            }],
+                            span: h.span,
+                            cached_signal_id: std::cell::Cell::new(None),
+                            cached_resolved_name: std::cell::OnceCell::new(),
+                        }),
+                        h.span,
+                    );
+                    let mut base_expr = arr_ident;
+                    for sel in &h.path[0].selects {
+                        base_expr = Expression::new(
+                            ExprKind::Index {
+                                expr: Box::new(base_expr),
+                                index: Box::new(sel.clone()),
+                            },
+                            h.span,
+                        );
+                    }
+                    let hd = self.eval_expr(&base_expr).to_u64().unwrap_or(0) as usize;
+                    return self.handle_collection_name(hd, &h.path[1].name.name);
+                }
+                obj_member(
+                    self,
+                    &h.path[0].name.name,
+                    &h.path[1].name.name,
+                )
+            },
             // Flattened `ClassName::static_handle.member` (3+ segments, e.g.
             // the uvm_root singleton `cs.get_root().m_children` reached through
             // a static `m_inst`, parsed as `Ident[svc, m_inst, m_children]`).

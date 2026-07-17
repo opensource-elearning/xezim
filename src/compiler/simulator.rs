@@ -2076,6 +2076,18 @@ pub struct Simulator {
     /// declared in `base_class` (so unrelated/inherited statics stay shared),
     /// giving each specialization its own cell (§8.25). None = shared cell.
     current_spec: Option<(String, String)>,
+    /// Tracks which `(base, sig)` specializations have already had their
+    /// static-call initializers run. Per §8.25/§6.21, each parameterized-class
+    /// specialization has its own set of static properties, and side-effecting
+    /// static initializers (like UVM's `local static bit m__initialized =
+    /// __deferred_init()`) must run once per specialization — not just once
+    /// for the generic class with default params.
+    initialized_spec_statics: std::collections::HashSet<(String, String)>,
+    /// Queue of specializations pending static-init, processed iteratively
+    /// by `ensure_spec_statics` to avoid deep Rust stack recursion.
+    pending_spec_inits: Vec<(String, String)>,
+    /// Recursion guard for `ensure_spec_statics`.
+    spec_init_depth: u32,
     /// Class-typed procedural locals — variable name -> class type name.
     /// Lets a later `name = new();` know which class to construct.
     var_class_types: HashMap<String, String>,
@@ -4164,6 +4176,9 @@ impl Simulator {
             rand_ranges: HashMap::default(),
             class_statics: HashMap::default(),
             current_spec: None,
+            initialized_spec_statics: std::collections::HashSet::default(),
+            pending_spec_inits: Vec::new(),
+            spec_init_depth: 0,
             var_class_types: HashMap::default(),
             var_type_args: HashMap::default(),
             var_container_types: HashMap::default(),
@@ -23350,6 +23365,9 @@ impl Simulator {
             if self.pure_sv_lrm {
                 let extracted =
                     self.resolve_call_spec_params(Self::extract_call_spec(expr), &saved);
+                if let Some((ref base, ref sig)) = extracted {
+                    self.ensure_spec_statics(base, sig);
+                }
                 self.current_spec = extracted.or(saved.clone());
             }
             let v = self.eval_expr_ctx(&Self::strip_spec_shape(expr), ctx_width);
@@ -23610,6 +23628,19 @@ impl Simulator {
                     if hier.path.len() == 2 {
                         let cls = &hier.path[0].name.name;
                         let prop = &hier.path[1].name.name;
+                        // §8.25.1: typedef alias to a parameterized-class
+                        // specialization (e.g. `typedef Reg#("foo") FooReg;`)
+                        // — resolve the specialization and key the static
+                        // cell per-spec.
+                        if let Some((base, sig)) = self.resolve_typedef_spec(cls) {
+                            let saved = self.current_spec.take();
+                            self.current_spec = Some((base.clone(), sig));
+                            let v = self.class_static_get(&base, prop);
+                            self.current_spec = saved;
+                            if let Some(v) = v {
+                                return v;
+                            }
+                        }
                         if self.module.classes.contains_key(cls)
                             && !self.signal_name_to_id.contains_key(
                                 self.resolve_hier_name(hier).as_str(),
@@ -37183,9 +37214,54 @@ impl Simulator {
             // code and the pre-supported library classes.
             let frags: Vec<String> = type_args
                 .iter()
-                .map(|e| self.expr_to_spec_fragment(e))
+                .map(|e| {
+                    // Check for `this_type` BEFORE expr_to_spec_fragment
+                    // resolves it to just the base class name (without the
+                    // specialization suffix).
+                    if let ExprKind::Ident(h) = &e.kind {
+                        if h.path.len() == 1 {
+                            let nm = &h.path[0].name.name;
+                            if nm == "this_type" || nm == "this" {
+                                if let Some((b, s)) = &self.current_spec {
+                                    return Some(format!("{}#({})", b, s));
+                                }
+                            }
+                        }
+                    }
+                    let frag = self.expr_to_spec_fragment(e)?;
+                    // Resolve bare type-param names (e.g. `T`, `this_type`)
+                    // through the active specialization so the typedef's
+                    // specialization carries concrete values.
+                    if frag == "this_type" || frag == "this" {
+                        if let Some((b, s)) = &self.current_spec {
+                            return Some(format!("{}#({})", b, s));
+                        }
+                    }
+                    // Check if frag is a type/value param of the spec base
+                    if let Some((b, s)) = &self.current_spec {
+                        if let Some(cd) = self.module.classes.get(b) {
+                            if cd.type_param_names.iter().any(|t| t == &frag)
+                                || cd.param_order.iter().any(|t| t == &frag)
+                            {
+                                if let Some(resolved) = self.resolve_type_param_with(&frag, &self.current_spec.clone()) {
+                                    return Some(resolved);
+                                }
+                                // Try value param resolution
+                                let idx = cd.param_order.iter().position(|t| t == &frag);
+                                if let Some(idx) = idx {
+                                    let sig_frags = Self::split_spec_args(s);
+                                    if let Some(v) = sig_frags.get(idx) {
+                                        return Some(v.trim().to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Some(frag)
+                })
                 .collect::<Option<_>>()?;
-            Some((base, frags.join(",")))
+            let result = Some((base.clone(), frags.join(",")));
+            result
         } else {
             None
         }
@@ -43701,6 +43777,128 @@ impl Simulator {
         }
     }
 
+    /// Run side-effecting static initializers (those containing function
+    /// calls) for every class in the hierarchy of the given specialization.
+    /// This ensures that per-specialization static properties like UVM's
+    /// `local static bit m__initialized = __deferred_init()` execute once per
+    /// specialization with the correct parameter bindings, rather than only
+    /// once for the generic class with default params.
+    fn ensure_spec_statics(&mut self, base: &str, sig: &str) {
+        // Queue-based: add to pending queue and process iteratively to
+        // avoid deep recursion on the Rust stack (UVM's callback subsystem
+        // chains dozens of specializations during init).
+        let key = (base.to_string(), sig.to_string());
+        if self.initialized_spec_statics.contains(&key) {
+            return;
+        }
+        self.pending_spec_inits.push(key);
+        if self.spec_init_depth > 0 {
+            return; // will be processed by the outermost caller
+        }
+        self.spec_init_depth = 1;
+        while let Some((b, s)) = self.pending_spec_inits.pop() {
+            if !self.initialized_spec_statics.insert((b.clone(), s.clone())) {
+                continue;
+            }
+            self.run_one_spec_statics(&b, &s);
+        }
+        self.spec_init_depth = 0;
+    }
+
+    /// Parse a string like `ClassName#(arg1,arg2)` into `(ClassName, "arg1,arg2")`.
+    fn extract_spec_from_string(&self, s: &str) -> Option<(String, String)> {
+        if let Some(hash_idx) = s.find("#(") {
+            if s.ends_with(')') {
+                let base = s[..hash_idx].to_string();
+                let sig = s[hash_idx + 2..s.len() - 1].to_string();
+                if self.module.classes.contains_key(&base) {
+                    return Some((base, sig));
+                }
+            }
+        }
+        None
+    }
+
+    /// Check if `derived` extends `ancestor` (directly or transitively).
+    fn class_extends(&self, derived: &str, ancestor: &str) -> bool {
+        let mut cur = Some(derived.to_string());
+        while let Some(cname) = cur {
+            if cname == ancestor {
+                return true;
+            }
+            cur = self
+                .module
+                .classes
+                .get(&cname)
+                .and_then(|cd| cd.extends.clone());
+        }
+        false
+    }
+
+    fn run_one_spec_statics(&mut self, base: &str, sig: &str) {
+        // Collect all static-call initializers from the class hierarchy.
+        let inits: Vec<(String, String, Expression)> = {
+            let mut acc = Vec::new();
+            let mut cur = Some(base.to_string());
+            while let Some(cname) = cur {
+                if let Some(cd) = self.module.classes.get(&cname) {
+                    for (prop, expr) in &cd.property_inits {
+                        if cd.static_properties.contains(prop) && Self::expr_contains_call(expr) {
+                            acc.push((cname.clone(), prop.clone(), expr.clone()));
+                        }
+                    }
+                    cur = cd.extends.clone();
+                } else { break; }
+            }
+            acc
+        };
+        // Run each initializer with current_spec set to this specialization.
+        let saved_spec = self.current_spec.clone();
+        self.current_spec = Some((base.to_string(), sig.to_string()));
+        for (cname, prop, init) in inits {
+            let spec_key = format!("{}#{}::{}", base, sig, prop);
+            if self.class_statics.contains_key(&spec_key) {
+                continue;
+            }
+            let cont_kind = self
+                .module
+                .classes
+                .get(&cname)
+                .and_then(|cd| cd.properties.get(&prop))
+                .and_then(|s| s.type_name.as_deref())
+                .and_then(Self::container_base);
+            let is_new = matches!(&init.kind, ExprKind::Call { func, .. }
+                if matches!(&func.kind, ExprKind::Ident(h)
+                    if h.path.len() == 1 && h.path[0].name.name == "new"));
+            let v = if let (Some(kind), true) = (cont_kind, is_new) {
+                let ch = self.heap.len();
+                self.heap.push(Some(ClassInstance {
+                    class_name: kind.to_string(),
+                    properties: HashMap::default(),
+                    type_bindings: HashMap::default(),
+                    spec: None,
+                }));
+                if kind == "semaphore" {
+                    self.semaphores.insert(ch, 0);
+                } else {
+                    self.mailboxes.insert(ch, std::collections::VecDeque::new());
+                }
+                Value::from_u64(ch as u64, 32)
+            } else {
+                self.class_context_stack.push(Some(cname.clone()));
+                self.this_stack.push(None);
+                if prop == "m__initialized" {
+                }
+                let v = self.eval_expr(&init);
+                self.this_stack.pop();
+                self.class_context_stack.pop();
+                v
+            };
+            self.class_statics.insert(spec_key, v);
+        }
+        self.current_spec = saved_spec;
+    }
+
     /// Walk the class hierarchy from `start_class` and return the
     /// `"DeclClass::prop"` storage key for a static property, if one of
     /// `start_class` or its ancestors declares `prop` as `static`.
@@ -43717,9 +43915,21 @@ impl Simulator {
                 {
                     // Per-specialization keying: when a `C#(params)::...` access
                     // is active, each specialization gets its own static cell.
+                    // This applies to statics declared in the spec's base class
+                    // AND inherited from parameterized ancestors (the common
+                    // UVM pattern: `uvm_registry_common::m__initialized` is
+                    // inherited by `uvm_object_registry#(T,Tname)`).
                     return Some(match &self.current_spec {
-                        Some((base, sig)) if *base == cname => {
-                            format!("{}#{}::{}", cname, sig, prop)
+                        Some((base, sig))
+                            // Only per-spec when the declaring class IS the
+                            // spec base or the spec base extends it (i.e.
+                            // cname is in the inheritance chain below base).
+                            // This avoids incorrectly per-spec keying unrelated
+                            // statics accessed during a spec'd method call.
+                            if *base == cname
+                                || self.class_extends(base, &cname) =>
+                        {
+                            format!("{}#{}::{}", base, sig, prop)
                         }
                         _ => format!("{}::{}", cname, prop),
                     });
@@ -44892,6 +45102,9 @@ impl Simulator {
         }
         let saved = self.current_spec.take();
         let extracted = self.resolve_call_spec_params(Self::extract_call_spec(func), &saved);
+        if let Some((ref base, ref sig)) = extracted {
+            self.ensure_spec_statics(base, sig);
+        }
         self.current_spec = extracted.or(saved.clone());
         let r = self.eval_call_inner(func, args);
         self.current_spec = saved;
@@ -45537,6 +45750,27 @@ impl Simulator {
                     && !self.signal_name_to_id.contains_key(name.as_str())
                     && !self.signals.contains_key(&name)
                 {
+                    // Type-parameter used as a class name: `Tregistry::get()`.
+                    if name == "Tregistry" {
+                    }
+                    // Resolve the type param to a concrete class/specialization
+                    // from the active spec before dispatching.
+                    if let Some(resolved) = self.resolve_type_param_binding(&name) {
+                        if let Some((base, sig)) = self.extract_spec_from_string(&resolved) {
+                            self.ensure_spec_statics(&base, &sig);
+                            let saved = self.current_spec.take();
+                            self.current_spec = Some((base.clone(), sig));
+                            let res = self.exec_static_method(&base, mname, args);
+                            self.current_spec = saved;
+                            if let Some(v) = res {
+                                return v;
+                            }
+                        } else if self.module.classes.contains_key(&resolved) {
+                            if let Some(res) = self.exec_static_method(&resolved, mname, args) {
+                                return res;
+                            }
+                        }
+                    }
                     if self.module.classes.contains_key(&name) {
                         if let Some(res) = self.exec_static_method(&name, mname, args) {
                             return res;
@@ -45551,6 +45785,7 @@ impl Simulator {
                     // §8.25.1 typedef specialization alias on the dot-access
                     // form (see the flattened-path handler for details).
                     if let Some((base, sig)) = self.resolve_typedef_spec(&name) {
+                        self.ensure_spec_statics(&base, &sig);
                         let saved = self.current_spec.take();
                         self.current_spec = Some((base.clone(), sig));
                         let res = self.exec_static_method(&base, mname, args);
@@ -46602,6 +46837,30 @@ impl Simulator {
                     && !self.signal_name_to_id.contains_key(obj_name.as_str())
                     && !self.signals.contains_key(obj_name)
                 {
+                    // Type-parameter used as a class name: `Tregistry::get()`.
+                    // Resolve the type param to a concrete class/specialization
+                    // from the active spec before dispatching.
+                    if let Some(resolved) = self.resolve_type_param_binding(obj_name) {
+                        // Check if it's a specialized class (e.g.
+                        // `uvm_object_registry#(base_class,"base_class")`)
+                        if let Some((base, sig)) = self.extract_spec_from_string(&resolved) {
+                            self.ensure_spec_statics(&base, &sig);
+                            let saved = self.current_spec.take();
+                            self.current_spec = Some((base.clone(), sig));
+                            let m = method_name.clone();
+                            let res = self.exec_static_method(&base, &m, args);
+                            self.current_spec = saved;
+                            if let Some(v) = res {
+                                return v;
+                            }
+                        } else if self.module.classes.contains_key(&resolved) {
+                            let cls = resolved;
+                            let m = method_name.clone();
+                            if let Some(res) = self.exec_static_method(&cls, &m, args) {
+                                return res;
+                            }
+                        }
+                    }
                     if self.module.classes.contains_key(obj_name) {
                         let cls = obj_name.clone();
                         let m = method_name.clone();
@@ -46625,6 +46884,7 @@ impl Simulator {
                     // fallthrough behavior.
                     if let Some((base, sig)) = self.resolve_typedef_spec(obj_name) {
                         let m = method_name.clone();
+                        self.ensure_spec_statics(&base, &sig);
                         let saved = self.current_spec.take();
                         self.current_spec = Some((base.clone(), sig));
                         let res = self.exec_static_method(&base, &m, args);
@@ -48688,12 +48948,74 @@ impl Simulator {
         if let Some((base, sig)) = spec {
             if let Some(cd) = self.module.classes.get(base) {
                 if let Some(idx) = cd.type_param_names.iter().position(|p| p == tn) {
-                    if let Some(v) = sig.split(',').nth(idx) {
+                    let frags = Self::split_spec_args(sig);
+                    if let Some(v) = frags.get(idx) {
                         let v = v.trim();
                         if !v.is_empty() {
                             return Some(v.to_string());
                         }
                     }
+                }
+                // §8.25: `tn` is a type parameter declared in an ANCESTOR of
+                // the spec's base class (e.g. `Tregistry` in
+                // `uvm_registry_common`, inherited by `uvm_object_registry`).
+                // Walk the extends chain to find which ancestor declares `tn`,
+                // then resolve the corresponding type arg from the extends
+                // clause. The arg is often `this_type` (a typedef for the
+                // current specialization) or another type param of `base`.
+                let mut cur_name = cd.name.clone();
+                let mut cur_extends = cd.extends.clone();
+                let mut cur_type_args = cd.extends_type_args.clone();
+                let mut level = 0;
+                while let Some(ancestor) = cur_extends {
+                    level += 1;
+                    if level > 16 { break; }
+                    let acd = match self.module.classes.get(&ancestor) {
+                        Some(c) => c.clone(),
+                        None => break,
+                    };
+                    // Find `tn` in the ancestor's full param_order (type +
+                    // value params interleaved). `extends_type_args` stores
+                    // ALL args positionally, so we index by param_order.
+                    if let Some(idx) = acd.param_order.iter().position(|p| p == tn) {
+                        if let Some(arg) = cur_type_args.get(idx) {
+                            let arg = arg.trim();
+                            if arg == "this_type" || arg == "this" {
+                                return Some(format!("{}#({})", base, sig));
+                            }
+                            // Check if arg is a type param of the ORIGINAL
+                            // spec base class
+                            if let Some(bidx) = cd.type_param_names.iter().position(|p| p == arg) {
+                                let sig_frags = Self::split_spec_args(sig);
+                                if let Some(v) = sig_frags.get(bidx) {
+                                    let v = v.trim();
+                                    if !v.is_empty() {
+                                        return Some(v.to_string());
+                                    }
+                                }
+                            }
+                            // Check if arg is a value param of the base class
+                            // (resolve from the sig by position in param_order)
+                            if let Some(bidx) = cd.param_order.iter().position(|p| p == arg) {
+                                let sig_frags = Self::split_spec_args(sig);
+                                if let Some(v) = sig_frags.get(bidx) {
+                                    let v = v.trim();
+                                    if !v.is_empty() {
+                                        return Some(v.to_string());
+                                    }
+                                }
+                            }
+                            // Otherwise return the arg verbatim (a concrete
+                            // class name like `uvm_registry_object_creator`)
+                            if arg != "<unknown>" {
+                                return Some(arg.to_string());
+                            }
+                        }
+                        break;
+                    }
+                    cur_name = ancestor.clone();
+                    cur_extends = acd.extends.clone();
+                    cur_type_args = acd.extends_type_args.clone();
                 }
             }
         }

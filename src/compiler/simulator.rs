@@ -22223,7 +22223,7 @@ impl Simulator {
                         }
                     }
                     let obj_val = if let Some(locals) = self.local_stack.last() {
-                        locals.get(obj_name).cloned()
+                        locals.get(obj_name).cloned().or_else(|| self.get_signal_value_by_name(obj_name))
                     } else {
                         self.get_signal_value_by_name(obj_name)
                     };
@@ -47680,7 +47680,13 @@ impl Simulator {
                     }
                 }
                 let obj_val = if let Some(locals) = self.local_stack.last() {
-                    locals.get(obj_name).cloned()
+                    locals.get(obj_name).cloned().or_else(|| {
+                        if let Some(&id) = self.signal_name_to_id.get(obj_name.as_str()) {
+                            Some(self.signal_table[id].clone())
+                        } else {
+                            self.signals.get(obj_name).cloned()
+                        }
+                    })
                 } else {
                     if let Some(&id) = self.signal_name_to_id.get(obj_name.as_str()) {
                         Some(self.signal_table[id].clone())

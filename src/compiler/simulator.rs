@@ -21167,7 +21167,7 @@ impl Simulator {
         self.prof_waiter_iters += waiters.len() as u64;
         self.event_waiters_swap.clear();
         let mut triggered_conts: Vec<(usize, Vec<Statement>)> = Vec::new();
-        for waiter in waiters {
+        for mut waiter in waiters {
             let mut triggered = false;
             for (i, sid) in waiter.resolved_sensitivities.iter().enumerate() {
                 let (pv, px) = waiter.captured_prev[i];
@@ -21198,6 +21198,32 @@ impl Simulator {
                 );
                 triggered_conts.push((waiter.pid, waiter.continuation));
             } else {
+                // Refresh this waiter's `captured_prev` baseline to each
+                // sensitivity signal's CURRENT value so that a qualifying
+                // edge occurring over multiple steps is detected.
+                //
+                // Without this, a waiter armed while its signal sits at the
+                // edge-target level can never see the NEXT edge: e.g. a
+                // process resumes on the first `@(posedge clk)` at t=5
+                // (clk=1) and immediately re-arms on the next line; its
+                // captured_prev is frozen at 1, so when clk later goes
+                // 1→0→1 the Posedge test `!pb_one && cb_one` stays false
+                // (pb_one clings to the stale 1) and the second posedge is
+                // lost — the process strands (see
+                // tests/bound_module / sequential_event_waits). Tracking the
+                // running level here preserves the same-tick NBA-region
+                // semantics captured_prev was added for (a waiter still
+                // won't fire on an edge that completed BEFORE it armed, since
+                // at arm time captured_prev already equals current), while
+                // catching cross-tick transitions through the target level.
+                for (i, sid) in waiter.resolved_sensitivities.iter().enumerate() {
+                    let (cv, cx) = self.signal_table[sid.signal_id].raw_bits();
+                    waiter.captured_prev[i] = (cv, cx);
+                    if self.signal_widths[sid.signal_id] > 64 {
+                        waiter.captured_prev_wide[i] =
+                            Some(self.signal_table[sid.signal_id].clone());
+                    }
+                }
                 self.event_waiters_swap.push(waiter);
             }
         }

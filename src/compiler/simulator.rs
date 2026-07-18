@@ -17734,6 +17734,15 @@ impl Simulator {
 
             // Check for forever with delays/events
             if let StatementKind::Forever { body } = &stmt.kind {
+                // NOTE: a `break` inside a blocking `forever` body is not
+                // honoured here. Unlike while/repeat, gating forever on entry
+                // regresses UVM driver/sequencer forever-loops (3414, 4194):
+                // they re-enter every cycle and the per-entry gate call, plus
+                // any transient flag, perturbs timing enough to TIMEOUT under
+                // suite load, with zero tests improved. forever-with-break is
+                // vanishingly rare (drivers loop indefinitely by design). If
+                // needed later, handle break inside exec_forever_sched at the
+                // re-append site instead of a top-of-arm gate. (§9.3.3)
                 self.exec_forever_sched(pid, body, &stmts[i + 1..]);
                 return;
             }
@@ -17741,7 +17750,25 @@ impl Simulator {
             // Check for repeat with event waits inside
             if let StatementKind::Repeat { count, body } = &stmt.kind {
                 let n = self.eval_expr(count).to_u64().unwrap_or(0);
-                if n > 0 && self.stmt_has_event_wait(body) {
+                if self.stmt_has_event_wait(body) {
+                    // n == 0 (initial count zero, or the natural-exhaustion
+                    // sentinel re-entering after the final iteration's body):
+                    // clear any loop-control flag left by that body — a
+                    // trailing `continue` must not leak past the loop and
+                    // suppress the statements after it. (§9.3.3)
+                    if n == 0 {
+                        self.break_flag = false;
+                        self.continue_flag = false;
+                        i += 1;
+                        continue;
+                    }
+                    // A `break`/`continue` set during a previous iteration's
+                    // body is consumed here: break exits the repeat, continue
+                    // proceeds to the next iteration. (§9.3.3)
+                    if self.blocking_loop_flag_gate() {
+                        i += 1;
+                        continue;
+                    }
                     // Unroll: execute body once, then schedule rest
                     let remaining_n = n - 1;
                     let mut cont = Vec::new();
@@ -17751,25 +17778,25 @@ impl Simulator {
                         _ => vec![*body.clone()],
                     };
                     cont.extend(body_stmts);
-                    // Re-schedule remaining repeats
-                    if remaining_n > 0 {
-                        cont.push(Statement::new(
-                            StatementKind::Repeat {
-                                count: Expression::new(
-                                    ExprKind::Number(NumberLiteral::Integer {
-                                        size: None,
-                                        signed: false,
-                                        base: NumberBase::Decimal,
-                                        value: remaining_n.to_string(),
-                                        cached_val: Cell::new(None),
-                                    }),
-                                    body.span,
-                                ),
-                                body: body.clone(),
-                            },
-                            stmt.span,
-                        ));
-                    }
+                    // Always re-schedule a Repeat tail — at remaining 0 it
+                    // becomes the exhaustion sentinel whose n==0 arm above
+                    // clears a trailing continue/break before `after` runs.
+                    cont.push(Statement::new(
+                        StatementKind::Repeat {
+                            count: Expression::new(
+                                ExprKind::Number(NumberLiteral::Integer {
+                                    size: None,
+                                    signed: false,
+                                    base: NumberBase::Decimal,
+                                    value: remaining_n.to_string(),
+                                    cached_val: Cell::new(None),
+                                }),
+                                body.span,
+                            ),
+                            body: body.clone(),
+                        },
+                        stmt.span,
+                    ));
                     cont.extend_from_slice(&stmts[i + 1..]);
                     self.continue_stmts_or_trampoline(pid, cont);
                     return;

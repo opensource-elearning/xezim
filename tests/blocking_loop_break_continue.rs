@@ -70,3 +70,48 @@ endmodule
     let out = run(src, "for");
     assert!(out.contains("RESULT PASS"), "expected for-break honoured\n{out}");
 }
+
+#[test]
+fn blocking_repeat_honours_break() {
+    let src = r#"module top;
+  int log[$];
+  initial begin
+    repeat (10) begin
+      #1;                 // blocking
+      if (log.size() == 3) break;
+      log.push_back(log.size());
+    end
+    // log == {0,1,2} — break when size reaches 3
+    if (log.size()==3 && log[0]==0 && log[1]==1 && log[2]==2)
+      $display("RESULT PASS"); else $display("RESULT FAIL log=%p", log);
+    $finish;
+  end
+endmodule
+"#;
+    let out = run(src, "repbrk");
+    assert!(out.contains("RESULT PASS"), "expected repeat-break honoured\n{out}");
+}
+
+#[test]
+fn blocking_repeat_honours_continue() {
+    // A trailing `continue` on the final iteration must NOT leak past the
+    // loop and suppress the statements after it (the historical bug).
+    let src = r#"module top;
+  int i; int log[$];
+  initial begin
+    repeat (6) begin
+      #1;                 // blocking
+      i++;
+      if (i % 2 == 0) continue;   // skip even i
+      log.push_back(i);           // push 1,3,5
+    end
+    // log == {1,3,5}
+    if (log.size()==3 && log[0]==1 && log[1]==3 && log[2]==5)
+      $display("RESULT PASS"); else $display("RESULT FAIL log=%p", log);
+    $finish;
+  end
+endmodule
+"#;
+    let out = run(src, "repcon");
+    assert!(out.contains("RESULT PASS"), "expected repeat-continue honoured\n{out}");
+}

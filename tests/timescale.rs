@@ -154,3 +154,34 @@ fn sub_ns_precision_emits_no_warning() {
     let joined = sim.output.iter().map(|o| o.message.clone()).collect::<Vec<_>>().join("\n");
     assert!(!joined.contains("ticks are 1ns"), "stale sub-ns warning leaked: {}", joined);
 }
+
+// §3.14.2 / §20.4 — a module with NO `timescale directive (and none preceding
+// it in compilation order) must REPORT the IEEE default 1s/1s via
+// $printtimescale — not the 1 ns simulation default, and not another module's
+// timescale. Regression for the leaked-testscale bug.
+#[test]
+fn no_timescale_module_reports_one_second_default() {
+    let o = out("module m; initial $printtimescale; endmodule");
+    assert!(o.contains("is 1s / 1s"), "no-timescale module must report 1s/1s; got: {}", o);
+}
+
+// A directive-less module keeps xezim's 1 ns DELAY default — only the REPORTED
+// timescale changes, so `#5` is still 5 (ns), never 5 seconds.
+#[test]
+fn no_timescale_module_keeps_one_ns_delays() {
+    let o = out("module m; initial begin #5; $display(\"T=%0d\", $time); end endmodule");
+    assert!(o.contains("T=5"), "delay scaling must stay 1ns; got: {}", o);
+}
+
+// A module WITHOUT its own directive but PRECEDED by one inherits it (sticky
+// §3.14.2.3) — it reports the inherited scale, not the 1s/1s default.
+#[test]
+fn untimed_module_inherits_preceding_directive() {
+    let o = out(r#"
+`timescale 1us/1ns
+module timed; initial $printtimescale; endmodule
+module inherits_it; initial $printtimescale; endmodule
+"#);
+    assert!(o.contains("(inherits_it) is 1us / 1ns"),
+        "module after a directive must inherit it; got: {}", o);
+}

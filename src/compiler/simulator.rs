@@ -32825,15 +32825,7 @@ impl Simulator {
                             .find(|i| i.path == cand)
                             .map(|i| i.def_name.clone())
                         {
-                            let ts = self
-                                .module
-                                .module_timescale_exp
-                                .get(&def)
-                                .copied()
-                                .unwrap_or((
-                                    self.module.timeunit_exp,
-                                    self.module.timeprecision_exp,
-                                ));
+                            let ts = self.reported_timescale_exp(&def);
                             found = Some((
                                 ts.0,
                                 ts.1,
@@ -32845,12 +32837,14 @@ impl Simulator {
                     match found {
                         Some(f) => f,
                         None => {
-                            let (u, p) = self.current_timescale_exp();
+                            let def = self.current_module_def().to_string();
+                            let (u, p) = self.reported_timescale_exp(&def);
                             (u, p, format!("{}.{}", self.module.name, rel))
                         }
                     }
                 } else {
-                    let (u, p) = self.current_timescale_exp();
+                    let def = self.current_module_def().to_string();
+                    let (u, p) = self.reported_timescale_exp(&def);
                     let scope = match self.process_scope_hint.get(&self.current_pid) {
                         Some(s) if !s.is_empty() => {
                             format!("{}.{}", self.module.name, s)
@@ -42272,6 +42266,21 @@ impl Simulator {
             .get(def)
             .copied()
             .unwrap_or((self.module.timeunit_exp, self.module.timeprecision_exp))
+    }
+
+    /// §3.14.2 / §20.4 — the timescale a module REPORTS via `$printtimescale`.
+    /// A module with no `timescale directive (and none preceding it in
+    /// compilation order, so it is absent from `module_timescale_exp`) reports
+    /// the IEEE default `1s / 1s` — NOT the global/top-module unit that drives
+    /// `$time` scaling. This keeps xezim's pragmatic 1 ns simulation default for
+    /// delays while matching a reference simulator's printed timescale (a
+    /// directive-less module must not display another module's timescale).
+    fn reported_timescale_exp(&self, def: &str) -> (i32, i32) {
+        self.module
+            .module_timescale_exp
+            .get(def)
+            .copied()
+            .unwrap_or((0, 0))
     }
 
     /// Current simulation time in the current module's time unit, as

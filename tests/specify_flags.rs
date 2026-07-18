@@ -156,3 +156,39 @@ fn lint_checks_apply_inside_generate() {
         "legal always inside generate must stay accepted"
     );
 }
+
+/// GLS structural-delay modes (VCS/Questa/Xcelium). `+delay_mode_zero` forces
+/// all structural (specify/SDF) delays to 0; `+delay_mode_unit` collapses each
+/// nonzero one to 1 tick. Default keeps the specify path delay. These used to
+/// fall silently into the generic plusarg bucket.
+#[test]
+fn delay_mode_zero_and_unit() {
+    fn xbin() -> PathBuf {
+        let mut p = std::env::current_exe().unwrap();
+        p.pop();
+        if p.ends_with("deps") { p.pop(); }
+        p.join("xezim")
+    }
+    let dir = std::env::temp_dir().join(format!("xezim_delaymode_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let sv = dir.join("sp.sv");
+    std::fs::write(
+        &sv,
+        "`timescale 1ns/1ns\n\
+         module cbuf(input a, output y); assign y=a; specify (a=>y)=8; endspecify endmodule\n\
+         module t; reg a=0; wire y; cbuf u(.a(a),.y(y));\n\
+         initial begin #1 a=1; #2 $display(\"T3 y=%b\",y); #8 $display(\"T11 y=%b\",y); $finish; end\n\
+         endmodule\n",
+    )
+    .unwrap();
+    let run = |args: &[&str]| -> String {
+        let o = Command::new(xbin()).args(args).arg(&sv).output().unwrap();
+        format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr))
+    };
+    // default: specify 8ns → edge at t9, so y=0 at t3.
+    assert!(run(&[]).contains("T3 y=0"), "default specify delay");
+    // zero: edge at t1 → y=1 at t3.
+    assert!(run(&["+delay_mode_zero"]).contains("T3 y=1"), "+delay_mode_zero");
+    // unit: 8→1, edge at t2 → y=1 at t3.
+    assert!(run(&["+delay_mode_unit"]).contains("T3 y=1"), "+delay_mode_unit");
+}

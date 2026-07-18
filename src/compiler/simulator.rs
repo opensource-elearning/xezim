@@ -181,6 +181,37 @@ fn nospecify() -> bool {
     NOSPECIFY.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Structural-delay mode (VCS/Questa/Xcelium GLS): 0 = normal (specify/SDF path
+/// delays apply), 1 = `+delay_mode_zero` (all structural delays forced to 0 —
+/// fast functional GLS), 2 = `+delay_mode_unit` (every nonzero structural delay
+/// becomes 1 time unit). Affects specify path delays and SDF back-annotation;
+/// procedural `#` delays are unaffected, per the LRM's delay_mode scope.
+static DELAY_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+pub fn set_delay_mode(mode: u8) {
+    DELAY_MODE.store(mode, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn delay_mode() -> u8 {
+    DELAY_MODE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Map a structural delay through the active `+delay_mode_*`: zero → 0,
+/// unit → 1 for any nonzero delay, normal → unchanged.
+fn apply_delay_mode(d: u64) -> u64 {
+    match delay_mode() {
+        1 => 0,
+        2 => {
+            if d > 0 {
+                1
+            } else {
+                0
+            }
+        }
+        _ => d,
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct XtraceOptions {
     pub profile: Option<String>,
@@ -7543,7 +7574,18 @@ impl Simulator {
         // `+nospecify`: module path delays from specify blocks are suppressed
         // (SDF annotation given explicitly via --sdf still applies — the CLI
         // warns when both are combined, since that pairing contradicts itself).
-        let use_specify = !nospecify() && !self.module.specify_delays.is_empty();
+        // `+delay_mode_zero` forces ALL structural delays to 0 (a superset of
+        // +nospecify that also drops SDF back-annotation) — fast functional GLS.
+        // `+delay_mode_unit` collapses every nonzero structural delay to 1 tick.
+        let dmode = delay_mode();
+        if dmode == 1 && self.sdf_annotation.is_some() {
+            eprintln!(
+                "Warning: +delay_mode_zero forces all structural delays to 0 — SDF back-annotation is ignored."
+            );
+            self.sdf_annotation = None;
+        }
+        let use_specify =
+            !nospecify() && dmode != 1 && !self.module.specify_delays.is_empty();
         let need_sdf = self.sdf_annotation.is_some() || use_specify;
         if need_sdf && self.sdf_delays.len() != self.signal_table.len() {
             self.sdf_delays.resize(self.signal_table.len(), 0);
@@ -7558,7 +7600,7 @@ impl Simulator {
             let mut count = 0;
             for (sig_name, &delay) in &ann.signal_delays {
                 if let Some(&id) = self.signal_name_to_id.get(sig_name.as_str()) {
-                    self.sdf_delays[id] = delay;
+                    self.sdf_delays[id] = apply_delay_mode(delay);
                     sdf_annotated.insert(id);
                     count += 1;
                 }
@@ -7571,7 +7613,7 @@ impl Simulator {
                     if sdf_annotated.contains(&id) {
                         continue; // SDF back-annotation overrides the specify delay
                     }
-                    self.sdf_delays[id] = self.sdf_delays[id].max(delay);
+                    self.sdf_delays[id] = self.sdf_delays[id].max(apply_delay_mode(delay));
                 }
             }
         }

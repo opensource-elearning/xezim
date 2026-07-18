@@ -1034,6 +1034,10 @@ struct EventWaiter {
     /// `Vec<Sensitivity>` mirror was set at construction but never
     /// consulted afterwards — dropped.
     resolved_sensitivities: Vec<SensitivityId>,
+    /// Value (raw v,x low-64) of each `resolved_sensitivities` signal at the
+    /// moment this waiter armed. Parallel to `resolved_sensitivities`. Used to
+    /// detect a change made AFTER arming within the same snapshot generation.
+    arm_bits: Vec<(u64, u64)>,
     continuation: Vec<Statement>,
     /// Value of `Simulator::snap_gen` when this waiter registered. A waiter
     /// only fires on edges detected against a snapshot taken AFTER it
@@ -15349,13 +15353,43 @@ impl Simulator {
                     })
             })
             .collect();
+        // Capture each sensitivity signal's value AT ARM TIME, parallel to
+        // `resolved`. A waiter registered within the current snapshot
+        // generation is checked against these (not the tick-start snapshot),
+        // so only a change made AFTER it armed counts as an edge — see the
+        // firing loop in `check_edges_inner`.
+        let arm_bits: Vec<(u64, u64)> = resolved
+            .iter()
+            .map(|sid| self.signal_table[sid.signal_id].raw_bits())
+            .collect();
         // `sens` (Vec<Sensitivity>) is consumed for resolution and dropped;
         // EventWaiter only carries the resolved IDs from here on.
         EventWaiter {
             pid,
             resolved_sensitivities: resolved,
+            arm_bits,
             continuation,
             registered_snap_gen: self.snap_gen,
+        }
+    }
+
+    /// Edge check against an EXPLICIT prior value (the waiter's arm-time
+    /// snapshot) rather than `prev_val`. Used for a waiter registered in the
+    /// current snapshot generation: comparing against the value the signal had
+    /// when the waiter armed distinguishes a genuine post-arm change (fire)
+    /// from a pre-arm edge the tick-start snapshot would otherwise report
+    /// (a `forever @(posedge clk)` loop re-arming against the edge it just
+    /// consumed, or time-0 init pseudo-edges — both read as no change).
+    fn check_edge_vs(&self, id: usize, edge: EdgeKind, prev_v: u64, prev_x: u64) -> bool {
+        let (cur_v, cur_x) = self.signal_table[id].raw_bits();
+        let cb_one = (cur_v & 1) == 1 && (cur_x & 1) == 0;
+        let cb_zero = (cur_v & 1) == 0 && (cur_x & 1) == 0;
+        let pb_one = (prev_v & 1) == 1 && (prev_x & 1) == 0;
+        let pb_zero = (prev_v & 1) == 0 && (prev_x & 1) == 0;
+        match edge {
+            EdgeKind::Posedge => !pb_one && cb_one,
+            EdgeKind::Negedge => !pb_zero && cb_zero,
+            EdgeKind::AnyEdge => cur_v != prev_v || cur_x != prev_x,
         }
     }
 
@@ -20749,13 +20783,32 @@ impl Simulator {
             // registered in an EARLIER delta cycle of this same timestamp
             // stay eligible — an inactive-region (`#0`) toggle or an NBA
             // commit at the current time must wake them (§4.4.2.3/§4.4.5).
-            if waiter.registered_snap_gen == self.snap_gen {
-                self.event_waiters_swap.push(waiter);
-                continue;
-            }
+            // A waiter registered in the CURRENT snapshot generation used to be
+            // blanket-suppressed (its tick-start snapshot predates the arm, so
+            // a detected edge might predate registration). That wrongly dropped
+            // a change made AFTER the arm in the same tick — the universal
+            // "apply stimulus, then `@(sig)` for the response" pattern. Instead,
+            // check such a waiter against its ARM-TIME values: only a genuine
+            // post-arm change fires it; a pre-arm edge reads as no change.
+            // A waiter registered in the CURRENT snapshot generation used to be
+            // blanket-suppressed (its tick-start snapshot predates the arm, so
+            // a detected edge might predate registration). That wrongly dropped
+            // a change made AFTER the arm in the same tick — the "apply
+            // stimulus, then `@(sig)` for the response" pattern. Instead, check
+            // such a waiter against its ARM-TIME values: only a genuine post-arm
+            // change fires it; a pre-arm edge (a `forever @(posedge clk)` loop
+            // re-arming against the edge it just consumed, or time-0 init
+            // pseudo-edges) reads as no change.
+            let same_gen = waiter.registered_snap_gen == self.snap_gen;
             let mut triggered = false;
-            for sid in &waiter.resolved_sensitivities {
-                if !self.check_edge_id(sid.signal_id, sid.edge) {
+            for (i, sid) in waiter.resolved_sensitivities.iter().enumerate() {
+                let edged = if same_gen {
+                    let (av, ax) = waiter.arm_bits.get(i).copied().unwrap_or((0, 0));
+                    self.check_edge_vs(sid.signal_id, sid.edge, av, ax)
+                } else {
+                    self.check_edge_id(sid.signal_id, sid.edge)
+                };
+                if !edged {
                     continue;
                 }
                 // LRM §9.4.2.3: `@(posedge clk iff g)` only fires when the

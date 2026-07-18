@@ -23412,6 +23412,21 @@ impl Simulator {
                     self.set_signal_value_by_name(&elem, val.clone());
                     return changed;
                 }
+                // Multidimensional associative-array write
+                // `m[k1][k2]...[kn] = v`: store under the flat compound key
+                // `m[K1][K2]...[Kn]` (see `multidim_assoc_elem`). Without this
+                // the write is silently lost and later reads / `.exists()` /
+                // recursion guards see nothing — e.g. UVM's printer
+                // `m_recur_states[obj][policy] = STARTED` never lands, so the
+                // cycle-break fails and `sprint()` on a circular object recurses
+                // to stack overflow.
+                if let Some((_, key)) = self.multidim_assoc_elem(expr, index) {
+                    let changed = self.signals.get(&key).map_or(true, |p| *p != *val);
+                    if changed {
+                        self.signals.insert(key, val.clone());
+                    }
+                    return changed;
+                }
                 // Ascending packed vector bit-write (`logic [0:7] pa; pa[i]=b`):
                 // label i targets internal bit (W-1)-i (LRM §7.4.1, §11.5.1).
                 if let ExprKind::Ident(h) = &expr.kind {
@@ -25865,13 +25880,6 @@ impl Simulator {
                 r
             }
             ExprKind::Index { expr, index } => {
-                if std::env::var("XEZIM_EV_DBG").is_ok() {
-                    eprintln!("[EVDBG] idx-eval base_fmn={:?} qb={:?} ean={:?} nin={:?}",
-                        self.flat_member_name(expr),
-                        self.indexed_queue_base(expr),
-                        self.expr_assoc_name(expr),
-                        self.nested_index_name(expr));
-                }
                 // Element of an unpacked ARRAY OF QUEUES: `q[i][k]` selects
                 // element k of the queue `q[i]` (§7.4.5). Without this the base
                 // resolves to a scalar and `[k]` becomes a bit-select.
@@ -25887,6 +25895,16 @@ impl Simulator {
                     return self
                         .get_signal_value_by_name(&elem)
                         .unwrap_or_else(|| Value::new(32));
+                }
+                // Multidimensional associative-array read `m[k1][k2]...[kn]`:
+                // look up the flat compound key `m[K1][K2]...[Kn]`. Mirrors
+                // the write path (`multidim_assoc_elem`) so the two agree on
+                // the key for every type (handle / int / signed / string).
+                if let Some((_, key)) = self.multidim_assoc_elem(expr, index) {
+                    if let Some(v) = self.get_signal_value_by_name(&key) {
+                        return v;
+                    }
+                    return Value::new(ctx_width.max(1));
                 }
                 // §7.4.2 element of a DYNAMIC ARRAY OF DYNAMIC ARRAYS reached
                 // through a class member (`m[i][j]`, `obj.m[i][j]`): the base
@@ -27751,6 +27769,23 @@ impl Simulator {
                 }
             }
             ExprKind::MemberAccess { expr, member } => {
+                // `ClassName::ENUM_CONST` / `ClassName::static_prop`: when the
+                // parser represents a class-scoped name as
+                // `MemberAccess(Ident([ClassName]), member)` (notably inside a
+                // method body), resolve the member against the class scope
+                // BEFORE the object-property paths below — a class name has no
+                // runtime instance, so without this `Base::STARTED` reads 0.
+                if let ExprKind::Ident(h) = &expr.kind {
+                    if h.path.len() == 1 && h.path[0].selects.is_empty()
+                        && self.module.classes.contains_key(&h.path[0].name.name)
+                    {
+                        if let Some(v) =
+                            self.class_scoped_const(&h.path[0].name.name, &member.name)
+                        {
+                            return v;
+                        }
+                    }
+                }
                 // §18.4: member of a struct/union CLASS property — read through
                 // the aggregate's storage (a bit slice for a packed struct/
                 // union, so a union's members alias). Must precede the flat
@@ -35293,6 +35328,7 @@ impl Simulator {
     }
 
     fn resolve_hier_name_uncached(&self, hier: &HierarchicalIdentifier) -> String {
+
         let common_prefix_len = |a: &str, b: &str| -> usize {
             let mut n = 0usize;
             for (sa, sb) in a.split('.').zip(b.split('.')) {
@@ -41129,6 +41165,84 @@ impl Simulator {
         None
     }
 
+    /// Resolve a base expression to its associative-array STORAGE name if it
+    /// is one — a module-level signal name, or a per-instance `<handle>#member`
+    /// (a bare class member accessed inside a method). Returns None for a
+    /// non-assoc base (a fixed/dynamic/queue array, a non-array signal).
+    fn assoc_array_storage_name(&self, e: &Expression) -> Option<String> {
+        if let ExprKind::Ident(h) = &e.kind {
+            if h.path.len() == 1 && h.path[0].selects.is_empty() {
+                let nm = self.resolve_hier_name(h);
+                if self.is_associative_array(&nm) {
+                    return Some(nm);
+                }
+                if let Some(scoped) = self.instance_assoc_member(&nm) {
+                    if self.is_associative_array(&scoped) {
+                        return Some(scoped);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// A multiply-indexed ASSOCIATIVE-array element `base[k1][k2]...[kn]`
+    /// (n ≥ 2) whose `base` is a registered associative array AND whose
+    /// first-level element is NOT itself a queue/dynamic collection (which
+    /// would make it an assoc-of-collection, handled by the queue/indexed
+    /// paths). Returns `(assoc_base_name, flat_compound_key)` where the
+    /// compound key is `base[K1][K2]...[Kn]` with each `Ki` rendered as an
+    /// assoc key string via `assoc_key_str` — so the read and write paths
+    /// (which both call this) stay byte-for-byte consistent regardless of
+    /// key type (handle / int / signed / string). 1D indexes are left to the
+    /// existing single-index assoc handlers.
+    ///
+    /// Multidimensional associative arrays (`int m[C][int]`, UVM's
+    /// `m_recur_states[uvm_object][uvm_recursion_policy_enum]`) store each
+    /// element under the flat compound key, mirroring how the 1D assoc
+    /// machinery keys off `<name>[<key>]`. `m.exists(k)` scans the
+    /// `<base>[k][` prefix; `m[k1].exists(k2)` checks `<base>[k1][k2]`.
+    fn multidim_assoc_elem(
+        &mut self,
+        base: &Expression,
+        outer_index: &Expression,
+    ) -> Option<(String, String)> {
+        // The full expression is `base[outer_index]`; `base` may itself be a
+        // nested Index (`m[k1][k2]` parses as Index(Index(m,k1),k2)). Unwrap
+        // the Index levels of `base`, then treat `outer_index` as k_n.
+        let mut rev: Vec<&Expression> = vec![outer_index];
+        let mut cur = base;
+        let mut depth = 1;
+        while let ExprKind::Index { expr: b, index } = &cur.kind {
+            rev.push(index.as_ref());
+            cur = b.as_ref();
+            depth += 1;
+        }
+        if depth < 2 {
+            return None; // 1D — existing handlers
+        }
+        let base_name = self.assoc_array_storage_name(cur)?;
+        // Distinguish a true multidim assoc from an assoc-of-queue/
+        // dynamic-array (`m[k1][i]`): if the first-level element `m[K1]` is a
+        // registered queue/dynamic collection, defer to the collection paths.
+        let k0 = self.eval_expr(rev[depth - 1]);
+        let k0s = self.assoc_key_str(&base_name, &k0);
+        let first_elem = format!("{}[{}]", base_name, k0s);
+        if self.module.dynamic_arrays.contains(&first_elem)
+            || self.module.arrays.contains_key(&first_elem)
+        {
+            return None;
+        }
+        // Build the compound key inner→outer so it reads base[K1][K2]...[Kn].
+        let mut key = base_name.clone();
+        for idx in rev.iter().rev() {
+            let kv = self.eval_expr(idx);
+            let ks = self.assoc_key_str(&base_name, &kv);
+            key = format!("{}[{}]", key, ks);
+        }
+        Some((base_name, key))
+    }
+
     /// All randomizable property names across an object's class hierarchy.
     fn object_rand_set(&self, handle: usize) -> HashSet<String> {
         let mut out = HashSet::default();
@@ -46000,12 +46114,22 @@ impl Simulator {
                 let kv = self.eval_expr(arg);
                 let key = self.assoc_key_str(obj_name, &kv);
                 let elem_name = format!("{}[{}]", obj_name, key);
+                // A multidimensional associative array (`m[K1][K2]`, e.g. UVM's
+                // `m_recur_states[obj][policy]`) stores elements under the
+                // compound key `m[K1][K2]`; the bare `m[K1]` is never a direct
+                // entry. So a hit is EITHER the flat 1D key OR any compound
+                // `m[K1][...]` element (prefix scan).
+                let nested_prefix = format!("{}[", elem_name);
                 let found = self.signals.contains_key(&elem_name)
                     || self.signal_name_to_id.contains_key(elem_name.as_str())
                     // An assoc element that is itself a collection is stored
                     // under `<assoc>[<key>].size` / `<assoc>[<key>][i]`.
                     || self.signals.contains_key(&format!("{}.size", elem_name))
-                    || self.module.dynamic_arrays.contains(&elem_name);
+                    || self.module.dynamic_arrays.contains(&elem_name)
+                    || self
+                        .signals
+                        .keys()
+                        .any(|k| k.starts_with(&nested_prefix));
                 return Some(Value::from_u64(found as u64, 1));
             }
         }
@@ -46349,6 +46473,64 @@ impl Simulator {
                 cur = cd.extends.clone();
             } else {
                 break;
+            }
+        }
+        None
+    }
+
+    /// Resolve a CLASS-SCOPED constant `ClassName::member` — an enum literal
+    /// of a `typedef enum` declared in `ClassName` or an ancestor, or a static
+    /// property. SystemVerilog scopes enum literals to their declaring class,
+    /// so `Base::STARTED` (where `STARTED` is a member of an enum typedef in
+    /// `Base`) yields the literal's value. The parser represents such a scoped
+    /// name — inside a method body — as `MemberAccess(Ident([ClassName]), member)`;
+    /// without this resolution the class name is treated as a runtime object
+    /// (it has none) and the access reads 0. Enum typedefs are hoisted globally
+    /// by `hoist_class_local_typedefs`, so we walk the inheritance chain's
+    /// `typedef_targets` and look each enum's members up in
+    /// `module.enum_members`.
+    fn class_scoped_const(&mut self, start_class: &str, member: &str) -> Option<Value> {
+        // Collect the inheritance chain and its enum-typedef names + widths
+        // under an immutable borrow, then resolve under separate borrows so
+        // the later `class_static_get` (&mut self) doesn't conflict.
+        let mut chain_classes: Vec<String> = Vec::new();
+        let mut enum_tds: Vec<(String, u32)> = Vec::new();
+        {
+            let mut cur = Some(start_class.to_string());
+            while let Some(cn) = cur {
+                chain_classes.push(cn.clone());
+                match self.module.classes.get(&cn) {
+                    Some(cd) => {
+                        for (td_name, dt) in &cd.typedef_targets {
+                            if matches!(dt, DataType::Enum(_)) {
+                                let w = self
+                                    .module
+                                    .typedefs
+                                    .get(td_name)
+                                    .copied()
+                                    .unwrap_or(32)
+                                    .max(1);
+                                enum_tds.push((td_name.clone(), w));
+                            }
+                        }
+                        cur = cd.extends.clone();
+                    }
+                    None => break,
+                }
+            }
+        }
+        // Enum literal lookup.
+        for (td_name, w) in &enum_tds {
+            if let Some(members) = self.module.enum_members.get(td_name) {
+                if let Some((_, val)) = members.iter().find(|(n, _)| n == member) {
+                    return Some(Value::from_u64(*val, *w));
+                }
+            }
+        }
+        // Static property / localparam fallback.
+        for cn in &chain_classes {
+            if let Some(v) = self.class_static_get(cn, member) {
+                return Some(v);
             }
         }
         None
@@ -48207,6 +48389,7 @@ impl Simulator {
                 mname,
                 "push_back" | "push_front" | "pop_back" | "pop_front" | "size" | "len"
                     | "delete" | "insert" | "sum" | "product" | "min" | "max" | "unique"
+                    | "exists" | "num" | "first" | "last" | "next" | "prev"
             ) {
                 if let ExprKind::Index { .. } = &expr.kind {
                     if let Some(cn) = self.nested_index_name(expr) {

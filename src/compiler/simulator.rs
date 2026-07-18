@@ -462,6 +462,32 @@ enum CombItem {
     FusedGate {
         op: FusedGate,
     },
+    /// IEEE 1800-2017 §29 User-Defined Primitive instance. Evaluated by
+    /// `eval_udp(idx)` against `self.udp_runtime[idx]` (truth table + per-
+    /// instance sequential state). Always evaluated on the serial settle path.
+    Udp {
+        idx: usize,
+    },
+}
+
+/// Per-instance runtime state for a §29 UDP. Terminals are resolved to single
+/// bit refs; sequential state and previous-input levels drive edge detection.
+#[derive(Clone)]
+struct UdpRuntime {
+    udp_name: String,
+    inst_path: String,
+    out_ref: BitRef,
+    in_refs: Vec<BitRef>,
+    is_sequential: bool,
+    delay: u64,
+    rows: Vec<crate::ast::decl::UdpTableRow>,
+    /// Current output/state level: 0,1,2(=x).
+    state: u8,
+    /// Previous input levels (0,1,2); 255 = uninitialised (first eval).
+    prev_inputs: Vec<u8>,
+    initialized: bool,
+    /// True once we've warned about a no-match with a delayed multibit output.
+    warned: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2030,6 +2056,12 @@ pub struct Simulator {
     sdf_delays: Vec<u64>,
     /// Pending delayed signal updates: (time, signal_id, value)
     delayed_updates: Vec<(u64, usize, Value)>,
+    /// §29 per-instance UDP runtime state, indexed by `CombItem::Udp{idx}`.
+    udp_runtime: Vec<UdpRuntime>,
+    /// True when the design contains any UDP instance — forces the serial
+    /// settle path (sequential UDPs need `&mut self` to update their state,
+    /// which the parallel/BSP isolated eval cannot provide).
+    has_udp: bool,
     module: ElaboratedModule,
     dpi_libraries: Vec<Library>,
     dpi_bindings: HashMap<String, DpiBinding>,
@@ -4248,6 +4280,8 @@ impl Simulator {
             sdf_select: None,
             sdf_delays: Vec::new(),
             delayed_updates: Vec::new(),
+            udp_runtime: Vec::new(),
+            has_udp: false,
             module,
             dpi_libraries: Vec::new(),
             dpi_bindings: HashMap::default(),
@@ -8044,6 +8078,8 @@ impl Simulator {
                 }
                 // AST entries always need &mut self.
                 CombItem::ContAssign { .. } | CombItem::AlwaysBlock { .. } => {}
+                // §29 UDPs mutate per-instance state — never parallel-safe.
+                CombItem::Udp { .. } => {}
             }
             if e.has_unresolved_reads {
                 unresolved += 1;
@@ -8595,6 +8631,9 @@ impl Simulator {
     ) -> bool {
         match &self.comb_entries[eidx].item {
             CombItem::Noop => true,
+            // §29 UDPs are never evaluated on this isolated (parallel) path —
+            // `has_udp` forces the serial settle. Present only for exhaustiveness.
+            CombItem::Udp { .. } => true,
             CombItem::FastDirectCopy { dst_id, src_id } => {
                 // LRM §9.3.1: skip if the destination is forced
                 if !self.forced_signals.contains_key(dst_id) {
@@ -8699,6 +8738,8 @@ impl Simulator {
     ) -> bool {
         match item {
             CombItem::Noop => true,
+            // §29 UDPs never run on this isolated path (serial forced).
+            CombItem::Udp { .. } => true,
             CombItem::FastDirectCopy { dst_id, src_id } => {
                 let (mut sv, mut sx) = view[*src_id].raw_bits();
                 // §6.11.1/§10.7: a 2-state destination drops X/Z (X/Z -> 0).
@@ -9658,6 +9699,9 @@ impl Simulator {
             .iter()
             .map(|e| match &e.item {
                 CombItem::Noop => SendCombItem::Noop,
+                // §29 UDPs disable parallel settle (has_udp forces serial), so a
+                // UDP never reaches a worker; represent it inertly here.
+                CombItem::Udp { .. } => SendCombItem::Noop,
                 CombItem::FastDirectCopy { dst_id, src_id } => {
                     SendCombItem::FastDirectCopy { dst_id: *dst_id, src_id: *src_id }
                 }
@@ -13734,6 +13778,10 @@ impl Simulator {
             }
         }
 
+        // §29: append User-Defined Primitive instances as comb entries so
+        // their input nets participate in the reverse-dependency index below.
+        self.build_udp_entries(&mut entries);
+
         // Build reverse dependency index by signal ID using final entry
         // order. CSR layout: counts → prefix-sum → fill, all in flat
         // u32 Vecs. Avoids 585K × 24 B of empty Vec headers and 585K
@@ -13920,6 +13968,282 @@ impl Simulator {
         #[cfg(all(target_env = "gnu", not(miri)))]
         unsafe {
             libc::malloc_trim(0);
+        }
+    }
+
+    /// IEEE 1800-2017 §29: turn each flattened `UdpInstance` into a comb entry
+    /// (`CombItem::Udp{idx}`) plus a `UdpRuntime` state slot. Terminal nets are
+    /// resolved to single-bit refs; unresolved/multibit terminals emit a loud
+    /// warning and the instance is dropped (output left undriven).
+    fn build_udp_entries(&mut self, entries: &mut Vec<CombEntry>) {
+        let insts = std::mem::take(&mut self.module.udp_instances);
+        for inst in insts {
+            // Resolve output + input terminals to single bit refs.
+            let out_ref = match self.try_resolve_bit_ref(&inst.output, None) {
+                Some(b) => b,
+                None => {
+                    eprintln!(
+                        "\n========================================================================\n\
+                         Warning: UDP OUTPUT UNRESOLVED — primitive '{}' instance '{}'\n\
+                         the output terminal net could not be resolved to a single 1-bit net.\n\
+                         Consequence: this instance is DROPPED; its output is left UNDRIVEN.\n\
+                         ========================================================================\n",
+                        inst.udp_name, inst.inst_path);
+                    continue;
+                }
+            };
+            let mut in_refs = Vec::with_capacity(inst.inputs.len());
+            let mut bad = false;
+            for e in &inst.inputs {
+                match self.try_resolve_bit_ref(e, None) {
+                    Some(b) => in_refs.push(b),
+                    None => { bad = true; break; }
+                }
+            }
+            if bad {
+                eprintln!(
+                    "\n========================================================================\n\
+                     Warning: UDP INPUT UNRESOLVED — primitive '{}' instance '{}'\n\
+                     an input terminal net could not be resolved to a single 1-bit net.\n\
+                     Consequence: this instance is DROPPED; its output is left UNDRIVEN.\n\
+                     ========================================================================\n",
+                    inst.udp_name, inst.inst_path);
+                continue;
+            }
+
+            let idx = self.udp_runtime.len();
+            let init_state = match inst.init {
+                Some('0') => 0u8,
+                Some('1') => 1u8,
+                _ => 2u8, // x (default start state)
+            };
+            let n = in_refs.len();
+            let read_ids: Vec<usize> = in_refs.iter().map(|b| b.sig_id as usize).collect();
+            let write_ids: Vec<usize> = vec![out_ref.sig_id as usize];
+            self.udp_runtime.push(UdpRuntime {
+                udp_name: inst.udp_name.clone(),
+                inst_path: inst.inst_path.clone(),
+                out_ref,
+                in_refs,
+                is_sequential: inst.is_sequential,
+                delay: inst.delay,
+                rows: inst.rows,
+                state: init_state,
+                prev_inputs: vec![255u8; n],
+                initialized: false,
+                warned: false,
+            });
+            entries.push(CombEntry {
+                item: CombItem::Udp { idx },
+                scope_hint: None,
+                read_signal_ids: read_ids,
+                write_signal_ids: write_ids,
+                has_unresolved_reads: false,
+                defer_at_time0: false,
+                span: inst.span,
+            });
+            self.has_udp = true;
+        }
+        // A UDP output initializes to x (Icarus), not the undriven-wire z — a
+        // sequential UDP to its `initial` start state (default x), a
+        // combinational UDP to x until its first evaluation drives it. This is
+        // visible when an instance `#delay` postpones the first real drive.
+        for rt in &self.udp_runtime {
+            let id = rt.out_ref.sig_id as usize;
+            let code = if rt.is_sequential { rt.state } else { 2 };
+            if self.signal_table[id].set_bit_code(rt.out_ref.bit as usize, code) {
+                self.table_modified = true;
+            }
+        }
+    }
+
+    /// IEEE 1800-2017 §29: evaluate one UDP instance on an input change.
+    /// Detects per-input edges vs the previous input vector, selects the first
+    /// matching table row (edge rows require their input to have transitioned),
+    /// and drives the output net (immediately, or after the instance delay).
+    fn eval_udp(&mut self, idx: usize) {
+        // Read current input levels (z normalized to x).
+        let n = self.udp_runtime[idx].in_refs.len();
+        let mut cur = [2u8; 32];
+        if n > 32 {
+            // Absurdly wide UDP — not supported; warn once and bail.
+            if !self.udp_runtime[idx].warned {
+                self.udp_runtime[idx].warned = true;
+                eprintln!("Warning: UDP '{}' instance '{}' has {} inputs (>32 unsupported); \
+                    output left unchanged.",
+                    self.udp_runtime[idx].udp_name, self.udp_runtime[idx].inst_path, n);
+            }
+            return;
+        }
+        for i in 0..n {
+            let b = self.udp_runtime[idx].in_refs[i];
+            let code = self.signal_table[b.sig_id as usize].get_bit_code(b.bit as usize);
+            cur[i] = if code >= 2 { 2 } else { code }; // 0,1,x (z->x)
+        }
+
+        let rt = &self.udp_runtime[idx];
+        let first = !rt.initialized;
+        let cur_state = rt.state;
+
+        // Previous input levels. Before the first evaluation each input's prior
+        // value is x (its pre-time-0 state), so a t=0 x→value transition is a
+        // real edge — matching Icarus.
+        let mut prev = [2u8; 32];
+        for i in 0..n {
+            prev[i] = if first { 2 } else { rt.prev_inputs[i] };
+        }
+
+        // A UDP is event-driven: it evaluates only when an input actually
+        // changes. A spurious re-trigger with no input change must NOT alter the
+        // output (Icarus never re-evaluates without an event). The very first
+        // evaluation always runs so combinational level rows establish t=0.
+        let any_change = first || (0..n).any(|i| cur[i] != prev[i]);
+        if !any_change {
+            return;
+        }
+
+        // Select the first matching row (top-down).
+        let mut next: Option<u8> = None; // Some(level) or None(=`-` hold)
+        let mut matched = false;
+        for row in &rt.rows {
+            if let Some(out) = Self::udp_match_row(row, &cur[..n], &prev[..n], cur_state, rt.is_sequential) {
+                next = out;
+                matched = true;
+                break;
+            }
+        }
+
+        // Resolve the driven value. Per Icarus (empirically): on ANY input
+        // change with no matching row the output becomes x — for both
+        // combinational (§29.3) and sequential UDPs. Holding happens only via an
+        // explicit `-` output row (or when no input changed, handled above).
+        let new_code: u8 = if matched {
+            match next {
+                Some(c) => c,      // explicit 0/1/x
+                None => cur_state, // `-` no-change (sequential hold)
+            }
+        } else {
+            2 // no matching row ⇒ x
+        };
+
+        // Commit state + previous-input vector.
+        {
+            let rt = &mut self.udp_runtime[idx];
+            rt.state = new_code;
+            for i in 0..n { rt.prev_inputs[i] = cur[i]; }
+            rt.initialized = true;
+        }
+
+        // Drive the output net.
+        let out_ref = self.udp_runtime[idx].out_ref;
+        let delay = self.udp_runtime[idx].delay;
+        let id = out_ref.sig_id as usize;
+        let bit = out_ref.bit as usize;
+        // §29.7 instance delay: applied to every transition, including the
+        // initial one at t=0 (Icarus leaves the output at x until the delay
+        // elapses — unlike SDF back-annotation, which does not act at t=0).
+        if delay > 0 {
+            if self.signal_table[id].get_bit_code(bit) != new_code {
+                let mut v = self.signal_table[id].clone();
+                v.set_bit_code(bit, new_code);
+                self.schedule_delayed_with_delay(id, v, delay);
+            }
+        } else if self.signal_table[id].set_bit_code(bit, new_code) {
+            self.table_modified = true;
+            self.after_signal_write(id);
+            self.mark_dirty_id(id);
+        }
+    }
+
+    /// Match one table row against the current/previous input levels and state.
+    /// Returns `Some(Some(level))` for an explicit output, `Some(None)` for a
+    /// `-` (no-change) output, or `None` if the row does not match.
+    fn udp_match_row(
+        row: &crate::ast::decl::UdpTableRow,
+        cur: &[u8],
+        prev: &[u8],
+        cur_state: u8,
+        is_sequential: bool,
+    ) -> Option<Option<u8>> {
+        use crate::ast::decl::{UdpSym, UdpOut};
+        if row.inputs.len() != cur.len() {
+            return None;
+        }
+        // Find the (at most one) edge symbol position.
+        let mut edge_pos: Option<usize> = None;
+        for (i, sym) in row.inputs.iter().enumerate() {
+            if matches!(sym, UdpSym::Edge { .. } | UdpSym::EdgeShort(_)) {
+                if edge_pos.is_some() {
+                    return None; // two edges in one row — illegal, reject
+                }
+                edge_pos = Some(i);
+            }
+        }
+        // Level-match the non-edge inputs against their CURRENT value.
+        for (i, sym) in row.inputs.iter().enumerate() {
+            if Some(i) == edge_pos {
+                continue;
+            }
+            if !Self::udp_level_match(sym, cur[i]) {
+                return None;
+            }
+        }
+        // Edge input: require that input to have transitioned and match.
+        if let Some(e) = edge_pos {
+            let p = prev[e];
+            let c = cur[e];
+            if p == c {
+                return None; // no transition on the edge input
+            }
+            if !Self::udp_edge_match(&row.inputs[e], p, c) {
+                return None;
+            }
+        }
+        // Sequential current-state field.
+        if is_sequential {
+            if let Some(state_sym) = &row.state {
+                if !Self::udp_level_match(state_sym, cur_state) {
+                    return None;
+                }
+            }
+        }
+        // Matched — resolve the output.
+        Some(match row.output {
+            UdpOut::Level('0') => Some(0),
+            UdpOut::Level('1') => Some(1),
+            UdpOut::Level(_) => Some(2),
+            UdpOut::NoChange => None,
+        })
+    }
+
+    /// Level symbol match: `sym` against actual level `c` (0,1,2=x).
+    fn udp_level_match(sym: &crate::ast::decl::UdpSym, c: u8) -> bool {
+        use crate::ast::decl::UdpSym;
+        match sym {
+            UdpSym::Level('0') => c == 0,
+            UdpSym::Level('1') => c == 1,
+            UdpSym::Level(_) => c == 2, // 'x'
+            UdpSym::AnyQ => true,       // 0/1/x
+            UdpSym::B => c == 0 || c == 1,
+            // An edge symbol never matches as a level (handled separately).
+            UdpSym::Edge { .. } | UdpSym::EdgeShort(_) => false,
+        }
+    }
+
+    /// Edge symbol match: transition prev `p` -> cur `c` (levels 0,1,2=x).
+    fn udp_edge_match(sym: &crate::ast::decl::UdpSym, p: u8, c: u8) -> bool {
+        use crate::ast::decl::UdpSym;
+        let lc = |code: u8| -> char { match code { 0 => '0', 1 => '1', _ => 'x' } };
+        let (pc, cc) = (lc(p), lc(c));
+        let ml = |s: char, a: char| s == '?' || s == a;
+        match sym {
+            UdpSym::Edge { from, to } => ml(*from, pc) && ml(*to, cc),
+            UdpSym::EdgeShort('r') => pc == '0' && cc == '1',
+            UdpSym::EdgeShort('f') => pc == '1' && cc == '0',
+            UdpSym::EdgeShort('p') => matches!((pc, cc), ('0','1') | ('0','x') | ('x','1')),
+            UdpSym::EdgeShort('n') => matches!((pc, cc), ('1','0') | ('1','x') | ('x','0')),
+            UdpSym::EdgeShort('*') => pc != cc, // any change
+            _ => false,
         }
     }
 
@@ -16566,6 +16890,10 @@ impl Simulator {
                 // Get destination signal name to determine block
                 let dst_name = match &entry.item {
                     CombItem::Noop => "",
+                    CombItem::Udp { idx } => {
+                        let id = self.udp_runtime[*idx].out_ref.sig_id as usize;
+                        self.name_for_id(id)
+                    }
                     CombItem::DirectCopy { dst_id, .. }
                     | CombItem::FastDirectCopy { dst_id, .. } => self.name_for_id(*dst_id),
                     CombItem::FusedGate { op } => {
@@ -20805,7 +21133,12 @@ impl Simulator {
         if self.event_measure {
             self.event_phase += 1; // comb SETTLE phase (distinct from sample)
         }
-        if self.perlp_settle.is_some() {
+        // §29: sequential UDPs mutate per-instance state during evaluation,
+        // which the parallel/BSP isolated eval (`&self`, view-based) cannot do.
+        // Force the serial fixpoint path whenever the design contains any UDP.
+        if self.has_udp {
+            self.settle_combinatorial_inner();
+        } else if self.perlp_settle.is_some() {
             if self.perlp_shadow {
                 self.settle_combinatorial_shadow();
             } else {
@@ -21516,6 +21849,10 @@ impl Simulator {
                 let op = *op;
                 self.exec_fused_gate(op);
             }
+            CombItem::Udp { idx } => {
+                let idx = *idx;
+                self.eval_udp(idx);
+            }
             // Copies are always handled by the isolated path; reaching here for
             // them would be a logic error, but eval them correctly regardless.
             CombItem::FastDirectCopy { dst_id, src_id } => {
@@ -21889,6 +22226,11 @@ impl Simulator {
                     CombItem::FusedGate { op } => {
                         let op = *op;
                         self.exec_fused_gate(op);
+                        self.prof_settle_dc_count += 1;
+                    }
+                    CombItem::Udp { idx } => {
+                        let idx = *idx;
+                        self.eval_udp(idx);
                         self.prof_settle_dc_count += 1;
                     }
                 }

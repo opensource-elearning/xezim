@@ -86,6 +86,8 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                     }
                 }
             }
+            // §29 UDPs carry no should-fail lints (truth tables only).
+            SourceDefinition::Udp(_) => {}
         }
     }
     errs

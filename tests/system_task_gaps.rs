@@ -295,6 +295,49 @@ endmodule
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// ---------------------------------------------------------------- group 7
+
+#[test]
+fn recognized_stub_tasks_warn_once_and_continue() {
+    let src = r#"
+module tb;
+  integer n;
+  reg [7:0] m [0:3];
+  reg [7:0] m0;
+  reg done;
+  wire w;
+  initial begin
+    m[0] = 8'h5A;
+    $asserton;
+    $assertoff;
+    repeat (3) $assertkill;
+    $save("cp.dat");
+    $restart("cp.dat");
+    $sreadmemh("nope.dat", m);
+    n = $countdrivers(w);
+    $countdrivers(w);
+    $key;
+    $log;
+    $list;
+    $getpattern(0);
+    m0 = m[0];
+    done = 1;
+  end
+endmodule
+"#;
+    let sim = simulate(src, 1000).expect("simulate failed");
+    assert_eq!(u(&sim, "done") & 1, 1, "stubs must not abort execution");
+    assert_eq!(u(&sim, "n"), 0, "$countdrivers returns 0");
+    assert_eq!(u(&sim, "m0"), 0x5A, "$sreadmemh leaves memory unchanged");
+    let warned = sim.warned_system_task_names();
+    for name in [
+        "$asserton", "$assertoff", "$assertkill", "$save", "$restart",
+        "$sreadmemh", "$countdrivers", "$key", "$log", "$list", "$getpattern",
+    ] {
+        assert!(warned.contains(&name.to_string()), "missing stub warning for {}: {:?}", name, warned);
+    }
+}
+
 #[test]
 fn handled_names_do_not_trip_unknown_warning() {
     // Function-only names in statement position (result discarded) and

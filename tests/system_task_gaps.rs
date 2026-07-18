@@ -390,3 +390,52 @@ end endmodule
     assert!(joined.contains("SEED_OK"), "$srandom(42) must reproduce the stream:\n{}", joined);
     assert!(joined.contains("STATE_OK"), "get/set_randstate must round-trip:\n{}", joined);
 }
+
+/// SDF back-annotation must OVERRIDE a specify path delay (SDF standard), and
+/// the CLI `--sdf` path must agree with the runtime `$sdf_annotate` path — the
+/// CLI path previously `.max()`'d specify over SDF, so the two diverged when a
+/// cell had both a specify delay and a smaller SDF value. Specify-only timing
+/// (no SDF) is unaffected. CLI-level because it exercises `--sdf` argument wiring.
+#[test]
+fn sdf_annotation_overrides_specify_and_paths_agree() {
+    fn xezim_bin() -> std::path::PathBuf {
+        let mut p = std::env::current_exe().expect("current_exe");
+        p.pop();
+        if p.ends_with("deps") {
+            p.pop();
+        }
+        p.join("xezim")
+    }
+    let dir = std::env::temp_dir().join(format!("xezim_sdf_specify_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let sv = dir.join("c.sv");
+    std::fs::write(
+        &sv,
+        "`timescale 1ns/1ns\n\
+         module cbuf2(input a, output y); assign y=a; specify (a=>y)=8; endspecify endmodule\n\
+         module t; reg a=0; wire y; cbuf2 u(.a(a),.y(y));\n\
+         initial begin #1 a=1; #6 $display(\"T7 y=%b\",y); #4 $display(\"T11 y=%b\",y); $finish; end\n\
+         endmodule\n",
+    )
+    .unwrap();
+    let sdf = dir.join("d.sdf");
+    std::fs::write(
+        &sdf,
+        "(DELAYFILE (CELL (CELLTYPE \"cbuf2\") (INSTANCE u) (DELAY (ABSOLUTE (IOPATH a y (5:5:5) (5:5:5))))))\n",
+    )
+    .unwrap();
+    let run = |args: &[&str]| -> String {
+        let out = std::process::Command::new(xezim_bin())
+            .args(args)
+            .arg(&sv)
+            .output()
+            .expect("run");
+        format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
+    };
+    // SDF (5) overrides specify (8): edge at t=6, so y=1 at t=7.
+    let with_sdf = run(&["--sdf", sdf.to_str().unwrap()]);
+    assert!(with_sdf.contains("T7 y=1"), "SDF must override specify:\n{}", with_sdf);
+    // Specify-only (no SDF): edge at t=9, so y=0 at t=7.
+    let no_sdf = run(&[]);
+    assert!(no_sdf.contains("T7 y=0"), "specify-only timing must be unchanged:\n{}", no_sdf);
+}

@@ -7514,11 +7514,18 @@ impl Simulator {
         if need_sdf && self.sdf_delays.len() != self.signal_table.len() {
             self.sdf_delays.resize(self.signal_table.len(), 0);
         }
+        // Signals whose delay came from SDF back-annotation. SDF is
+        // authoritative: it REPLACES the specify path delay (SDF standard, and
+        // it keeps this CLI path consistent with the runtime `$sdf_annotate`
+        // path, which clobbers). Without this set a specify delay could `.max()`
+        // upward over a smaller annotated value — the two paths would disagree.
+        let mut sdf_annotated: std::collections::HashSet<usize> = std::collections::HashSet::new();
         if let Some(ref ann) = self.sdf_annotation {
             let mut count = 0;
             for (sig_name, &delay) in &ann.signal_delays {
                 if let Some(&id) = self.signal_name_to_id.get(sig_name.as_str()) {
                     self.sdf_delays[id] = delay;
+                    sdf_annotated.insert(id);
                     count += 1;
                 }
             }
@@ -7527,6 +7534,9 @@ impl Simulator {
         if use_specify {
             for (sig_name, &delay) in &self.module.specify_delays {
                 if let Some(&id) = self.signal_name_to_id.get(sig_name.as_str()) {
+                    if sdf_annotated.contains(&id) {
+                        continue; // SDF back-annotation overrides the specify delay
+                    }
                     self.sdf_delays[id] = self.sdf_delays[id].max(delay);
                 }
             }

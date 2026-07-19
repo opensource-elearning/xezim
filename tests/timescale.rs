@@ -173,6 +173,35 @@ fn no_timescale_module_keeps_one_ns_delays() {
     assert!(o.contains("T=5"), "delay scaling must stay 1ns; got: {}", o);
 }
 
+// §20.3 — `$time`/`$realtime` inside a subroutine reference the DEFINING
+// module's timescale, not the caller's. A task in a 1ns/1ps `sub` called from a
+// 1us/1ns `top` at t=5us must report 5000 (5us in sub's 1ns unit), not 5.
+// Confirmed against iverilog AND a commercial simulator.
+#[test]
+fn cross_module_task_uses_callee_timescale() {
+    let o = out(r#"
+`timescale 1us/1ns
+module top; sub s(); initial #5 s.show(); endmodule
+`timescale 1ns/1ps
+module sub; task show; $display("XT=%0g rt=%0g", $realtime, $time); endtask endmodule
+"#);
+    assert!(o.contains("XT=5000 rt=5000"),
+        "cross-module task must use the callee's 1ns unit (5000), not the caller's 1us (5); got: {}", o);
+}
+
+// Same rule for a FUNCTION returning $realtime across a timescale boundary.
+#[test]
+fn cross_module_function_uses_callee_timescale() {
+    let o = out(r#"
+`timescale 1us/1ns
+module top; sub s(); initial #5 $display("XF=%0g", s.gett()); endmodule
+`timescale 1ns/1ps
+module sub; function real gett; gett = $realtime; endfunction endmodule
+"#);
+    assert!(o.contains("XF=5000"),
+        "cross-module function must evaluate $realtime in the callee's 1ns unit (5000); got: {}", o);
+}
+
 // A module WITHOUT its own directive but PRECEDED by one inherits it (sticky
 // §3.14.2.3) — it reports the inherited scale, not the 1s/1s default.
 #[test]

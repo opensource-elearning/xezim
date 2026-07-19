@@ -48858,15 +48858,25 @@ impl Simulator {
                 let scope = full.rsplit_once('.').map(|(s, _)| s.to_string());
                 if let Some(fd) = self.module.functions.get(&full).cloned() {
                     let saved = self.name_resolve_hint.borrow().clone();
-                    *self.name_resolve_hint.borrow_mut() = scope;
+                    *self.name_resolve_hint.borrow_mut() = scope.clone();
+                    // §20.3: `$time`/`$realtime`/`%m` inside a subroutine reference
+                    // the module where it is DEFINED — i.e. the instance we
+                    // dispatched into — not the caller. Point the timescale scope
+                    // at that instance for the duration of the body.
+                    let saved_ts = self.timescale_scope_override.take();
+                    self.timescale_scope_override = scope.clone();
                     let r = self.exec_function_call(&fd, args);
+                    self.timescale_scope_override = saved_ts;
                     *self.name_resolve_hint.borrow_mut() = saved;
                     return r;
                 }
                 if let Some(td) = self.module.tasks.get(&full).cloned() {
                     let saved = self.name_resolve_hint.borrow().clone();
-                    *self.name_resolve_hint.borrow_mut() = scope;
+                    *self.name_resolve_hint.borrow_mut() = scope.clone();
+                    let saved_ts = self.timescale_scope_override.take();
+                    self.timescale_scope_override = scope.clone();
                     self.exec_task_call(&td, args);
+                    self.timescale_scope_override = saved_ts;
                     *self.name_resolve_hint.borrow_mut() = saved;
                     return Value::zero(32);
                 }

@@ -153,3 +153,68 @@ endmodule
         assert!(out.contains(tag), "{} (want {}):\n{}", want, tag, out);
     }
 }
+
+/// LRM §25.4/§25.5: a task imported into a modport, reached through a
+/// modport-typed port (`bus_if.mp b` connected as `m u(bus.mp)`). The modport
+/// `import` must PARSE (was a hard parse error on the `import` keyword), and
+/// the modport selector on the connection actual (`bus.mp`) must not become
+/// part of the instance path — else `b.put()` dispatched to a phantom
+/// `bus.mp.put` task and `b.d` read a phantom `bus.mp.d` signal.
+#[test]
+fn modport_import_task_via_modport_port() {
+    const SRC: &str = r#"
+interface bus_if;
+  logic [7:0] d;
+  task automatic put(input [7:0] x); d = x; endtask
+  modport mp (import put, output d);
+endinterface
+module m(bus_if.mp b);
+  initial begin
+    b.put(8'h42);
+    #1 $display("IMP d=%02h", b.d);
+  end
+endmodule
+module top;
+  bus_if bus();
+  m u(bus.mp);
+endmodule
+"#;
+    let sim = simulate(SRC, 100).expect("simulate failed");
+    let out = output_of(&sim);
+    assert!(
+        out.contains("IMP d=42"),
+        "b.put() through a modport port must write bus.d (want IMP d=42):\n{}",
+        out
+    );
+}
+
+/// A modport-typed port with a plain member write (no imported task): the
+/// modport selector on the connection actual must still resolve `b.d` to the
+/// instance's `bus.d`, not a phantom `bus.mp.d`.
+#[test]
+fn modport_port_member_write_resolves_to_instance() {
+    const SRC: &str = r#"
+interface bus_if;
+  logic [7:0] d;
+  modport mp (output d);
+endinterface
+module m(bus_if.mp b);
+  initial begin
+    b.d = 8'h55;
+    #1 $display("V d=%02h", b.d);
+  end
+endmodule
+module top;
+  bus_if bus();
+  m u(bus.mp);
+  initial #2 $display("TOP d=%02h", bus.d);
+endmodule
+"#;
+    let sim = simulate(SRC, 100).expect("simulate failed");
+    let out = output_of(&sim);
+    assert!(
+        out.contains("V d=55") && out.contains("TOP d=55"),
+        "b.d write through modport must land on bus.d (want V d=55, TOP d=55):\n{}",
+        out
+    );
+}

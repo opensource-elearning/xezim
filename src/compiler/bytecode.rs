@@ -215,6 +215,14 @@ pub struct BytecodeCompiler<'a> {
     /// Set via `set_string_signals`. None = no string info available, in
     /// which case the compiler can only catch the literal-operand case.
     string_signals: Option<&'a HashSet<String>>,
+    /// Base names of 2D/ND UNPACKED arrays. When a continuous-assign LHS
+    /// `m[0][j]` (outer index 0) targets one of these, the flattening
+    /// short-circuit (`flattened_outer_zero_signal_id`) must NOT fire — the
+    /// bogus scalar signal `m` would otherwise catch a bit-select write and
+    /// silently drop the element. None = no info (older callers); the guard
+    /// then only excludes 1D/packed bases as before. Set via
+    /// `set_multi_dim_arrays`.
+    multi_dim_arrays: Option<&'a HashSet<String>>,
 }
 
 impl<'a> BytecodeCompiler<'a> {
@@ -246,11 +254,16 @@ impl<'a> BytecodeCompiler<'a> {
             loop_break_patches: Vec::new(),
             loop_continue_patches: Vec::new(),
             string_signals: None,
+            multi_dim_arrays: None,
         }
     }
 
     pub fn set_string_signals(&mut self, s: &'a HashSet<String>) {
         self.string_signals = Some(s);
+    }
+
+    pub fn set_multi_dim_arrays(&mut self, s: &'a HashSet<String>) {
+        self.multi_dim_arrays = Some(s);
     }
 
     pub fn set_params(&mut self, params: &'a HashMap<String, Value>) {
@@ -535,7 +548,37 @@ impl<'a> BytecodeCompiler<'a> {
         if self.packed_elem_width_of(hier).is_some() {
             return None;
         }
+        // A genuine 2D/ND UNPACKED array (`logic [7:0] m [2][2]`) also carries
+        // a bogus scalar signal for its base name; `m[0][j]` must select the
+        // element (interpreter path), NOT bit-select that scalar. Only `[0]`
+        // hit this — `m[1][j]` already bailed because index != 0 — so the row-0
+        // writes were silently dropped.
+        if self.is_multi_dim_array(hier) {
+            return None;
+        }
         self.lookup_signal_id(hier)
+    }
+
+    /// True when `hier`'s base name is a registered 2D/ND unpacked array.
+    fn is_multi_dim_array(&self, hier: &HierarchicalIdentifier) -> bool {
+        let Some(set) = self.multi_dim_arrays else {
+            return false;
+        };
+        let raw = Self::hier_raw_name(hier);
+        if set.contains(raw.as_str()) {
+            return true;
+        }
+        if let Some(scope) = &self.scope_hint {
+            if set.contains(format!("{}.{}", scope, raw).as_str()) {
+                return true;
+            }
+        }
+        if hier.path.len() == 1 {
+            if set.contains(hier.path[0].name.name.as_str()) {
+                return true;
+            }
+        }
+        false
     }
 
     /// The base's registered packed ELEMENT width (>1), if it is a
@@ -567,6 +610,9 @@ impl<'a> BytecodeCompiler<'a> {
             return None;
         };
         if self.lookup_array_name(hier).is_some() {
+            return None;
+        }
+        if self.is_multi_dim_array(hier) {
             return None;
         }
         let id = self.lookup_signal_id(hier)?;
@@ -2161,7 +2207,12 @@ impl<'a> BytecodeCompiler<'a> {
                 v.is_signed = *signed;
                 Some(v)
             }
-            NumberLiteral::Real(f) => Some(Value::from_u64(*f as u64, 64)),
+            // A real literal must keep its fractional value as IEEE-754 bits so
+            // the VM's real-aware arithmetic sees a real operand. The old
+            // `*f as u64` truncated `4.4`→`4` and `5.5`→`5`, turning a comb/
+            // cont-assign `(1.0/4.4)*1000.0` into integer `1/4*1000 = 0` (the
+            // PLL clamp-mode `vcofbperiod` went to 0 → a #0 vclk livelock).
+            NumberLiteral::Real(f) => Some(Value::from_f64(*f)),
             // Time literal magnitude in tick units (1 ns), matching the
             // interpreter's value-context handling.
             NumberLiteral::Time(s) => Some(Value::from_u64((*s * 1e9) as u64, 64)),

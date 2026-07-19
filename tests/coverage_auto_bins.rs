@@ -43,3 +43,42 @@ endmodule
 "#);
     assert!(o.contains("COV=37.50"), "cross must count 2 of 16 bins; got: {}", o);
 }
+
+/// §19.7 option.at_least = N: a bin is covered only when hit >= N times.
+#[test]
+fn option_at_least_gates_bin_coverage() {
+    let o = cov(r#"
+module t;
+  bit [1:0] a;
+  covergroup cg;
+    option.at_least = 2;
+    cp: coverpoint a { bins b0={0}; bins b1={1}; }
+  endgroup
+  cg c = new;
+  initial begin
+    a=0; c.sample();               // b0 hit once (needs 2)
+    a=1; c.sample(); c.sample();   // b1 hit twice -> covered
+    $display("COV=%0.2f", c.get_coverage());
+    $finish;
+  end
+endmodule
+"#);
+    assert!(o.contains("COV=50.00"), "at_least=2: only b1 covered -> 50%; got: {}", o);
+}
+
+/// §19.7 option.weight: coverpoints are weighted in the covergroup mean.
+#[test]
+fn option_weight_reweights_the_mean() {
+    let o = cov(r#"
+module t;
+  bit [1:0] a, b;
+  covergroup cg;
+    ca: coverpoint a { option.weight=3; bins x={0}; }               // 100%
+    cb: coverpoint b { option.weight=1; bins y={1}; bins z={2}; }   // 0%
+  endgroup
+  cg c = new;
+  initial begin a=0; b=0; c.sample(); $display("COV=%0.2f", c.get_coverage()); $finish; end
+endmodule
+"#);
+    assert!(o.contains("COV=75.00"), "weighted (3*100+1*0)/4 = 75; got: {}", o);
+}

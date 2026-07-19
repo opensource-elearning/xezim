@@ -50236,23 +50236,52 @@ impl Simulator {
             return 0.0;
         };
 
-        // Is the (non-array) bin `key` hit in any instance? For the
-        // `bins name[]` array form, hits are recorded per sub-bin as
+        // §19.7 option.at_least: a bin counts as covered only when hit at least
+        // this many times (per-coverpoint override falls back to the covergroup
+        // option, then the LRM default of 1). §19.7 option.weight: each item's
+        // weight in the covergroup's (weighted) mean.
+        fn opt_u64(e: &crate::ast::expr::Expression) -> Option<u64> {
+            match &e.kind {
+                ExprKind::Number(NumberLiteral::Integer { value, base, .. }) => {
+                    let radix = match base {
+                        crate::ast::expr::NumberBase::Decimal => 10,
+                        crate::ast::expr::NumberBase::Hex => 16,
+                        crate::ast::expr::NumberBase::Octal => 8,
+                        crate::ast::expr::NumberBase::Binary => 2,
+                    };
+                    u64::from_str_radix(&value.replace('_', ""), radix).ok()
+                }
+                ExprKind::Paren(i) => opt_u64(i),
+                _ => None,
+            }
+        }
+        let cg_at_least = def
+            .items
+            .iter()
+            .find_map(|it| match it {
+                CovergroupItem::Option { name, val } if name == "at_least" => opt_u64(val),
+                _ => None,
+            })
+            .unwrap_or(1)
+            .max(1);
+
+        // Is the (non-array) bin `key` hit `>= at_least` times in any instance?
+        // For the `bins name[]` array form, hits are recorded per sub-bin as
         // `cp.name[<val>]`, so match on the `cp.name[` prefix.
-        let bin_hit = |key: &str, array_form: bool| -> bool {
+        let bin_hit = |key: &str, array_form: bool, at_least: u64| -> bool {
             insts.iter().any(|inst| {
                 if array_form {
                     let pre = format!("{}[", key);
                     inst.bin_hits
                         .iter()
-                        .any(|(k, &c)| c > 0 && k.starts_with(&pre))
+                        .any(|(k, &c)| c >= at_least && k.starts_with(&pre))
                 } else {
-                    inst.bin_hits.get(key).map_or(false, |&c| c > 0)
+                    inst.bin_hits.get(key).map_or(false, |&c| c >= at_least)
                 }
             })
         };
 
-        let mut total_items = 0usize;
+        let mut total_weight = 0.0f64;
         let mut coverage_sum = 0.0f64;
 
         for item in &def.items {
@@ -50310,19 +50339,34 @@ impl Simulator {
                             (bins_hit.len() as f64 / total_bins as f64).min(1.0)
                         }
                     } else {
+                        // Per-coverpoint at_least overrides the covergroup one.
+                        let at_least = cp
+                            .options
+                            .iter()
+                            .find_map(|(n, v)| (n == "at_least").then(|| opt_u64(v)).flatten())
+                            .unwrap_or(cg_at_least)
+                            .max(1);
                         let hit = explicit
                             .iter()
                             .filter(|b| {
                                 bin_hit(
                                     &format!("{}.{}", cp_name, b.name.name),
                                     b.array_form,
+                                    at_least,
                                 )
                             })
                             .count();
                         hit as f64 / explicit.len() as f64
                     };
-                    total_items += 1;
-                    coverage_sum += cov;
+                    // §19.7 option.weight (default 1) weights this coverpoint in
+                    // the covergroup's mean.
+                    let weight = cp
+                        .options
+                        .iter()
+                        .find_map(|(n, v)| (n == "weight").then(|| opt_u64(v)).flatten())
+                        .unwrap_or(1) as f64;
+                    total_weight += weight;
+                    coverage_sum += cov * weight;
                 }
                 CovergroupItem::Cross(cr) => {
                     let cr_name = cr.name.as_ref().map(|n| n.name.clone()).unwrap_or_else(|| {
@@ -50391,18 +50435,19 @@ impl Simulator {
                             .count();
                         hit as f64 / cr.bins.len() as f64
                     };
-                    total_items += 1;
+                    // A cross carries the default weight 1 (no option storage).
+                    total_weight += 1.0;
                     coverage_sum += cov;
                 }
                 _ => {}
             }
         }
 
-        if total_items == 0 {
+        if total_weight == 0.0 {
             // §19.11: a covergroup with no items has 100% coverage.
             100.0
         } else {
-            (coverage_sum / total_items as f64) * 100.0
+            (coverage_sum / total_weight) * 100.0
         }
     }
 

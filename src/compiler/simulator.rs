@@ -36,6 +36,8 @@ use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 
 static SIM_DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
+/// `--dump-timescales`: print every module's timescale before the run starts.
+static DUMP_TIMESCALES: AtomicBool = AtomicBool::new(false);
 static DPI_LIB_PATHS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 
 /// Opaque handle base for `process::self()` (IEEE 1800-2023 §9.7). The token is
@@ -154,6 +156,16 @@ const INTRA_SAVED_MARKER: &str = "$__xz_intra_saved";
 
 pub fn set_sim_debug(enabled: bool) {
     SIM_DEBUG_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// `--dump-timescales`: enable the pre-run per-module timescale dump.
+pub fn set_dump_timescales(enabled: bool) {
+    DUMP_TIMESCALES.store(enabled, Ordering::Relaxed);
+}
+
+#[inline]
+fn dump_timescales_enabled() -> bool {
+    DUMP_TIMESCALES.load(Ordering::Relaxed)
 }
 
 #[inline]
@@ -10469,6 +10481,10 @@ impl Simulator {
     pub fn simulate(&mut self) {
         if !self.compiled {
             self.compile();
+        }
+        // `--dump-timescales`: report every module's timescale before the run.
+        if dump_timescales_enabled() {
+            self.dump_module_timescales();
         }
         let prev_active = ACTIVE_SIMULATOR.with(|cell| cell.get());
         let self_ptr = self as *mut Simulator;
@@ -42389,6 +42405,39 @@ impl Simulator {
             .get(def)
             .copied()
             .unwrap_or((0, 0))
+    }
+
+    /// `--dump-timescales`: print every module definition's timescale before the
+    /// run. Shows the REPORTED unit/precision (`$printtimescale` semantics: an
+    /// explicit/inherited `timescale, or the 1s/1s default when a module has
+    /// none — flagged, since such a module's effective delay unit collapses to
+    /// the global tick). No source `$printtimescale` calls are needed.
+    fn dump_module_timescales(&self) {
+        // Every module definition reachable in the design: the top plus every
+        // instantiated def_name (deduplicated, sorted for stable output).
+        let mut defs: Vec<String> = vec![self.module.name.clone()];
+        let mut seen: std::collections::HashSet<String> =
+            std::iter::once(self.module.name.clone()).collect();
+        for inst in &self.module.instances {
+            if seen.insert(inst.def_name.clone()) {
+                defs.push(inst.def_name.clone());
+            }
+        }
+        defs.sort();
+        println!("=== module timescales ({} modules) ===", defs.len());
+        for d in &defs {
+            let (u, p) = self.reported_timescale_exp(d);
+            let has_ts = self.module.module_timescale_exp.contains_key(d);
+            let note = if has_ts { "" } else { "   (no `timescale — 1s/1s default)" };
+            println!(
+                "  {:<28} {} / {}{}",
+                d,
+                Self::time_exp_to_str(u),
+                Self::time_exp_to_str(p),
+                note
+            );
+        }
+        println!("======================================");
     }
 
     /// Current simulation time in the current module's time unit, as

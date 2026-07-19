@@ -270,6 +270,7 @@ Common options:
 | `--dpi-lib <path>` | Load a DPI-C shared library (`.so`/`.dylib`/`.dll`). Repeatable. See [docs/dpi-guide.md](docs/dpi-guide.md). |
 | `--vpi-lib <path>` (`-m`) | Load a VPI module and run its `vlog_startup_routines` (system-task registration, design walk). Repeatable. |
 | `--module-timescale [mods=]<unit>/<prec>` | Assign a timescale to modules with no explicit source-level one. See [below](#module-timescale-extension). Repeatable. |
+| `--dump-timescales` | Print every module's resolved timescale before the run (no source `$printtimescale` needed); modules with no `` `timescale `` are flagged. See [below](#module-timescale-extension). |
 | `--max-time <N>` | Stop simulation at time `N` (counted in the design's finest time precision) |
 | `+trace`, `+<plusarg>` | Passed through to `$value$plusargs` / `$test$plusargs` |
 | `+seed=<n>` | Seed the RNG for a reproducible run (same seed ⇒ byte-identical output; affects e.g. the number of packets a random UVM test collects) |
@@ -339,6 +340,30 @@ Sub-nanosecond precision is honoured — the simulation tick is the finest
 precision declared anywhere in the design, down to `fs`. (`--max-time` is
 counted in that tick, so a `1ps`-precision design covers proportionally less
 wall-clock time for the same `--max-time`.)
+
+### Inspecting resolved timescales
+
+`--dump-timescales` prints the resolved timescale of every module *before* the
+run — no source `$printtimescale` calls required. It reports each definition's
+`` `timescale `` semantics (an explicit/`--module-timescale` value, or the
+`1s/1s` default when a module has none) and flags the modules that carry no
+`` `timescale ``. Combine it with `--module-timescale` to confirm an assignment
+landed where you intended.
+
+```bash
+$ xezim --dump-timescales design.sv
+=== module timescales (3 modules) ===
+  cache                        10ns / 1ns
+  cpu                          1ns / 1ps
+  glue                         1s / 1s   (no `timescale — 1s/1s default)
+======================================
+```
+
+A flagged module also emits the `has no timescale directive` warning in a
+mixed-timescale design; give it a source `` `timescale `` or a
+`--module-timescale` assignment to resolve it. (The reported `1s/1s` is the
+IEEE-default *display* value; such a module's effective delay unit is the
+design's global tick — a further reason to declare one explicitly.)
 
 ---
 

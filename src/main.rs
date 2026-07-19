@@ -74,6 +74,8 @@ fn print_usage() {
     eprintln!("  --dump-ast       With --parse, print the AST");
     eprintln!("  --max-time <n>   Set maximum simulation time (default: 100000)");
     eprintln!("  --sim_debug      Enable simulator [DEBUG]/[OPT] output");
+    eprintln!("  --dump-timescales  Print each module's timescale before the run (no source");
+    eprintln!("                     $printtimescale needed); flags modules with no `timescale.");
     eprintln!("  --dpi-lib <so>   Load a DPI shared library (.so/.dylib/.dll)");
     eprintln!("  --vpi-lib <so>   Load a VPI module and run its vlog_startup_routines (-m)");
     eprintln!("  --module-timescale <unit>/<prec>            Timescale for every module with no");
@@ -646,6 +648,7 @@ fn main() {
     let mut log_file: Option<String> = None;
     let mut settle_limit: Option<u32> = None;
     let mut activity_mon = false;
+    let mut dump_timescales = false;
     let mut sdf_file: Option<String> = None;
     let mut sdf_select: Option<xezim::compiler::sdf::DelaySelect> = None;
     let mut xtrace_file: Option<String> = None;
@@ -935,6 +938,9 @@ fn main() {
             }
             "--activity-mon" => {
                 activity_mon = true;
+            }
+            "--dump-timescales" | "--dump-timescale" => {
+                dump_timescales = true;
             }
             "--sdf" => {
                 i += 1;
@@ -1246,6 +1252,7 @@ suppressed but the explicit SDF annotation still applies."
                         println!("------------------------------");
                         let total_start = std::time::Instant::now();
                         xezim::compiler::simulator::set_sim_debug(sim_debug);
+                        xezim::compiler::simulator::set_dump_timescales(dump_timescales);
                         xezim::compiler::simulator::set_dpi_libs(&dpi_libs);
                         xezim::compiler::simulator::set_vpi_libs(&vpi_libs);
                         let mut sim = xezim::compiler::Simulator::new(elab, max_time);
@@ -1514,6 +1521,7 @@ suppressed but the explicit SDF annotation still applies."
     println!("Max time: {}", max_time);
     println!("------------------------------");
     xezim::compiler::simulator::set_sim_debug(sim_debug);
+    xezim::compiler::simulator::set_dump_timescales(dump_timescales);
     xezim::compiler::simulator::set_dpi_libs(&dpi_libs);
     xezim::compiler::simulator::set_vpi_libs(&vpi_libs);
 

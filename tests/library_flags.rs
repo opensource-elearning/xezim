@@ -115,6 +115,36 @@ fn library_flags_inside_filelist() {
     assert!(out.contains("LIB_PASS"), "got:\n{}", out);
 }
 
+#[test]
+fn incdir_does_not_enable_library_search() {
+    let dir = std::env::temp_dir().join("xezim_incdir_not_libdir");
+    let inc = dir.join("inc");
+    std::fs::create_dir_all(&inc).unwrap();
+    std::fs::write(inc.join("defs.svh"), "`define INCLUDED_VALUE 1'b1\n").unwrap();
+    std::fs::write(
+        inc.join("bad_syntax.v"),
+        "module unreferenced_bad; THIS_IS_ILLEGAL !!! endmodule\n",
+    ).unwrap();
+    std::fs::write(
+        dir.join("top.sv"),
+        "`include \"defs.svh\"\nmodule top; initial if (`INCLUDED_VALUE) $finish; endmodule\n",
+    ).unwrap();
+    std::fs::write(dir.join("run.f"), "+incdir+inc\ntop.sv\n").unwrap();
+
+    for args in [
+        vec!["--compile", "+incdir+inc", "top.sv"],
+        vec!["--compile", "-f", "run.f"],
+    ] {
+        let out = run(&dir, &args);
+        assert!(out.contains("Elaboration successful"), "include lookup failed:\n{}", out);
+        assert!(
+            !out.contains("library file") && !out.contains("parse error"),
+            "+incdir must not scan unreferenced source files:\n{}",
+            out
+        );
+    }
+}
+
 /// A missing `-v` file is a clear error, not a silent ignore.
 #[test]
 fn missing_v_file_errors() {

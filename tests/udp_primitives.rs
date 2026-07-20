@@ -315,6 +315,92 @@ endmodule
     ]);
 }
 
+#[test]
+fn primitive_verbose_is_scoped_to_explicit_v_files() {
+    let dir = std::env::temp_dir().join("xezim_udp_verbose");
+    let lib_dir = dir.join("lib");
+    std::fs::create_dir_all(&lib_dir).expect("mkdir");
+    let vfile = lib_dir.join("vendor.v");
+    std::fs::write(&vfile, r#"primitive udp_buf(q, a);
+  output q; input a;
+  table 0 : 0; 1 : 1; endtable
+endprimitive
+module BUFX1(output q, input a); udp_buf u(q, a); endmodule
+"#).expect("write library");
+    let top = dir.join("top.sv");
+    std::fs::write(&top, "module top; wire q; BUFX1 u(q, 1'b1); endmodule\n")
+        .expect("write top");
+
+    let run = |args: &[&str]| {
+        let out = Command::new(xezim_bin())
+            .current_dir(&dir)
+            .args(args)
+            .output()
+            .expect("run xezim");
+        format!("{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr))
+    };
+
+    let verbose = run(&[
+        "--compile",
+        "--primitive-verbose",
+        "-v",
+        "lib/vendor.v",
+        "top.sv",
+    ]);
+    for expected in [
+        "[primitive-verbose] parsed UDP 'udp_buf'",
+        "[primitive-verbose] parsed module 'BUFX1'",
+        "[primitive-verbose] adopting module 'BUFX1'",
+        "[primitive-verbose] adopting UDP 'udp_buf'",
+        "[primitive-verbose] -v resolution summary",
+    ] {
+        assert!(verbose.contains(expected), "missing {:?}:\n{}", expected, verbose);
+    }
+
+    std::fs::write(
+        dir.join("verbose.f"),
+        "--primitive-verbose\n-v lib/vendor.v\ntop.sv\n",
+    ).expect("write verbose filelist");
+    let via_filelist = run(&["--compile", "-f", "verbose.f"]);
+    assert!(
+        via_filelist.contains("[primitive-verbose] parsed UDP 'udp_buf'"),
+        "filelist did not enable primitive diagnostics:\n{}",
+        via_filelist
+    );
+
+    let quiet = run(&["--compile", "-v", "lib/vendor.v", "top.sv"]);
+    assert!(!quiet.contains("[primitive-verbose]"), "diagnostics must be opt-in:\n{}", quiet);
+
+    let y_only = run(&["--compile", "--primitive-verbose", "-y", "lib", "top.sv"]);
+    assert!(
+        !y_only.contains("[primitive-verbose]"),
+        "--primitive-verbose must not trace -y files:\n{}",
+        y_only
+    );
+
+    let bad_v = lib_dir.join("bad.v");
+    std::fs::write(
+        &bad_v,
+        "primitive broken(q, a); output q; input a; THIS_IS_ILLEGAL !!! endprimitive\n",
+    ).expect("write malformed primitive");
+    let parse_issue = run(&[
+        "--compile",
+        "--primitive-verbose",
+        "-v",
+        "lib/bad.v",
+        "top.sv",
+    ]);
+    assert!(
+        parse_issue.contains("[primitive-verbose] detailed parser diagnostics")
+            && parse_issue.contains("THIS_IS_ILLEGAL")
+            && parse_issue.contains('^'),
+        "missing detailed primitive parse context:\n{}",
+        parse_issue
+    );
+}
+
 // 7. Edge shorthands `r f * (??)`.
 #[test]
 fn edge_shorthands() {

@@ -86,6 +86,7 @@ fn print_usage() {
     eprintln!("                   n>=2 offloads stdout writes to a background thread.");
     eprintln!("  -l, --log <file> Redirect all stdout/stderr (including DPI output) to <file>
   -v <file>        Library file: modules compiled only to resolve instantiations
+  --primitive-verbose  Show parse/adoption diagnostics for explicit -v files
   -y <dir>         Library directory: <module>.<ext> loaded on demand
   +libext+<ext>+.. Extension list for -y search (replaces default .v/.sv/.V)
   +nospecify       Suppress specify-block path delays (zero-delay gate sim)
@@ -214,14 +215,13 @@ fn push_define_token(tok: &str, defines: &mut Vec<(String, Option<String>)>) {
     }
 }
 
-fn push_plus_incdir(arg: &str, include_dirs: &mut Vec<String>, lib_dirs: &mut Vec<String>) {
+fn push_plus_incdir(arg: &str, include_dirs: &mut Vec<String>) {
     if !arg.starts_with("+incdir+") {
         return;
     }
     let payload = &arg[8..];
     for dir in payload.split('+').filter(|s| !s.is_empty()) {
         include_dirs.push(dir.to_string());
-        lib_dirs.push(dir.to_string());
     }
 }
 
@@ -432,6 +432,7 @@ fn process_command_file(
     lib_files: &mut Vec<String>,
     lib_exts: &mut Option<Vec<String>>,
     nospecify: &mut bool,
+    primitive_verbose: &mut bool,
 ) -> Result<(), String> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("Cannot read command file '{}': {}", path, e))?;
@@ -520,6 +521,7 @@ fn process_command_file(
                             lib_files,
                             lib_exts,
                             nospecify,
+                            primitive_verbose,
                         )?;
                     }
                 }
@@ -546,10 +548,14 @@ fn process_command_file(
                         lib_files,
                         lib_exts,
                         nospecify,
+                        primitive_verbose,
                     )?;
                 }
                 _ if t.starts_with("+incdir+") => {
-                    push_plus_incdir(t, include_dirs, lib_dirs);
+                    push_plus_incdir(t, include_dirs);
+                }
+                "--primitive-verbose" => {
+                    *primitive_verbose = true;
                 }
                 _ if t.starts_with("+define+") => {
                     push_plus_define(t, defines);
@@ -644,6 +650,7 @@ fn main() {
     let mut lib_dirs: Vec<String> = Vec::new();
     let mut lib_files: Vec<String> = Vec::new();
     let mut lib_exts: Option<Vec<String>> = None;
+    let mut primitive_verbose = false;
     let mut nospecify = false;
     let mut log_file: Option<String> = None;
     let mut settle_limit: Option<u32> = None;
@@ -754,6 +761,7 @@ fn main() {
                         &mut lib_files,
                         &mut lib_exts,
                         &mut nospecify,
+                        &mut primitive_verbose,
                     ) {
                         Ok(()) => {}
                         Err(e) => {
@@ -774,6 +782,7 @@ fn main() {
                     &mut lib_files,
                     &mut lib_exts,
                     &mut nospecify,
+                    &mut primitive_verbose,
                 ) {
                     Ok(()) => {}
                     Err(e) => {
@@ -801,7 +810,7 @@ fn main() {
                 }
             }
             _ if arg.starts_with("+incdir+") => {
-                push_plus_incdir(arg, &mut include_dirs, &mut lib_dirs);
+                push_plus_incdir(arg, &mut include_dirs);
             }
             _ if arg.starts_with("+define+") => {
                 push_plus_define(arg, &mut defines);
@@ -860,6 +869,9 @@ fn main() {
             }
             "--verbose" => {
                 verbose = true;
+            }
+            "--primitive-verbose" => {
+                primitive_verbose = true;
             }
             "-V" => {
                 print_version();
@@ -1221,10 +1233,12 @@ suppressed but the explicit SDF annotation still applies."
             );
         }
     }
-    if !lib_files.is_empty() || lib_exts.is_some() {
+    if !lib_dirs.is_empty() || !lib_files.is_empty() || lib_exts.is_some() {
         xezim::set_library_cli(xezim::LibraryCli {
             lib_files: lib_files.clone(),
+            lib_dirs: lib_dirs.clone(),
             lib_exts: lib_exts.clone(),
+            primitive_verbose,
         });
     }
 

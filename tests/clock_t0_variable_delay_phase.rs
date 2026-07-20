@@ -284,3 +284,71 @@ endmodule
         out
     );
 }
+
+#[test]
+fn conditional_dynamic_clock_rearms_with_the_updated_delay() {
+    // This is the behavioral-PLL clock shape: a dynamic real delay and a
+    // conditional clamp on the assignment. A delay already in flight keeps
+    // its original deadline; the new value is sampled when the loop re-arms.
+    const SRC: &str = r#"
+`timescale 1ps/1ps
+module top;
+  logic clk = 0;
+  logic halt = 0;
+  real half = 10.0;
+  integer edges = 0;
+
+  always #(half) clk = halt ? 1'b0 : ~clk;
+  always @(posedge clk) edges = edges + 1;
+
+  initial begin
+    #25 half = 4.0;
+    #18 halt = 1;
+    #12;
+    $display("PLL_SHAPE t=%0t clk=%b edges=%0d", $time, clk, edges);
+    $finish;
+  end
+endmodule
+"#;
+    let out = output_of(&simulate(SRC, 100).expect("sim"));
+    assert!(
+        out.contains("PLL_SHAPE t=55 clk=0 edges=3"),
+        "conditional dynamic clock used the wrong scheduling semantics:\n{}",
+        out
+    );
+}
+
+#[test]
+fn shared_clock_port_fanout_delivers_every_child_edge() {
+    const SRC: &str = r#"
+`timescale 1ps/1ps
+module capture(output logic q, input logic clk);
+  initial q = 0;
+  always_ff @(posedge clk) q <= 1;
+endmodule
+module top;
+  logic clk = 0;
+  wire [5:0] q;
+
+  capture c0(q[0], clk);
+  capture c1(q[1], clk);
+  capture c2(q[2], clk);
+  capture c3(q[3], clk);
+  capture c4(q[4], clk);
+  capture c5(q[5], clk);
+
+  always #5 clk = ~clk;
+  initial begin
+    #6;
+    $display("FANOUT q=%b", q);
+    $finish;
+  end
+endmodule
+"#;
+    let out = output_of(&simulate(SRC, 100).expect("sim"));
+    assert!(
+        out.contains("FANOUT q=111111"),
+        "shared clock fanout lost a child edge:\n{}",
+        out
+    );
+}

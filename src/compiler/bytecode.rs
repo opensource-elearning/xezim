@@ -115,16 +115,16 @@ pub enum Insn {
     BlockingAssignBitDyn(usize, RegId, RegId), // (signal_id, idx_reg, value_reg)
 
     /// Load array element: dest = signal_table[array_base + eval(index_reg)]
-    /// `Box<String>` keeps the variant at 16 B instead of 32 B.
-    LoadArrayElem(RegId, Box<String>, RegId), // (dest, array_name, index_reg)
+    /// Boxing the operand keeps the instruction compact.
+    LoadArrayElem(RegId, Box<ArrayOperand>, RegId), // (dest, array, index_reg)
     /// NBA assign to array element.
-    NbaAssignArray(Box<String>, RegId, RegId, u32), // (array_name, index_reg, value_reg, width)
+    NbaAssignArray(Box<ArrayOperand>, RegId, RegId, u32), // (array, index_reg, value_reg, width)
     /// Blocking assign to array element.
-    BlockingAssignArray(Box<String>, RegId, RegId, u32), // (array_name, index_reg, value_reg, width)
+    BlockingAssignArray(Box<ArrayOperand>, RegId, RegId, u32), // (array, index_reg, value_reg, width)
     /// NBA range assign to array element.
-    NbaAssignArrayRange(Box<String>, RegId, RegId, RegId, RegId), // (array_name, index_reg, hi_reg, lo_reg, value_reg)
+    NbaAssignArrayRange(Box<ArrayOperand>, RegId, RegId, RegId, RegId), // (array, index_reg, hi_reg, lo_reg, value_reg)
     /// Blocking range assign to array element.
-    BlockingAssignArrayRange(Box<String>, RegId, RegId, RegId, RegId), // (array_name, index_reg, hi_reg, lo_reg, value_reg)
+    BlockingAssignArrayRange(Box<ArrayOperand>, RegId, RegId, RegId, RegId), // (array, index_reg, hi_reg, lo_reg, value_reg)
 
     /// Marks end of a compiled block (no-op, helps debugging).
     /// Copy src register to dest register.
@@ -143,6 +143,28 @@ pub enum Insn {
     Nop,
 }
 
+/// Pre-resolved unpacked-array addressing embedded in bytecode. The name is
+/// retained for diagnostics and the rare unresolved fallback, while normal
+/// execution uses only the dense base/range fields.
+#[derive(Debug, Clone)]
+pub enum ArrayOperand {
+    Dense {
+        name: String,
+        first_id: usize,
+        lo: i64,
+        hi: i64,
+    },
+    Named(String),
+}
+
+impl ArrayOperand {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Dense { name, .. } | Self::Named(name) => name,
+        }
+    }
+}
+
 /// A compiled bytecode program for one always block or continuous assign.
 #[derive(Debug, Clone)]
 pub struct CompiledBlock {
@@ -158,6 +180,7 @@ pub struct BytecodeCompiler<'a> {
     signal_signed: &'a [bool],
     signal_widths: &'a [u32],
     arrays: &'a HashMap<String, (i64, i64, u32)>,
+    array_first_id: Option<&'a HashMap<Arc<str>, (usize, i64, i64)>>,
     widths: &'a HashMap<String, u32>,
     pub bail_reason: Option<&'static str>,
     /// When true, unsupported statements emit `StmtFallback` instead of
@@ -240,6 +263,7 @@ impl<'a> BytecodeCompiler<'a> {
             signal_signed,
             signal_widths,
             arrays,
+            array_first_id: None,
             widths,
             bail_reason: None,
             allow_ast_fallback: false,
@@ -264,6 +288,26 @@ impl<'a> BytecodeCompiler<'a> {
 
     pub fn set_multi_dim_arrays(&mut self, s: &'a HashSet<String>) {
         self.multi_dim_arrays = Some(s);
+    }
+
+    pub fn set_array_first_id(&mut self, arrays: &'a HashMap<Arc<str>, (usize, i64, i64)>) {
+        self.array_first_id = Some(arrays);
+    }
+
+    fn array_operand(&self, name: String) -> Box<ArrayOperand> {
+        if let Some(&(first_id, lo, hi)) = self
+            .array_first_id
+            .and_then(|arrays| arrays.get(name.as_str()))
+        {
+            Box::new(ArrayOperand::Dense {
+                name,
+                first_id,
+                lo,
+                hi,
+            })
+        } else {
+            Box::new(ArrayOperand::Named(name))
+        }
     }
 
     pub fn set_params(&mut self, params: &'a HashMap<String, Value>) {
@@ -300,16 +344,22 @@ impl<'a> BytecodeCompiler<'a> {
         match &e.kind {
             ExprKind::StringLiteral(_) => true,
             ExprKind::Paren(inner) => self.expr_is_string_concat_operand(inner),
-            ExprKind::Concatenation(parts) => parts.iter().any(|p| self.expr_is_string_concat_operand(p)),
+            ExprKind::Concatenation(parts) => {
+                parts.iter().any(|p| self.expr_is_string_concat_operand(p))
+            }
             ExprKind::SystemCall { name, .. } => matches!(name.as_str(), "$sformatf" | "$psprintf"),
             ExprKind::Ident(h) => {
                 if let Some(set) = self.string_signals {
                     let last = h.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
-                    if set.contains(last) { return true; }
+                    if set.contains(last) {
+                        return true;
+                    }
                     // Try scope-qualified form too.
                     if let Some(scope) = &self.scope_hint {
                         let q = format!("{}.{}", scope, last);
-                        if set.contains(&q) { return true; }
+                        if set.contains(&q) {
+                            return true;
+                        }
                     }
                 }
                 false
@@ -324,13 +374,19 @@ impl<'a> BytecodeCompiler<'a> {
             StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
                 stmts.iter().any(Self::stmt_has_break_or_continue)
             }
-            StatementKind::If { then_stmt, else_stmt, .. } => {
+            StatementKind::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
                 Self::stmt_has_break_or_continue(then_stmt)
-                    || else_stmt.as_ref().map_or(false, |e| Self::stmt_has_break_or_continue(e))
+                    || else_stmt
+                        .as_ref()
+                        .map_or(false, |e| Self::stmt_has_break_or_continue(e))
             }
-            StatementKind::Case { items, .. } => {
-                items.iter().any(|it| Self::stmt_has_break_or_continue(&it.stmt))
-            }
+            StatementKind::Case { items, .. } => items
+                .iter()
+                .any(|it| Self::stmt_has_break_or_continue(&it.stmt)),
             // Don't descend into nested loops — break/continue there target the
             // inner loop, not the enclosing one.
             _ => false,
@@ -345,9 +401,15 @@ impl<'a> BytecodeCompiler<'a> {
             StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
                 stmts.iter().any(Self::stmt_is_blocking)
             }
-            StatementKind::If { then_stmt, else_stmt, .. } => {
+            StatementKind::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
                 Self::stmt_is_blocking(then_stmt)
-                    || else_stmt.as_ref().map_or(false, |e| Self::stmt_is_blocking(e))
+                    || else_stmt
+                        .as_ref()
+                        .map_or(false, |e| Self::stmt_is_blocking(e))
             }
             StatementKind::For { body, .. } | StatementKind::While { body, .. } => {
                 Self::stmt_is_blocking(body)
@@ -359,27 +421,51 @@ impl<'a> BytecodeCompiler<'a> {
     /// Try to inline a zero-arg, non-blocking user task's body at this
     /// call site. Returns true if successfully inlined.
     fn try_inline_task(&mut self, task_name: &str) -> bool {
-        if self.inlining_stack.len() >= MAX_INLINE_DEPTH { return false; }
-        if self.inlining_stack.iter().any(|n| n == task_name) { return false; }
-        let tasks = match self.tasks { Some(t) => t, None => return false };
-        let td = match tasks.get(task_name) { Some(t) => t, None => return false };
-        if !td.ports.is_empty() { return false; }
-        if td.items.iter().any(Self::stmt_is_blocking) { return false; }
+        if self.inlining_stack.len() >= MAX_INLINE_DEPTH {
+            return false;
+        }
+        if self.inlining_stack.iter().any(|n| n == task_name) {
+            return false;
+        }
+        let tasks = match self.tasks {
+            Some(t) => t,
+            None => return false,
+        };
+        let td = match tasks.get(task_name) {
+            Some(t) => t,
+            None => return false,
+        };
+        if !td.ports.is_empty() {
+            return false;
+        }
+        if td.items.iter().any(Self::stmt_is_blocking) {
+            return false;
+        }
         let body: Vec<Statement> = td.items.clone();
         self.inlining_stack.push(task_name.to_string());
         let mut ok = true;
         for s in &body {
-            if !self.compile_stmt(s) { ok = false; break; }
+            if !self.compile_stmt(s) {
+                ok = false;
+                break;
+            }
         }
         self.inlining_stack.pop();
-        if ok { self.tasks_inlined += 1; }
+        if ok {
+            self.tasks_inlined += 1;
+        }
         ok
     }
 
     fn emit_fallback(&mut self, stmt: &Statement) -> bool {
         if self.allow_ast_fallback {
-            let reason = self.bail_reason.unwrap_or_else(|| Self::stmt_kind_label(stmt));
-            self.emit(Insn::StmtFallback(Box::new((Arc::new(stmt.clone()), reason))));
+            let reason = self
+                .bail_reason
+                .unwrap_or_else(|| Self::stmt_kind_label(stmt));
+            self.emit(Insn::StmtFallback(Box::new((
+                Arc::new(stmt.clone()),
+                reason,
+            ))));
             true
         } else {
             false
@@ -492,13 +578,19 @@ impl<'a> BytecodeCompiler<'a> {
     fn lookup_param_value(&self, hier: &HierarchicalIdentifier) -> Option<Value> {
         let params = self.params?;
         let raw = Self::hier_raw_name(hier);
-        if let Some(v) = params.get(&raw) { return Some(v.clone()); }
+        if let Some(v) = params.get(&raw) {
+            return Some(v.clone());
+        }
         if let Some(scope) = &self.scope_hint {
             let q = format!("{}.{}", scope, raw);
-            if let Some(v) = params.get(&q) { return Some(v.clone()); }
+            if let Some(v) = params.get(&q) {
+                return Some(v.clone());
+            }
         }
         if hier.path.len() == 1 {
-            if let Some(v) = params.get(&hier.path[0].name.name) { return Some(v.clone()); }
+            if let Some(v) = params.get(&hier.path[0].name.name) {
+                return Some(v.clone());
+            }
         }
         // Suffix-match: bare `CARRY_CHAIN` may be stored as
         // `top.uut.picorv32_core.pcpi_mul.CARRY_CHAIN`. Only accept if a
@@ -507,14 +599,14 @@ impl<'a> BytecodeCompiler<'a> {
         for (name, value) in params {
             let raw_has_key_suffix = raw.len() >= name.len()
                 && raw.ends_with(name.as_str())
-                && (raw.len() == name.len()
-                    || raw.as_bytes()[raw.len() - name.len() - 1] == b'.');
+                && (raw.len() == name.len() || raw.as_bytes()[raw.len() - name.len() - 1] == b'.');
             let key_has_raw_suffix = name.len() >= raw.len()
                 && name.ends_with(raw.as_str())
-                && (name.len() == raw.len()
-                    || name.as_bytes()[name.len() - raw.len() - 1] == b'.');
+                && (name.len() == raw.len() || name.as_bytes()[name.len() - raw.len() - 1] == b'.');
             if raw_has_key_suffix || key_has_raw_suffix {
-                if found.is_some() { return None; }
+                if found.is_some() {
+                    return None;
+                }
                 found = Some(value);
             }
         }
@@ -662,10 +754,15 @@ impl<'a> BytecodeCompiler<'a> {
             return true;
         }
         if self.allow_ast_fallback {
-            let reason = self.bail_reason.unwrap_or_else(|| Self::stmt_kind_label(stmt));
+            let reason = self
+                .bail_reason
+                .unwrap_or_else(|| Self::stmt_kind_label(stmt));
             self.insns.truncate(start);
             self.next_reg = start_reg;
-            self.emit(Insn::StmtFallback(Box::new((Arc::new(stmt.clone()), reason))));
+            self.emit(Insn::StmtFallback(Box::new((
+                Arc::new(stmt.clone()),
+                reason,
+            ))));
             self.bail_reason = saved_reason;
             return true;
         }
@@ -714,7 +811,12 @@ impl<'a> BytecodeCompiler<'a> {
                 self.next_reg = start_reg;
                 self.emit_fallback(stmt)
             }
-            StatementKind::If { condition, then_stmt, else_stmt, .. } => {
+            StatementKind::If {
+                condition,
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
                 // §12.6 `if (e matches p)` binds the pattern's `.name`s for the
                 // then-branch. That needs the AST interpreter — compiling it to
                 // a conditional jump would evaluate the match but drop the
@@ -725,13 +827,17 @@ impl<'a> BytecodeCompiler<'a> {
                 if let Some(cond_reg) = self.compile_expr(condition, 0) {
                     let branch_idx = self.insns.len();
                     self.emit(Insn::BranchIfFalse(cond_reg, 0)); // placeholder target
-                    if !self.compile_stmt(then_stmt) { return false; }
+                    if !self.compile_stmt(then_stmt) {
+                        return false;
+                    }
                     if let Some(el) = else_stmt {
                         let jump_idx = self.insns.len();
                         self.emit(Insn::Jump(0)); // placeholder
                         let else_start = self.insns.len() as u32;
                         self.insns[branch_idx] = Insn::BranchIfFalse(cond_reg, else_start);
-                        if !self.compile_stmt(el) { return false; }
+                        if !self.compile_stmt(el) {
+                            return false;
+                        }
                         let end = self.insns.len() as u32;
                         self.insns[jump_idx] = Insn::Jump(end);
                     } else {
@@ -743,7 +849,9 @@ impl<'a> BytecodeCompiler<'a> {
                     false
                 }
             }
-            StatementKind::Case { kind, expr, items, .. } => {
+            StatementKind::Case {
+                kind, expr, items, ..
+            } => {
                 if let Some(val_reg) = self.compile_expr(expr, 0) {
                     let mut end_jumps: Vec<usize> = Vec::new();
                     let mut default_item: Option<&Statement> = None;
@@ -758,13 +866,19 @@ impl<'a> BytecodeCompiler<'a> {
                             if let Some(pat_reg) = self.compile_expr(pat, 0) {
                                 let cmp_reg = self.alloc_reg();
                                 self.emit(match kind {
-                                    crate::ast::stmt::CaseKind::Casez => Insn::CasezEq(cmp_reg, val_reg, pat_reg),
-                                    crate::ast::stmt::CaseKind::Casex => Insn::CasexEq(cmp_reg, val_reg, pat_reg),
+                                    crate::ast::stmt::CaseKind::Casez => {
+                                        Insn::CasezEq(cmp_reg, val_reg, pat_reg)
+                                    }
+                                    crate::ast::stmt::CaseKind::Casex => {
+                                        Insn::CasexEq(cmp_reg, val_reg, pat_reg)
+                                    }
                                     _ => Insn::CaseEq(cmp_reg, val_reg, pat_reg),
                                 });
                                 let branch_idx = self.insns.len();
                                 self.emit(Insn::BranchIfFalse(cmp_reg, 0));
-                                if !self.compile_stmt(&item.stmt) { return false; }
+                                if !self.compile_stmt(&item.stmt) {
+                                    return false;
+                                }
                                 end_jumps.push(self.insns.len());
                                 self.emit(Insn::Jump(0));
                                 let next = self.insns.len() as u32;
@@ -776,7 +890,9 @@ impl<'a> BytecodeCompiler<'a> {
                     }
                     // Default case
                     if let Some(def_stmt) = default_item {
-                        if !self.compile_stmt(def_stmt) { return false; }
+                        if !self.compile_stmt(def_stmt) {
+                            return false;
+                        }
                     }
                     let end = self.insns.len() as u32;
                     for idx in end_jumps {
@@ -789,7 +905,9 @@ impl<'a> BytecodeCompiler<'a> {
             }
             StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
                 for s in stmts {
-                    if !self.compile_stmt(s) { return false; }
+                    if !self.compile_stmt(s) {
+                        return false;
+                    }
                 }
                 true
             }
@@ -801,20 +919,39 @@ impl<'a> BytecodeCompiler<'a> {
                     // doesn't resolve is typically a task-enable (`task_name;`) whose
                     // dispatch must happen in the AST interpreter's `exec_expr_stmt`.
                     ExprKind::Ident(hier) if hier.path.len() == 1 => {
-                        if self.lookup_signal_id(hier).is_some() { return true; }
+                        if self.lookup_signal_id(hier).is_some() {
+                            return true;
+                        }
                         let name = hier.path[0].name.name.clone();
-                        if self.try_inline_task(&name) { return true; }
+                        if self.try_inline_task(&name) {
+                            return true;
+                        }
                         self.bail("Expr_TaskEnable");
                         return self.emit_fallback(stmt);
                     }
                     ExprKind::Ident(hier) if hier.path.len() > 1 => {
                         let mname = hier.path.last().unwrap().name.name.as_str();
-                        if matches!(mname, "delete" | "sort" | "rsort" | "reverse" | "unique" | "unique_index" | "pop_front" | "pop_back") {
-                            return self.emit_fallback(&Statement::new(stmt.kind.clone(), stmt.span));
+                        if matches!(
+                            mname,
+                            "delete"
+                                | "sort"
+                                | "rsort"
+                                | "reverse"
+                                | "unique"
+                                | "unique_index"
+                                | "pop_front"
+                                | "pop_back"
+                        ) {
+                            return self
+                                .emit_fallback(&Statement::new(stmt.kind.clone(), stmt.span));
                         }
-                        if self.lookup_signal_id(hier).is_some() { return true; }
+                        if self.lookup_signal_id(hier).is_some() {
+                            return true;
+                        }
                         let leaf = hier.path.last().unwrap().name.name.clone();
-                        if self.try_inline_task(&leaf) { return true; }
+                        if self.try_inline_task(&leaf) {
+                            return true;
+                        }
                         self.bail("Expr_TaskEnable");
                         return self.emit_fallback(stmt);
                     }
@@ -822,8 +959,14 @@ impl<'a> BytecodeCompiler<'a> {
                         return true;
                     }
                     // Pre/post increment/decrement have side effects — compile them
-                    ExprKind::Unary { op: UnaryOp::PreIncr, operand } |
-                    ExprKind::Unary { op: UnaryOp::PostIncr, operand } => {
+                    ExprKind::Unary {
+                        op: UnaryOp::PreIncr,
+                        operand,
+                    }
+                    | ExprKind::Unary {
+                        op: UnaryOp::PostIncr,
+                        operand,
+                    } => {
                         if let Some(sig_id) = self.expr_to_signal_id(operand) {
                             let r = self.alloc_reg();
                             self.emit(Insn::LoadSignal(r, sig_id));
@@ -839,8 +982,14 @@ impl<'a> BytecodeCompiler<'a> {
                         self.bail("Expr_PreIncr");
                         return self.emit_fallback(stmt);
                     }
-                    ExprKind::Unary { op: UnaryOp::PreDecr, operand } |
-                    ExprKind::Unary { op: UnaryOp::PostDecr, operand } => {
+                    ExprKind::Unary {
+                        op: UnaryOp::PreDecr,
+                        operand,
+                    }
+                    | ExprKind::Unary {
+                        op: UnaryOp::PostDecr,
+                        operand,
+                    } => {
                         if let Some(sig_id) = self.expr_to_signal_id(operand) {
                             let r = self.alloc_reg();
                             self.emit(Insn::LoadSignal(r, sig_id));
@@ -882,7 +1031,12 @@ impl<'a> BytecodeCompiler<'a> {
                 self.bail(n);
                 self.emit_fallback(stmt)
             }
-            StatementKind::For { init, condition, step, body } => {
+            StatementKind::For {
+                init,
+                condition,
+                step,
+                body,
+            } => {
                 // LRM §12.7 — `break`/`continue` are now compiled to direct
                 // jumps; we push fresh patch lists on entry and apply them
                 // once we know the step-start and loop-end addresses.
@@ -899,11 +1053,17 @@ impl<'a> BytecodeCompiler<'a> {
                             let width = self.infer_lhs_width(lvalue);
                             let val_reg = match self.compile_expr(rvalue, width) {
                                 Some(r) => r,
-                                None => { self.bail("For_init_rvalue"); return false; }
+                                None => {
+                                    self.bail("For_init_rvalue");
+                                    return false;
+                                }
                             };
-                            if width > 0 { self.emit(Insn::Resize(val_reg, width)); }
+                            if width > 0 {
+                                self.emit(Insn::Resize(val_reg, width));
+                            }
                             if !self.compile_blocking_target(lvalue, val_reg, width) {
-                                self.bail("For_init_target"); return false;
+                                self.bail("For_init_target");
+                                return false;
                             }
                             // Capture init's lvalue signal_id keyed by leaf
                             // name. The for-loop's step / body expressions
@@ -929,11 +1089,22 @@ impl<'a> BytecodeCompiler<'a> {
                             // leaf bridges that asymmetry: bare `i` in step
                             // gets re-routed to init's resolved id.
                             if let ExprKind::Ident(hier) = &lvalue.kind {
-                                let leaf = if hier.path.len() == 1 && hier.path[0].name.name.contains('.') {
+                                let leaf = if hier.path.len() == 1
+                                    && hier.path[0].name.name.contains('.')
+                                {
                                     // Parser flattened a hier path into one segment with dots.
-                                    hier.path[0].name.name.rsplit('.').next().unwrap_or("").to_string()
+                                    hier.path[0]
+                                        .name
+                                        .name
+                                        .rsplit('.')
+                                        .next()
+                                        .unwrap_or("")
+                                        .to_string()
                                 } else {
-                                    hier.path.last().map(|s| s.name.name.clone()).unwrap_or_default()
+                                    hier.path
+                                        .last()
+                                        .map(|s| s.name.name.clone())
+                                        .unwrap_or_default()
                                 };
                                 if !leaf.is_empty() && !leaf.contains('.') {
                                     if let Some(id) = self.lookup_signal_id(hier) {
@@ -944,7 +1115,8 @@ impl<'a> BytecodeCompiler<'a> {
                         }
                         ForInit::VarDecl { .. } => {
                             self.for_loop_var_ids = saved_for_vars;
-                            self.bail("For_init_vardecl"); return false;
+                            self.bail("For_init_vardecl");
+                            return false;
                         }
                     }
                 }
@@ -952,12 +1124,17 @@ impl<'a> BytecodeCompiler<'a> {
                 let cond_branch_idx = if let Some(c) = condition {
                     let cond_reg = match self.compile_expr(c, 0) {
                         Some(r) => r,
-                        None => { self.bail("For_condition"); return false; }
+                        None => {
+                            self.bail("For_condition");
+                            return false;
+                        }
                     };
                     let idx = self.insns.len();
                     self.emit(Insn::BranchIfFalse(cond_reg, 0));
                     Some(idx)
-                } else { None };
+                } else {
+                    None
+                };
                 if !self.compile_stmt(body) {
                     // Bail path — pop patches so they don't leak.
                     self.loop_break_patches.pop();
@@ -967,9 +1144,15 @@ impl<'a> BytecodeCompiler<'a> {
                 let step_start = self.insns.len() as u32;
                 // `continue` jumps to the step (or to loop_start if there is
                 // no step) — patch now.
-                let cont_targ = if step.is_empty() { loop_start } else { step_start };
+                let cont_targ = if step.is_empty() {
+                    loop_start
+                } else {
+                    step_start
+                };
                 if let Some(patches) = self.loop_continue_patches.pop() {
-                    for idx in patches { self.insns[idx] = Insn::Jump(cont_targ); }
+                    for idx in patches {
+                        self.insns[idx] = Insn::Jump(cont_targ);
+                    }
                 }
                 for s in step {
                     // For-loop step can be either the legacy `Binary{Assign,…}`
@@ -978,18 +1161,31 @@ impl<'a> BytecodeCompiler<'a> {
                     // xezim-core 8b9c88c (ibex parsing). Both collapse to a
                     // blocking assign.
                     let (lhs, rhs) = match &s.kind {
-                        ExprKind::Binary { op: BinaryOp::Assign, left, right } => (&**left, &**right),
+                        ExprKind::Binary {
+                            op: BinaryOp::Assign,
+                            left,
+                            right,
+                        } => (&**left, &**right),
                         ExprKind::AssignExpr { lvalue, rvalue } => (&**lvalue, &**rvalue),
-                        _ => { self.bail("For_step_other"); return false; }
+                        _ => {
+                            self.bail("For_step_other");
+                            return false;
+                        }
                     };
                     let width = self.infer_lhs_width(lhs);
                     let val_reg = match self.compile_expr(rhs, width) {
                         Some(r) => r,
-                        None => { self.bail("For_step_rvalue"); return false; }
+                        None => {
+                            self.bail("For_step_rvalue");
+                            return false;
+                        }
                     };
-                    if width > 0 { self.emit(Insn::Resize(val_reg, width)); }
+                    if width > 0 {
+                        self.emit(Insn::Resize(val_reg, width));
+                    }
                     if !self.compile_blocking_target(lhs, val_reg, width) {
-                        self.bail("For_step_target"); return false;
+                        self.bail("For_step_target");
+                        return false;
                     }
                 }
                 self.emit(Insn::Jump(loop_start));
@@ -1001,7 +1197,9 @@ impl<'a> BytecodeCompiler<'a> {
                 }
                 // `break` jumps to the loop-exit address.
                 if let Some(patches) = self.loop_break_patches.pop() {
-                    for idx in patches { self.insns[idx] = Insn::Jump(end); }
+                    for idx in patches {
+                        self.insns[idx] = Insn::Jump(end);
+                    }
                 }
                 // Restore outer for-loop's override map.
                 self.for_loop_var_ids = saved_for_vars;
@@ -1108,11 +1306,16 @@ impl<'a> BytecodeCompiler<'a> {
                 // resize the operand and corrupt the reduction
                 // (e.g. zero-extending a 32-bit value to 64 makes &a = 0
                 // even when the 32-bit value was all 1s).
-                let operand_ctx = if matches!(op,
-                    UnaryOp::BitAnd | UnaryOp::BitNand
-                    | UnaryOp::BitOr  | UnaryOp::BitNor
-                    | UnaryOp::BitXor | UnaryOp::BitXnor
-                    | UnaryOp::LogNot) {
+                let operand_ctx = if matches!(
+                    op,
+                    UnaryOp::BitAnd
+                        | UnaryOp::BitNand
+                        | UnaryOp::BitOr
+                        | UnaryOp::BitNor
+                        | UnaryOp::BitXor
+                        | UnaryOp::BitXnor
+                        | UnaryOp::LogNot
+                ) {
                     0
                 } else {
                     ctx_width
@@ -1139,7 +1342,10 @@ impl<'a> BytecodeCompiler<'a> {
                         self.emit(Insn::ReduceXor(dest, src));
                         self.emit(Insn::BitNot(dest, dest));
                     }
-                    _ => { self.bail("UnaryOp_other"); return None; }
+                    _ => {
+                        self.bail("UnaryOp_other");
+                        return None;
+                    }
                 }
                 Some(dest)
             }
@@ -1157,13 +1363,23 @@ impl<'a> BytecodeCompiler<'a> {
                 // 0x20000000 → 0x200, AND'd with 0xe00 should be 0x200,
                 // but resized to 1 bit gives 0, so == 0 returns 1 instead
                 // of 0.)
-                let is_self_determined = matches!(op,
-                    BinaryOp::Eq | BinaryOp::Neq
-                    | BinaryOp::CaseEq | BinaryOp::CaseNeq
-                    | BinaryOp::WildcardEq | BinaryOp::WildcardNeq
-                    | BinaryOp::Lt | BinaryOp::Leq | BinaryOp::Gt | BinaryOp::Geq
-                    | BinaryOp::LogAnd | BinaryOp::LogOr
-                    | BinaryOp::LogImplies | BinaryOp::LogEquiv);
+                let is_self_determined = matches!(
+                    op,
+                    BinaryOp::Eq
+                        | BinaryOp::Neq
+                        | BinaryOp::CaseEq
+                        | BinaryOp::CaseNeq
+                        | BinaryOp::WildcardEq
+                        | BinaryOp::WildcardNeq
+                        | BinaryOp::Lt
+                        | BinaryOp::Leq
+                        | BinaryOp::Gt
+                        | BinaryOp::Geq
+                        | BinaryOp::LogAnd
+                        | BinaryOp::LogOr
+                        | BinaryOp::LogImplies
+                        | BinaryOp::LogEquiv
+                );
                 let sub_ctx = if is_self_determined {
                     let lw = self.expr_max_width(left);
                     let rw = self.expr_max_width(right);
@@ -1176,8 +1392,19 @@ impl<'a> BytecodeCompiler<'a> {
                 // Context width resizing for arithmetic / bitwise ops only.
                 // For self-determined comparisons we must NOT resize to
                 // ctx_width — that would clobber the operands.
-                if !is_self_determined && ctx_width > 0 && matches!(op, BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul
-                    | BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor | BinaryOp::BitXnor) {
+                if !is_self_determined
+                    && ctx_width > 0
+                    && matches!(
+                        op,
+                        BinaryOp::Add
+                            | BinaryOp::Sub
+                            | BinaryOp::Mul
+                            | BinaryOp::BitAnd
+                            | BinaryOp::BitOr
+                            | BinaryOp::BitXor
+                            | BinaryOp::BitXnor
+                    )
+                {
                     self.emit(Insn::Resize(l, ctx_width));
                     self.emit(Insn::Resize(r, ctx_width));
                 }
@@ -1225,7 +1452,9 @@ impl<'a> BytecodeCompiler<'a> {
                     BinaryOp::Gt => self.emit(Insn::Gt(dest, l, r)),
                     BinaryOp::Geq => self.emit(Insn::Geq(dest, l, r)),
                     BinaryOp::ShiftLeft | BinaryOp::ArithShiftLeft => {
-                        if ctx_width > 0 { self.emit(Insn::Resize(l, ctx_width)); }
+                        if ctx_width > 0 {
+                            self.emit(Insn::Resize(l, ctx_width));
+                        }
                         self.emit(Insn::Shl(dest, l, r));
                     }
                     BinaryOp::ShiftRight => self.emit(Insn::Shr(dest, l, r)),
@@ -1259,11 +1488,18 @@ impl<'a> BytecodeCompiler<'a> {
                             return None;
                         }
                     }
-                    _ => { self.bail("BinaryOp_other"); return None; }
+                    _ => {
+                        self.bail("BinaryOp_other");
+                        return None;
+                    }
                 }
                 Some(dest)
             }
-            ExprKind::Conditional { condition, then_expr, else_expr } => {
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
                 // Evaluate both branches unconditionally so Select can do a
                 // per-bit merge when the condition has X/Z (IEEE 1800 §11.4.11).
                 let cond = self.compile_expr(condition, 0)?;
@@ -1280,7 +1516,8 @@ impl<'a> BytecodeCompiler<'a> {
                     if let Some(name) = self.lookup_array_name(hier) {
                         let idx_reg = self.compile_expr(index, 0)?;
                         let dest = self.alloc_reg();
-                        self.emit(Insn::LoadArrayElem(dest, Box::new(name), idx_reg));
+                        let array = self.array_operand(name);
+                        self.emit(Insn::LoadArrayElem(dest, array, idx_reg));
                         return Some(dest);
                     }
                     // Packed multi-D READ: `mem_q[i]` for `logic [N-1:0][W-1:0]`
@@ -1288,15 +1525,16 @@ impl<'a> BytecodeCompiler<'a> {
                     // bit. Mirror the LHS variable-index slice path so reads
                     // and writes stay symmetric.
                     let raw = Self::hier_raw_name(hier);
-                    let elem_w = self.packed_elem_widths.and_then(|m| {
-                        m.get(raw.as_str())
-                            .copied()
-                            .or_else(|| {
+                    let elem_w = self
+                        .packed_elem_widths
+                        .and_then(|m| {
+                            m.get(raw.as_str()).copied().or_else(|| {
                                 hier.path
                                     .last()
                                     .and_then(|s| m.get(s.name.name.as_str()).copied())
                             })
-                    }).filter(|&w| w > 1);
+                        })
+                        .filter(|&w| w > 1);
                     if let Some(elem_w) = elem_w {
                         let base = self.compile_expr(expr, 0)?;
                         let idx_reg = self.compile_expr(index, 0)?;
@@ -1340,7 +1578,8 @@ impl<'a> BytecodeCompiler<'a> {
             } => match kind {
                 RangeKind::Constant => {
                     let base = self.compile_expr(expr, 0)?;
-                    if let (Some(l), Some(r)) = (self.eval_const_expr(left), self.eval_const_expr(right))
+                    if let (Some(l), Some(r)) =
+                        (self.eval_const_expr(left), self.eval_const_expr(right))
                     {
                         let dest = self.alloc_reg();
                         self.emit(Insn::RangeSelectConst(dest, base, l, r));
@@ -1444,8 +1683,7 @@ impl<'a> BytecodeCompiler<'a> {
                 self.emit(Insn::Concat(dest, Box::new(regs)));
                 Some(dest)
             }
-            ExprKind::SystemCall { name, args } => {
-                match name.as_str() {
+            ExprKind::SystemCall { name, args } => match name.as_str() {
                     "$signed" => {
                         let r = self.compile_expr(args.first()?, 0)?;
                         self.emit(Insn::SetSigned(r));
@@ -1460,8 +1698,7 @@ impl<'a> BytecodeCompiler<'a> {
                         let _ = other;
                         None
                     }
-                }
-            }
+            },
             other => {
                 let n: &'static str = match other {
                     ExprKind::StringLiteral(_) => "Expr_StringLiteral",
@@ -1499,7 +1736,8 @@ impl<'a> BytecodeCompiler<'a> {
                 if let ExprKind::Ident(hier) = &expr.kind {
                     if let Some(name) = self.lookup_array_name(hier) {
                         if let Some(idx_reg) = self.compile_expr(index, 0) {
-                            self.emit(Insn::NbaAssignArray(Box::new(name), idx_reg, val_reg, width));
+                            let array = self.array_operand(name);
+                            self.emit(Insn::NbaAssignArray(array, idx_reg, val_reg, width));
                             return true;
                         }
                     }
@@ -1507,15 +1745,16 @@ impl<'a> BytecodeCompiler<'a> {
                         // Packed multi-D NBA: `mem[i] <= data` must write the
                         // W-bit slice at `i*W +: W`. Mirrors compile_blocking_target.
                         let raw = Self::hier_raw_name(hier);
-                        let elem_w = self.packed_elem_widths.and_then(|m| {
-                            m.get(raw.as_str())
-                                .copied()
-                                .or_else(|| {
+                        let elem_w = self
+                            .packed_elem_widths
+                            .and_then(|m| {
+                                m.get(raw.as_str()).copied().or_else(|| {
                                     hier.path
                                         .last()
                                         .and_then(|s| m.get(s.name.name.as_str()).copied())
                                 })
-                        }).filter(|&w| w > 1);
+                            })
+                            .filter(|&w| w > 1);
                         if let Some(elem_w) = elem_w {
                             if let Some(idx_reg) = self.compile_expr(index, 0) {
                                 let elem_w_reg = self.alloc_reg();
@@ -1654,7 +1893,8 @@ impl<'a> BytecodeCompiler<'a> {
                     }
                 }
                 if *kind == RangeKind::Constant {
-                    if let Some((id, hi, lo)) = self.flattened_const_range_target(expr, left, right) {
+                    if let Some((id, hi, lo)) = self.flattened_const_range_target(expr, left, right)
+                    {
                         self.emit(Insn::NbaAssignRange(id, hi, lo, val_reg));
                         return true;
                     }
@@ -1671,12 +1911,9 @@ impl<'a> BytecodeCompiler<'a> {
                                 if let (Some(hi_reg), Some(lo_reg)) =
                                     (self.compile_expr(left, 0), self.compile_expr(right, 0))
                                 {
+                                    let array = self.array_operand(name);
                                     self.emit(Insn::NbaAssignArrayRange(
-                                        Box::new(name),
-                                        idx_reg,
-                                        hi_reg,
-                                        lo_reg,
-                                        val_reg,
+                                        array, idx_reg, hi_reg, lo_reg, val_reg,
                                     ));
                                     return true;
                                 }
@@ -1767,12 +2004,8 @@ impl<'a> BytecodeCompiler<'a> {
                 if let ExprKind::Ident(hier) = &expr.kind {
                     if let Some(name) = self.lookup_array_name(hier) {
                         if let Some(idx_reg) = self.compile_expr(index, 0) {
-                            self.emit(Insn::BlockingAssignArray(
-                                Box::new(name),
-                                idx_reg,
-                                val_reg,
-                                width,
-                            ));
+                            let array = self.array_operand(name);
+                            self.emit(Insn::BlockingAssignArray(array, idx_reg, val_reg, width));
                             return true;
                         }
                     }
@@ -1782,15 +2015,16 @@ impl<'a> BytecodeCompiler<'a> {
                         // slice at `i*W +: W`, not a single bit. Emit a
                         // RangeDyn write of `(i*W+W-1):(i*W)` instead.
                         let raw = Self::hier_raw_name(hier);
-                        let elem_w = self.packed_elem_widths.and_then(|m| {
-                            m.get(raw.as_str())
-                                .copied()
-                                .or_else(|| {
+                        let elem_w = self
+                            .packed_elem_widths
+                            .and_then(|m| {
+                                m.get(raw.as_str()).copied().or_else(|| {
                                     hier.path
                                         .last()
                                         .and_then(|s| m.get(s.name.name.as_str()).copied())
                                 })
-                        }).filter(|&w| w > 1);
+                            })
+                            .filter(|&w| w > 1);
                         if let Some(elem_w) = elem_w {
                             if let Some(idx_reg) = self.compile_expr(index, 0) {
                                 // lo = idx * elem_w
@@ -1902,7 +2136,9 @@ impl<'a> BytecodeCompiler<'a> {
                                         (idx, other)
                                     }
                                 };
-                                self.emit(Insn::BlockingAssignRangeDyn(id, hi_reg, lo_reg, resized));
+                                self.emit(Insn::BlockingAssignRangeDyn(
+                                    id, hi_reg, lo_reg, resized,
+                                ));
                                 return true;
                             }
                         }
@@ -1972,7 +2208,8 @@ impl<'a> BytecodeCompiler<'a> {
                     }
                 }
                 if *kind == RangeKind::Constant {
-                    if let Some((id, hi, lo)) = self.flattened_const_range_target(expr, left, right) {
+                    if let Some((id, hi, lo)) = self.flattened_const_range_target(expr, left, right)
+                    {
                         let range_w = hi - lo + 1;
                         let resized = self.alloc_reg();
                         self.emit(Insn::Move(resized, val_reg));
@@ -1993,12 +2230,9 @@ impl<'a> BytecodeCompiler<'a> {
                                 if let (Some(hi_reg), Some(lo_reg)) =
                                     (self.compile_expr(left, 0), self.compile_expr(right, 0))
                                 {
+                                    let array = self.array_operand(name);
                                     self.emit(Insn::BlockingAssignArrayRange(
-                                        Box::new(name),
-                                        idx_reg,
-                                        hi_reg,
-                                        lo_reg,
-                                        val_reg,
+                                        array, idx_reg, hi_reg, lo_reg, val_reg,
                                     ));
                                     return true;
                                 }
@@ -2046,7 +2280,9 @@ impl<'a> BytecodeCompiler<'a> {
         }
     }
 
-    pub fn infer_lhs_width_pub(&self, lhs: &Expression) -> u32 { self.infer_lhs_width(lhs) }
+    pub fn infer_lhs_width_pub(&self, lhs: &Expression) -> u32 {
+        self.infer_lhs_width(lhs)
+    }
 
     fn infer_lhs_width(&self, lhs: &Expression) -> u32 {
         match &lhs.kind {
@@ -2071,33 +2307,41 @@ impl<'a> BytecodeCompiler<'a> {
                     }
                     // Packed multi-D vector: element is N bits, not 1.
                     if let Some(elem_w) = self.packed_elem_widths.and_then(|m| {
-                        m.get(raw.as_str())
-                            .copied()
-                            .or_else(|| {
+                        m.get(raw.as_str()).copied().or_else(|| {
                                 hier.path
                                     .last()
                                     .and_then(|s| m.get(s.name.name.as_str()).copied())
                             })
                     }) {
-                        if elem_w > 1 { return elem_w; }
+                        if elem_w > 1 {
+                            return elem_w;
+                        }
                     }
                     // Not an array — bit-select on a plain packed signal; width = 1.
                     1
-                } else { 32 }
+                } else {
+                    32
             }
-            ExprKind::RangeSelect { left, right, kind, .. } => {
-                match kind {
+            }
+            ExprKind::RangeSelect {
+                left, right, kind, ..
+            } => match kind {
                     RangeKind::IndexedUp | RangeKind::IndexedDown => {
                         self.eval_const_expr(right).unwrap_or(32)
                     }
                     RangeKind::Constant => {
-                        if let (Some(l), Some(r)) = (self.eval_const_expr(left), self.eval_const_expr(right)) {
+                    if let (Some(l), Some(r)) =
+                        (self.eval_const_expr(left), self.eval_const_expr(right))
+                    {
                             let (hi, lo) = if l >= r { (l, r) } else { (r, l) };
-                            hi.checked_sub(lo).and_then(|w| w.checked_add(1)).unwrap_or(32)
-                        } else { 32 }
-                    }
+                        hi.checked_sub(lo)
+                            .and_then(|w| w.checked_add(1))
+                            .unwrap_or(32)
+                    } else {
+                        32
                 }
             }
+            },
             ExprKind::Concatenation(parts) => parts.iter().map(|p| self.infer_lhs_width(p)).sum(),
             _ => 32,
         }
@@ -2121,13 +2365,17 @@ impl<'a> BytecodeCompiler<'a> {
                 match op {
                     BinaryOp::LogAnd => {
                         let l = self.eval_const_expr(left)? as u64;
-                        if l == 0 { return Some(0); }
+                        if l == 0 {
+                            return Some(0);
+                        }
                         let r = self.eval_const_expr(right)? as u64;
                         return Some(if r != 0 { 1 } else { 0 });
                     }
                     BinaryOp::LogOr => {
                         let l = self.eval_const_expr(left)? as u64;
-                        if l != 0 { return Some(1); }
+                        if l != 0 {
+                            return Some(1);
+                        }
                         let r = self.eval_const_expr(right)? as u64;
                         return Some(if r != 0 { 1 } else { 0 });
                     }
@@ -2139,8 +2387,20 @@ impl<'a> BytecodeCompiler<'a> {
                     BinaryOp::Add => l.wrapping_add(r),
                     BinaryOp::Sub => l.wrapping_sub(r),
                     BinaryOp::Mul => l.wrapping_mul(r),
-                    BinaryOp::Div => if r == 0 { return None } else { l / r },
-                    BinaryOp::Mod => if r == 0 { return None } else { l % r },
+                    BinaryOp::Div => {
+                        if r == 0 {
+                            return None;
+                        } else {
+                            l / r
+                        }
+                    }
+                    BinaryOp::Mod => {
+                        if r == 0 {
+                            return None;
+                        } else {
+                            l % r
+                        }
+                    }
                     // LRM §11.4.3 power — silently dropped before this fix.
                     BinaryOp::Power => {
                         let e = u32::try_from(r as i64).ok()?;
@@ -2153,12 +2413,48 @@ impl<'a> BytecodeCompiler<'a> {
                     BinaryOp::BitOr   => l | r,
                     BinaryOp::BitXor  => l ^ r,
                     BinaryOp::BitXnor => !(l ^ r),
-                    BinaryOp::Eq | BinaryOp::CaseEq    => if l == r { 1 } else { 0 },
-                    BinaryOp::Neq | BinaryOp::CaseNeq  => if l != r { 1 } else { 0 },
-                    BinaryOp::Lt  => if (l as i64) <  (r as i64) { 1 } else { 0 },
-                    BinaryOp::Leq => if (l as i64) <= (r as i64) { 1 } else { 0 },
-                    BinaryOp::Gt  => if (l as i64) >  (r as i64) { 1 } else { 0 },
-                    BinaryOp::Geq => if (l as i64) >= (r as i64) { 1 } else { 0 },
+                    BinaryOp::Eq | BinaryOp::CaseEq => {
+                        if l == r {
+                            1
+                        } else {
+                            0
+                        }
+                    }
+                    BinaryOp::Neq | BinaryOp::CaseNeq => {
+                        if l != r {
+                            1
+                        } else {
+                            0
+                        }
+                    }
+                    BinaryOp::Lt => {
+                        if (l as i64) < (r as i64) {
+                            1
+                        } else {
+                            0
+                        }
+                    }
+                    BinaryOp::Leq => {
+                        if (l as i64) <= (r as i64) {
+                            1
+                        } else {
+                            0
+                        }
+                    }
+                    BinaryOp::Gt => {
+                        if (l as i64) > (r as i64) {
+                            1
+                        } else {
+                            0
+                        }
+                    }
+                    BinaryOp::Geq => {
+                        if (l as i64) >= (r as i64) {
+                            1
+                        } else {
+                            0
+                        }
+                    }
                     _ => return None,
                 };
                 Some(v as u32)
@@ -2169,23 +2465,61 @@ impl<'a> BytecodeCompiler<'a> {
                     UnaryOp::Plus    => v,
                     UnaryOp::Minus   => 0u64.wrapping_sub(v),
                     UnaryOp::BitNot  => !v,
-                    UnaryOp::LogNot  => if v == 0 { 1 } else { 0 },
+                    UnaryOp::LogNot => {
+                        if v == 0 {
+                            1
+                        } else {
+                            0
+                        }
+                    }
                     // LRM §11.4.9 reductions. The unknown bit-width is OK here
                     // since callers use this for sizing/indexing — `|MASK` only
                     // needs to be 1 if MASK has any set bits.
-                    UnaryOp::BitAnd  => if v == u64::MAX { 1 } else { 0 },
-                    UnaryOp::BitNand => if v == u64::MAX { 0 } else { 1 },
-                    UnaryOp::BitOr   => if v != 0 { 1 } else { 0 },
-                    UnaryOp::BitNor  => if v != 0 { 0 } else { 1 },
+                    UnaryOp::BitAnd => {
+                        if v == u64::MAX {
+                            1
+                        } else {
+                            0
+                        }
+                    }
+                    UnaryOp::BitNand => {
+                        if v == u64::MAX {
+                            0
+                        } else {
+                            1
+                        }
+                    }
+                    UnaryOp::BitOr => {
+                        if v != 0 {
+                            1
+                        } else {
+                            0
+                        }
+                    }
+                    UnaryOp::BitNor => {
+                        if v != 0 {
+                            0
+                        } else {
+                            1
+                        }
+                    }
                     UnaryOp::BitXor  => (v.count_ones() & 1) as u64,
                     UnaryOp::BitXnor => 1 - ((v.count_ones() & 1) as u64),
                     _ => return None,
                 };
                 Some(r as u32)
             }
-            ExprKind::Conditional { condition, then_expr, else_expr } => {
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
                 let c = self.eval_const_expr(condition)?;
-                if c != 0 { self.eval_const_expr(then_expr) } else { self.eval_const_expr(else_expr) }
+                if c != 0 {
+                    self.eval_const_expr(then_expr)
+                } else {
+                    self.eval_const_expr(else_expr)
+                }
             }
             _ => None,
         }
@@ -2193,7 +2527,13 @@ impl<'a> BytecodeCompiler<'a> {
 
     fn eval_number_static(&self, num: &NumberLiteral) -> Option<Value> {
         match num {
-            NumberLiteral::Integer { size, signed, base, value, cached_val } => {
+            NumberLiteral::Integer {
+                size,
+                signed,
+                base,
+                value,
+                cached_val,
+            } => {
                 let w = size.unwrap_or(32);
                 if let Some((vb, xz, cw)) = cached_val.get() {
                     if cw == w {
@@ -2202,7 +2542,12 @@ impl<'a> BytecodeCompiler<'a> {
                         return Some(v);
                     }
                 }
-                let r = match base { NumberBase::Binary => 2, NumberBase::Octal => 8, NumberBase::Hex => 16, NumberBase::Decimal => 10 };
+                let r = match base {
+                    NumberBase::Binary => 2,
+                    NumberBase::Octal => 8,
+                    NumberBase::Hex => 16,
+                    NumberBase::Decimal => 10,
+                };
                 let mut v = Value::from_str_radix(value, r, w);
                 v.is_signed = *signed;
                 Some(v)
@@ -2249,7 +2594,12 @@ impl<'a> BytecodeCompiler<'a> {
     /// as the interpreted assign_value path, but at bytecode speed.
     /// Yosys gate-level netlists emit hundreds of per-bit assigns that used
     /// to fall through to the interpreter on every settle iteration.
-    pub fn compile_cont_assign_lhs(&mut self, lhs: &Expression, rhs: &Expression, lhs_width: u32) -> bool {
+    pub fn compile_cont_assign_lhs(
+        &mut self,
+        lhs: &Expression,
+        rhs: &Expression,
+        lhs_width: u32,
+    ) -> bool {
         let ctx = lhs_width.max(self.expr_max_width(rhs));
         if let Some(val_reg) = self.compile_expr(rhs, ctx) {
             self.emit(Insn::Resize(val_reg, lhs_width));
@@ -2261,14 +2611,11 @@ impl<'a> BytecodeCompiler<'a> {
 
     fn expr_max_width(&self, expr: &Expression) -> u32 {
         match &expr.kind {
-            ExprKind::Ident(hier) => {
-                self.lookup_signal_id(hier)
+            ExprKind::Ident(hier) => self
+                .lookup_signal_id(hier)
                     .map(|id| self.signal_widths[id])
-                    .unwrap_or(0)
-            }
-            ExprKind::Number(n) => {
-                self.eval_number_static(n).map(|v| v.width).unwrap_or(32)
-            }
+                .unwrap_or(0),
+            ExprKind::Number(n) => self.eval_number_static(n).map(|v| v.width).unwrap_or(32),
             ExprKind::Binary { op, left, right } => {
                 // Relational, equality, and logical operators always
                 // produce a 1-bit result regardless of operand width.
@@ -2278,12 +2625,23 @@ impl<'a> BytecodeCompiler<'a> {
                 // produce ~0 in the upper bits — manifests as
                 // `(a ^~ b) && (c < d)` returning 1 instead of 0 when
                 // a^~b should be 0. (c910 BJU branch_blt_taken bug.)
-                if matches!(op,
-                    BinaryOp::Eq | BinaryOp::Neq | BinaryOp::CaseEq
-                    | BinaryOp::CaseNeq | BinaryOp::WildcardEq | BinaryOp::WildcardNeq
-                    | BinaryOp::Lt | BinaryOp::Leq | BinaryOp::Gt | BinaryOp::Geq
-                    | BinaryOp::LogAnd | BinaryOp::LogOr
-                    | BinaryOp::LogImplies | BinaryOp::LogEquiv) {
+                if matches!(
+                    op,
+                    BinaryOp::Eq
+                        | BinaryOp::Neq
+                        | BinaryOp::CaseEq
+                        | BinaryOp::CaseNeq
+                        | BinaryOp::WildcardEq
+                        | BinaryOp::WildcardNeq
+                        | BinaryOp::Lt
+                        | BinaryOp::Leq
+                        | BinaryOp::Gt
+                        | BinaryOp::Geq
+                        | BinaryOp::LogAnd
+                        | BinaryOp::LogOr
+                        | BinaryOp::LogImplies
+                        | BinaryOp::LogEquiv
+                ) {
                     1
                 } else {
                     self.expr_max_width(left).max(self.expr_max_width(right))
@@ -2292,33 +2650,50 @@ impl<'a> BytecodeCompiler<'a> {
             ExprKind::Unary { op, operand } => {
                 // Self-determined unary: reductions and logical NOT all
                 // produce 1 bit regardless of operand width.
-                if matches!(op,
-                    UnaryOp::BitAnd | UnaryOp::BitNand
-                    | UnaryOp::BitOr  | UnaryOp::BitNor
-                    | UnaryOp::BitXor | UnaryOp::BitXnor
-                    | UnaryOp::LogNot) {
+                if matches!(
+                    op,
+                    UnaryOp::BitAnd
+                        | UnaryOp::BitNand
+                        | UnaryOp::BitOr
+                        | UnaryOp::BitNor
+                        | UnaryOp::BitXor
+                        | UnaryOp::BitXnor
+                        | UnaryOp::LogNot
+                ) {
                     1
                 } else {
                     self.expr_max_width(operand)
                 }
             }
             ExprKind::Paren(inner) => self.expr_max_width(inner),
-            ExprKind::Call { args, .. } => {
-                args.iter().map(|a| self.expr_max_width(a)).max().unwrap_or(0)
-            }
-            ExprKind::Conditional { then_expr, else_expr, .. } => {
+            ExprKind::Call { args, .. } => args
+                .iter()
+                .map(|a| self.expr_max_width(a))
+                .max()
+                .unwrap_or(0),
+            ExprKind::Conditional {
+                then_expr,
+                else_expr,
+                ..
+            } => {
                 // Verilog: result of `cond ? then : else` is max(then, else).
                 // Condition is self-determined (does NOT contribute to result width).
                 self.expr_max_width(then_expr)
                     .max(self.expr_max_width(else_expr))
             }
-            ExprKind::Concatenation(parts) => {
-                parts.iter().map(|p| self.expr_max_width(p)).sum()
-            }
-            ExprKind::RangeSelect { expr: base, left, right, kind, .. } => {
+            ExprKind::Concatenation(parts) => parts.iter().map(|p| self.expr_max_width(p)).sum(),
+            ExprKind::RangeSelect {
+                expr: base,
+                left,
+                right,
+                kind,
+                ..
+            } => {
                 match kind {
                     RangeKind::Constant => {
-                        if let (Some(l), Some(r)) = (self.eval_const_expr(left), self.eval_const_expr(right)) {
+                        if let (Some(l), Some(r)) =
+                            (self.eval_const_expr(left), self.eval_const_expr(right))
+                        {
                             ((l as i64 - r as i64).abs() as u32) + 1
                         } else {
                             // Fallback when bounds aren't const-evaluable:
@@ -2328,9 +2703,10 @@ impl<'a> BytecodeCompiler<'a> {
                             self.expr_max_width(base)
                         }
                     }
-                    RangeKind::IndexedUp | RangeKind::IndexedDown => {
-                        self.eval_const_expr(right).unwrap_or_else(|| self.expr_max_width(base)) as u32
-                    }
+                    RangeKind::IndexedUp | RangeKind::IndexedDown => self
+                        .eval_const_expr(right)
+                        .unwrap_or_else(|| self.expr_max_width(base))
+                        as u32,
                 }
             }
             ExprKind::Index { .. } => 1,
@@ -2341,6 +2717,13 @@ impl<'a> BytecodeCompiler<'a> {
             }
             _ => 0,
         }
+    }
+
+    /// Compile a standalone expression and return the register containing its
+    /// result. Used by scheduler fast paths that repeatedly evaluate the same
+    /// delay expression outside an always-block body.
+    pub fn compile_root_expr(&mut self, expr: &Expression) -> Option<RegId> {
+        self.compile_expr(expr, 0)
     }
 
     pub fn finish(mut self) -> CompiledBlock {

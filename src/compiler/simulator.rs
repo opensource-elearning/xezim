@@ -19249,6 +19249,27 @@ impl Simulator {
         }
     }
 
+    /// §9.7: structurally check if `expr` is a `handle.await()` call on a
+    /// process handle (no `&mut self` needed — a static shape check). Used by
+    /// `stmt_is_blocking` so that a `forever { h.await(); ... }` body is
+    /// detected as blocking and routed through `run_process_stmts`, where the
+    /// await is intercepted and the process parks in `await_waiters`.
+    fn expr_is_proc_await(expr: &Expression) -> bool {
+        if let ExprKind::Call { func, args } = &expr.kind {
+            if args.is_empty() {
+                // MemberAccess form: `job.await()`
+                if let ExprKind::MemberAccess { member, .. } = &func.kind {
+                    return member.name.as_str() == "await";
+                }
+                // Flattened Ident form: `job.await` parses as Ident([job, await])
+                if let ExprKind::Ident(hier) = &func.kind {
+                    return hier.path.len() == 2 && hier.path[1].name.name == "await";
+                }
+            }
+        }
+        false
+    }
+
     /// Check if any statements contain blocking constructs (timing, events, wait).
     fn stmts_have_blocking(&self, stmts: &[Statement]) -> bool {
         stmts.iter().any(|s| self.stmt_is_blocking(s))
@@ -19305,6 +19326,15 @@ impl Simulator {
             // (m_select_sequence's waits, m_req_fifo.peek) to reach the
             // suspend-aware path. Recognise the canonical blocking task names.
             StatementKind::Expr(e) => {
+                // §9.7: `process_handle.await()` blocks the calling process
+                // until the target terminates. A `forever { h.await(); ... }`
+                // body (UVM's m_safe_select_item re-arbitration fork) must be
+                // detected as blocking so exec_forever_sched routes it through
+                // run_process_stmts, where the await is intercepted and the
+                // process parks in await_waiters instead of busy-spinning.
+                if Self::expr_is_proc_await(e) {
+                    return true;
+                }
                 // Default mode: name whitelist only (behavior unchanged).
                 // Pure-LRM mode: also follow the call into the callee's body so
                 // a task that blocks only transitively (e.g. UVM's `run_test`

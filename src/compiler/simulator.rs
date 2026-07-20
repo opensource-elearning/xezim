@@ -1322,6 +1322,26 @@ impl TimingWheel {
                 return Some(self.current_time + delta as u64);
             }
         }
+        // Phase 3: wrap back to start_word's LOW bits (< start_bit). These are
+        // the furthest-ahead slots in the wheel window — a nearly-full wrap
+        // around — and belong AFTER every other word in scan order. Phase 1's
+        // `!0 << start_bit` mask hid them and Phase 2 stops before returning to
+        // start_word, so without this pass a lone event in this range is
+        // INVISIBLE: e.g. current_time=250 (slot 250, word 3 bit 58) with an
+        // event at time 500 (slot 244, word 3 bit 52) — same word, lower bit.
+        // next_time() would then return None and the scheduler would end the
+        // run early, silently dropping the event. (next_time_after scans all
+        // 256 slots and never had this hole.)
+        if start_bit != 0 {
+            let last_masked = self.bitmap[start_word] & !(!0u64 << start_bit);
+            if last_masked != 0 {
+                let bit = last_masked.trailing_zeros() as usize;
+                let slot = (start_word << 6) | bit;
+                // slot < start_slot here, so the wrap delta is always positive.
+                let delta = slot + WHEEL_SIZE - start_slot;
+                return Some(self.current_time + delta as u64);
+            }
+        }
         // Check overflow
         self.overflow.keys().next().copied()
     }
@@ -2635,6 +2655,16 @@ pub struct Simulator {
     fork_block_children: HashMap<String, HashSet<usize>>,
     /// Associative arrays already warned about an x/z index.
     warned_assoc_index: HashSet<String>,
+    /// `#delay` sites already warned about a pathological (non-finite / absurdly
+    /// large) real delay value, keyed by the delay expression's source offset —
+    /// warn once per site so a spiking clock names itself without spamming.
+    warned_delay_spikes: HashSet<usize>,
+    /// PIDs whose first-at-time-0 variable `#(expr)` delay evaluated to 0 and
+    /// was deferred once past the time-0 settle (so the period signal — e.g. a
+    /// real cont-assign feeding `always #(p/2) clk=~clk` — settles before the
+    /// clock's phase is fixed). Guards the one-shot re-park against a genuine
+    /// zero-period loop re-parking forever at t=0.
+    t0_delay_deferred: HashSet<usize>,
     /// SV-2023: PIDs killed by `disable fork` — skip dispatch on these.
     killed_pids: HashSet<usize>,
     /// §9.7 `process` class: PIDs explicitly suspended via `suspend()`. The
@@ -4569,6 +4599,8 @@ impl Simulator {
             disable_labels: HashMap::default(),
             fork_block_children: HashMap::default(),
             warned_assoc_index: HashSet::default(),
+            warned_delay_spikes: HashSet::default(),
+            t0_delay_deferred: HashSet::default(),
             killed_pids: HashSet::default(),
             suspended_pids: HashSet::default(),
             suspended_proc_info: HashMap::default(),
@@ -11771,7 +11803,17 @@ impl Simulator {
                 }
                 Insn::Select(dest, cond, then_r, else_r) => {
                     let v = if vm_regs[*cond as usize].has_unknown() {
-                        vm_regs[*then_r as usize].merge_unknown(&vm_regs[*else_r as usize])
+                        let t = &vm_regs[*then_r as usize];
+                        let e = &vm_regs[*else_r as usize];
+                        // §11.3.1: a real result can't hold X, so bit-merging the
+                        // branches reads their IEEE-754 bits as garbage (a real
+                        // 1000.0 came out as 4.65e18). Return a defined real value
+                        // (x condition → the else/false branch) instead.
+                        if t.is_real || e.is_real {
+                            e.clone()
+                        } else {
+                            t.merge_unknown(e)
+                        }
                     } else if vm_regs[*cond as usize].is_true() {
                         vm_regs[*then_r as usize].clone()
                     } else {
@@ -12138,7 +12180,17 @@ impl Simulator {
                 }
                 Insn::Select(dest, cond, then_r, else_r) => {
                     let v = if vm_regs[*cond as usize].has_unknown() {
-                        vm_regs[*then_r as usize].merge_unknown(&vm_regs[*else_r as usize])
+                        let t = &vm_regs[*then_r as usize];
+                        let e = &vm_regs[*else_r as usize];
+                        // §11.3.1: a real result can't hold X, so bit-merging the
+                        // branches reads their IEEE-754 bits as garbage (a real
+                        // 1000.0 came out as 4.65e18). Return a defined real value
+                        // (x condition → the else/false branch) instead.
+                        if t.is_real || e.is_real {
+                            e.clone()
+                        } else {
+                            t.merge_unknown(e)
+                        }
                     } else if vm_regs[*cond as usize].is_true() {
                         vm_regs[*then_r as usize].clone()
                     } else {
@@ -12680,7 +12732,15 @@ impl Simulator {
                     let v = if self.vm_regs[*cond as usize].has_unknown() {
                         let t = self.vm_regs[*then_r as usize].clone();
                         let e = self.vm_regs[*else_r as usize].clone();
-                        t.merge_unknown(&e)
+                        // §11.3.1: a real result can't hold X — bit-merging the
+                        // branches would read their IEEE-754 bits as garbage.
+                        // Return a defined real value (else branch) when either
+                        // branch is real.
+                        if t.is_real || e.is_real {
+                            e
+                        } else {
+                            t.merge_unknown(&e)
+                        }
                     } else if self.vm_regs[*cond as usize].is_true() {
                         self.vm_regs[*then_r as usize].clone()
                     } else {
@@ -12908,10 +12968,19 @@ impl Simulator {
                 }
                 Insn::BlockingAssign(sig_id, val_reg, width) => {
                     let id = *sig_id;
-                    let mut handled = false;
+                    // §10.6.1/§10.6.2: a `force`d or procedurally-continuously-
+                    // `assign`ed target ignores ordinary procedural writes until
+                    // release/deassign. The slow path's `write_sig!` already
+                    // honors this, but the raw-bit fast path below writes
+                    // `signal_table` directly — so an edge/procedural block's
+                    // blocking assign overrode a force. Treat a forced target as
+                    // already handled (drop the write on BOTH paths).
+                    let mut handled = !self.forced_signals.is_empty()
+                        && self.forced_signals.contains_key(&id);
                     // 2-state targets take the slow path so X/Z is dropped
                     // (§6.11.1/§10.7); the raw-bit fast path would keep it.
-                    if *width <= 64
+                    if !handled
+                        && *width <= 64
                         && self.signal_widths[id] == *width
                         && !self.signal_real[id]
                         && !self.signal_two_state.get(id).copied().unwrap_or(false)
@@ -17567,6 +17636,7 @@ impl Simulator {
                 self.dirty_any = true;
             }
             let processes = self.event_queue.remove(self.time);
+            let ran_process = !processes.is_empty();
             for (pid, stmts) in processes {
                 if self.finished {
                     break;
@@ -17585,7 +17655,7 @@ impl Simulator {
             // After advancing time and any clock/delay fires, check for
             // edge triggers so always_ff blocks fire within this delay
             // window, then re-snapshot for the next iter.
-            if fired_clock || dly_applied {
+            if fired_clock || dly_applied || ran_process {
                 self.check_edges();
                 let _ = self.drain_edge_cascade(self.cascade_limit);
                 self.snapshot_edge_signals();
@@ -17791,6 +17861,27 @@ impl Simulator {
         let v = self.eval_expr(d);
         let raw = if v.is_real {
             let f = v.to_f64();
+            // Diagnose a pathological real delay: non-finite (NaN/inf) or
+            // absurdly large. A huge `#delay` parks the process ~forever — which
+            // reads as "the clock stopped" — and is almost always a bit-garbage
+            // value (an IEEE-754 pattern read as a ~1e18 number) or a divide that
+            // produced inf/NaN. Warn once per site so the offending delay names
+            // itself in the log instead of silently freezing a clock.
+            if !f.is_finite() || f >= 1e15 {
+                if self.warned_delay_spikes.insert(d.span.start) {
+                    let loc = self
+                        .span_file_line_in(d.span, None)
+                        .map(|l| format!(" at {}", l))
+                        .unwrap_or_default();
+                    eprintln!(
+                        "[xezim][warning] a #delay evaluated to a pathological real value {:.4e}{} \
+                         at time {} — the process is parked far in the future, so a clock driven \
+                         by it will appear to stop. This usually means the delay expression \
+                         produced NaN/inf or IEEE-754 bit garbage.",
+                        f, loc, self.time
+                    );
+                }
+            }
             if f.is_finite() && f > 0.0 { f } else { 0.0 }
         } else {
             v.to_u64().unwrap_or(0) as f64
@@ -18492,6 +18583,38 @@ impl Simulator {
                 match control {
                     TimingControl::Delay(d) => {
                         let delay = self.eval_delay_ticks(d);
+                        // A NON-LITERAL `#(expr)` that evaluates to 0 at the
+                        // very start of time 0 almost always means its period
+                        // signal has not settled yet: e.g. `assign xbOH =
+                        // dTx*d0j;` feeding `always #(xbOH/2) clk=~clk;`, where
+                        // the clock process (a lower pid, scheduled during
+                        // classify_always_blocks) runs before the `initial`
+                        // block that seeds `dTx`. Toggling now would drop a
+                        // spurious edge at t=0 and INVERT the clock's phase for
+                        // the whole run (so a later strobe samples the wrong
+                        // half-cycle). Re-park the WHOLE timing control — not
+                        // the post-`body` continuation — so `#(expr)` RE-
+                        // EVALUATES after the time-0 active+NBA+settle has run
+                        // the initial blocks and propagated the cont-assign.
+                        // One-shot per pid (`t0_delay_deferred`): a genuine
+                        // zero-period loop re-parks the continuation as usual on
+                        // its second pass. Literal `#0` is untouched.
+                        if delay == 0
+                            && self.time == 0
+                            && !matches!(d.kind, ExprKind::Number(_))
+                            && self.t0_delay_deferred.insert(pid)
+                        {
+                            let mut whole = vec![Statement::new(
+                                StatementKind::TimingControl {
+                                    control: TimingControl::Delay(d.clone()),
+                                    stmt: body.clone(),
+                                },
+                                stmt.span,
+                            )];
+                            whole.extend_from_slice(&stmts[i + 1..]);
+                            self.inactive_queue.push((pid, whole));
+                            return;
+                        }
                         let mut cont = vec![*body.clone()];
                         cont.extend_from_slice(&stmts[i + 1..]);
                         if delay == 0 {
@@ -18653,6 +18776,7 @@ impl Simulator {
                         i += 1;
                         continue;
                     }
+
                     // Unroll: execute body once, then schedule rest
                     let remaining_n = n - 1;
                     let mut cont = Vec::new();
@@ -19318,7 +19442,7 @@ impl Simulator {
             StatementKind::ParBlock { join_type, .. } => {
                 !matches!(join_type, JoinType::JoinNone)
             }
-            // A call to a known blocking task. UVM's TLM/sequencer chains
+            // A call to a blocking task. UVM's TLM/sequencer chains
             // forward through thin wrappers whose body is a single call (e.g.
             // uvm_seq_item_pull_port::get_next_item -> `imp.get_next_item(t)`);
             // such a wrapper is blocking-via-call even though it has no
@@ -19328,29 +19452,27 @@ impl Simulator {
             StatementKind::Expr(e) => {
                 // §9.7: `process_handle.await()` blocks the calling process
                 // until the target terminates. A `forever { h.await(); ... }`
-                // body (UVM's m_safe_select_item re-arbitration fork) must be
-                // detected as blocking so exec_forever_sched routes it through
+                // body (the sequencer's re-arbitration fork) must be detected
+                // as blocking so exec_forever_sched routes it through
                 // run_process_stmts, where the await is intercepted and the
                 // process parks in await_waiters instead of busy-spinning.
                 if Self::expr_is_proc_await(e) {
                     return true;
                 }
-                // Default mode: name whitelist only (behavior unchanged).
-                // Pure-LRM mode: also follow the call into the callee's body so
-                // a task that blocks only transitively (e.g. UVM's `run_test`
-                // -> `uvm_root::run_test` -> `fork m_run_phases join_none;
-                // wait(...)`) is detected and routed through the suspend-aware
-                // runner instead of being executed synchronously.
+                // Follow user task calls into their bodies so blocking tasks
+                // reached through loop/conditional bodies still use the
+                // suspend-aware runner. The name whitelist remains useful for
+                // built-in/UVM calls whose source declaration is unavailable.
                 Self::call_is_blocking_task(e)
-                    || (self.pure_sv_lrm && self.callee_transitively_blocks(e))
+                    || self.callee_transitively_blocks(e)
             }
             StatementKind::Repeat { body, .. } => self.stmt_is_blocking(body),
             _ => false,
         }
     }
 
-    /// Pure-LRM transitive blocking detection: true if the call `expr` targets a
-    /// user subroutine whose body eventually reaches a blocking construct.
+    /// Transitive blocking detection: true if the call `expr` targets a user
+    /// subroutine whose body eventually reaches a blocking construct.
     fn callee_transitively_blocks(&self, expr: &Expression) -> bool {
         // A subroutine call in statement position can parse as Call{func},
         // a bare Ident (`task_name;` with no args), or a MemberAccess
@@ -19656,6 +19778,33 @@ impl Simulator {
                 match control {
                     TimingControl::Delay(d) => {
                         let delay = self.eval_delay_ticks(d);
+                        // `forever #(expr) sig=~sig;` variable-period clock:
+                        // when `expr` evaluates to 0 at the very start of time 0
+                        // its period signal (a real cont-assign like `assign
+                        // xbOH = dTx*d0j;`) has not settled from the initial
+                        // blocks yet — this clock process (a low pid) ran first.
+                        // Toggling now drops a spurious t=0 edge and INVERTS the
+                        // clock phase for the whole run. Restart the loop so
+                        // `#(expr)` RE-EVALUATES after the time-0 active+NBA+
+                        // settle; one-shot per pid so a genuine zero-period loop
+                        // still spins. Only for the pure `#(expr) …` head (i==0)
+                        // and a non-literal delay (literal `#0` untouched).
+                        if i == 0
+                            && delay == 0
+                            && self.time == 0
+                            && !matches!(d.kind, ExprKind::Number(_))
+                            && self.t0_delay_deferred.insert(pid)
+                        {
+                            let mut restart = vec![Statement::new(
+                                StatementKind::Forever {
+                                    body: Box::new(body.clone()),
+                                },
+                                body.span,
+                            )];
+                            restart.extend_from_slice(after);
+                            self.inactive_queue.push((pid, restart));
+                            return;
+                        }
                         let mut cont = vec![*tbody.clone()];
                         cont.extend_from_slice(&body_stmts[i + 1..]);
                         cont.push(Statement::new(
@@ -24759,6 +24908,15 @@ impl Simulator {
                         }
                     }
                 }
+                if let Some(bound) = self.indexed_iface_alias_for(expr) {
+                    let target = format!("{}.{}", bound, member.name);
+                    let prev = self.get_signal_value_by_name(&target);
+                    let w = prev.as_ref().map(|v| v.width).unwrap_or(val.width);
+                    let resized = val.resize(w);
+                    let changed = prev.as_ref() != Some(&resized);
+                    self.set_signal_value_by_name(&target, resized);
+                    return changed;
+                }
                 // Unpacked aggregates keep every leaf in its own signal
                 // (`arr[i].m`, `c.nodes[i].m`) — there is no contiguous bit
                 // layout to slice, and a `real` member has no bit offset. If the
@@ -27408,7 +27566,13 @@ impl Simulator {
                         v.is_signed = true;
                         v
                     } else {
-                        Value::from_u64(0, 32)
+                        // §20.15.1: no-seed `$random` draws from the global RNG
+                        // (same stream as no-arg `$urandom`) and returns a SIGNED
+                        // 32-bit value. It used to return a constant 0, so every
+                        // `$random` stimulus was stuck at 0.
+                        let mut v = Value::from_u64(self.rng_u32() as u64, 32);
+                        v.is_signed = true;
+                        v
                     }
                 }
                 "$isunknown" => {
@@ -27419,32 +27583,47 @@ impl Simulator {
                     Value::from_u64(v.has_xz() as u64, 1)
                 }
                 "$realtobits" => {
+                    // §20.5: return the 64-bit IEEE-754 pattern of the real as an
+                    // INTEGER bit-vector (not a real), so it can be indexed/stored
+                    // as bits. `v` is a real Value whose bits already are the
+                    // pattern; re-emit them as a plain 64-bit integer.
                     let v = args
                         .first()
                         .map(|a| self.eval_expr(a))
                         .unwrap_or(Value::zero(64));
-                    v
+                    Value::from_u64(v.to_f64().to_bits(), 64)
                 }
                 "$bitstoreal" => {
+                    // §20.5: reinterpret the 64-bit pattern as an IEEE-754 double.
+                    // The old pass-through left is_real=false, so the bits were
+                    // read as a huge integer (0x3FF0000000000000 -> 4.6e18 instead
+                    // of 1.0). Rebuild the real from the raw bits.
                     let v = args
                         .first()
                         .map(|a| self.eval_expr(a))
                         .unwrap_or(Value::zero(64));
-                    v
+                    Value::from_f64(f64::from_bits(v.to_u64().unwrap_or(0)))
                 }
                 "$itor" => {
+                    // §20.4: convert a (signed) integer to real. `to_u64` read a
+                    // negative arg as a huge unsigned value ($itor(-5) -> 4.29e9);
+                    // `to_i64` honors the operand's signedness so -5 -> -5.0.
                     let v = args
                         .first()
                         .map(|a| self.eval_expr(a))
                         .unwrap_or(Value::zero(32));
-                    Value::from_f64(v.to_u64().unwrap_or(0) as f64)
+                    Value::from_f64(v.to_i64().unwrap_or(0) as f64)
                 }
                 "$rtoi" => {
+                    // §20.4: returns `integer` (a SIGNED 32-bit type). Mark the
+                    // result signed so %d prints e.g. -3, not 4294967293.
                     let v = args
                         .first()
                         .map(|a| self.eval_expr(a))
                         .unwrap_or(Value::zero(64));
-                    Self::real_trunc_to_int(v.to_f64(), 32)
+                    let mut r = Self::real_trunc_to_int(v.to_f64(), 32);
+                    r.is_signed = true;
+                    r
                 }
                 "$ceil" => {
                     let v = args
@@ -27858,10 +28037,24 @@ impl Simulator {
                                 self.lookup_signal_width(&aname).unwrap_or(0)
                             };
                             let sel = dims.as_ref().and_then(|d| d.get(dim.saturating_sub(1)));
+                            let n_unpacked = dims.as_ref().map(|d| d.len()).unwrap_or(0);
                             let (lo, hi, descending) = if let Some(&(l, h)) = sel {
                                 let desc = dim == 1
                                     && self.module.descending_arrays.contains(&aname);
                                 (l, h, desc)
+                            } else if let Some(&(l, r)) = self
+                                .module
+                                .packed_full_dims
+                                .get(&aname)
+                                .and_then(|pd| pd.get(dim.saturating_sub(1).saturating_sub(n_unpacked)))
+                            {
+                                // §7.4.5: dimensions number unpacked-first, then
+                                // packed. A multi-D packed vector (`logic
+                                // [3:0][7:0]`) has per-dimension bounds in
+                                // packed_full_dims (declared left,right) — without
+                                // this the query collapsed to the FLATTENED vector,
+                                // so `$left([3:0][7:0])` returned 31, not 3.
+                                (l.min(r), l.max(r), l > r)
                             } else {
                                 (0i64, packed_w as i64 - 1, true)
                             };
@@ -28113,6 +28306,15 @@ impl Simulator {
                             return v;
                         }
                     }
+                }
+                // §25.10: member access through an indexed plain virtual-
+                // interface array (`vifs[i].data`). Resolve the element alias
+                // before generic flattened aggregate handling creates/reads a
+                // phantom `vifs[i].data` value.
+                if let Some(bound) = self.indexed_iface_alias_for(expr) {
+                    return self
+                        .get_signal_value_by_name(&format!("{}.{}", bound, member.name))
+                        .unwrap_or_else(|| Value::new(1));
                 }
                 // §18.4: member of a struct/union CLASS property — read through
                 // the aggregate's storage (a bit slice for a packed struct/
@@ -32107,6 +32309,15 @@ impl Simulator {
                             }
                         }
                     }
+                    // A released signal that is a gateable flop's output (`q` in
+                    // `always @(posedge clk) q<=d`) may no longer equal its data
+                    // input — the force broke the "Q provably unchanged" invariant
+                    // the EVENT_EDGE skip relies on. Invalidate every flop
+                    // snapshot so the next edge actually re-fires and re-drives the
+                    // released output, instead of being skipped for "no data
+                    // change" and leaving Q stuck at the forced value. Release is
+                    // rare, so a one-shot re-fire of all flops is cheap.
+                    self.edge_block_snap_valid.iter_mut().for_each(|v| *v = false);
                     self.dirty_any = true;
                 }
             },
@@ -46088,7 +46299,18 @@ impl Simulator {
         // (Vec<(name, value)> in declaration order, which IS the LRM
         // iteration order). Type info is on signal_type_names (keyed by
         // signal_id), since `self.module.signals` may not be the storage.
-        if matches!(mname, "first" | "last" | "next" | "prev" | "num") && args.is_empty() {
+        // §6.19.6: first/last/num take no argument; next/prev take an OPTIONAL
+        // count N (default 1) — `c.next(2)` steps two forward with wrapping.
+        if (matches!(mname, "first" | "last" | "num") && args.is_empty())
+            || (matches!(mname, "next" | "prev") && args.len() <= 1)
+        {
+            let step_n: u64 = if matches!(mname, "next" | "prev") {
+                args.first()
+                    .map(|a| self.eval_expr(a).to_u64().unwrap_or(1))
+                    .unwrap_or(1)
+            } else {
+                0
+            };
             let tn_opt: Option<String> = self
                 .signal_name_to_id
                 .get(obj_name)
@@ -46117,12 +46339,15 @@ impl Simulator {
                                 .unwrap_or(0);
                             let pos = members.iter().position(|(_, v)| *v == cur);
                             if let Some(p) = pos {
-                                // LRM §6.19.6: next() of last wraps to
-                                // first; prev() of first wraps to last.
+                                // LRM §6.19.6: next(N)/prev(N) step N places with
+                                // wrapping (next of last -> first, prev of first
+                                // -> last). N defaults to 1; N==0 returns current.
+                                let len = members.len() as u64;
+                                let step = (step_n % len) as usize;
                                 let new_p = if mname == "next" {
-                                    if p + 1 >= members.len() { 0 } else { p + 1 }
+                                    (p + step) % members.len()
                                 } else {
-                                    if p == 0 { members.len() - 1 } else { p - 1 }
+                                    (p + members.len() - step) % members.len()
                                 };
                                 Value::from_u64(members[new_p].1, mw)
                             } else {
@@ -47101,6 +47326,26 @@ impl Simulator {
                     .and_then(|cn| self.module.classes.get(&cn))
                     .map_or(false, |cd| cd.virtual_iface_properties.contains_key(name));
                 if is_viface_var && !shadows_class_prop {
+                    // §25.10: whole-array binding (`vifs = interfaces`). Each
+                    // virtual-interface element is an independent alias to the
+                    // corresponding structural interface instance.
+                    if let Some(&(lo, hi, _)) = self.module.arrays.get(name) {
+                        if let ExprKind::Ident(rhs_h) = &rvalue.kind {
+                            if rhs_h.path.len() == 1 && rhs_h.path[0].selects.is_empty() {
+                                let rhs_base = &rhs_h.path[0].name.name;
+                                let targets: Vec<String> = (lo..=hi)
+                                    .map(|idx| format!("{}[{}]", rhs_base, idx))
+                                    .collect();
+                                if targets.iter().all(|target| self.is_interface_instance(target)) {
+                                    for (idx, target) in (lo..=hi).zip(targets) {
+                                        self.viface_var_aliases
+                                            .insert(format!("{}[{}]", name, idx), target);
+                                    }
+                                    return true;
+                                }
+                            }
+                        }
+                    }
                     if matches!(&rvalue.kind, ExprKind::Null) {
                         // Clear the alias, then FALL THROUGH so the normal
                         // value path stores the null handle — keeping a
@@ -47471,6 +47716,20 @@ impl Simulator {
             return None; // fast path: no vif variables bound anywhere
         }
         self.viface_var_aliases.get(name).cloned()
+    }
+
+    fn indexed_iface_alias_for(&self, expr: &Expression) -> Option<String> {
+        let ExprKind::Index { expr: base, index } = &expr.kind else {
+            return None;
+        };
+        let ExprKind::Ident(h) = &base.kind else {
+            return None;
+        };
+        if h.path.len() != 1 || !h.path[0].selects.is_empty() {
+            return None;
+        }
+        let idx = self.eval_scalar_self(index)?;
+        self.iface_alias_for(&format!("{}[{}]", h.path[0].name.name, idx))
     }
 
     /// Is `path` an elaborated INTERFACE instance (e.g. `bus` of
@@ -48308,6 +48567,30 @@ impl Simulator {
         } else {
             func
         };
+        // A subroutine declared in a named generate-for scope is addressed as
+        // `block[index].task(...)`. Elaboration stores each iteration under
+        // that exact hierarchical key.
+        if let ExprKind::MemberAccess { expr: base, member } = &func.kind {
+            if let ExprKind::Index { expr: scope, index } = &base.kind {
+                if let ExprKind::Ident(h) = &scope.kind {
+                    if h.path.len() == 1 && h.path[0].selects.is_empty() {
+                        if let Some(idx) = self.eval_scalar_self(index) {
+                            let name = format!(
+                                "{}[{}].{}",
+                                h.path[0].name.name, idx, member.name
+                            );
+                            if let Some(fd) = self.module.functions.get(&name).cloned() {
+                                return self.exec_function_call(&fd, args);
+                            }
+                            if let Some(td) = self.module.tasks.get(&name).cloned() {
+                                self.exec_task_call(&td, args);
+                                return Value::zero(32);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // Intercept UVM method calls
         let real_uvm = self.uses_real_uvm();
         if let ExprKind::MemberAccess { expr, member } = &func.kind {
@@ -50992,7 +51275,7 @@ impl Simulator {
         self.func_call_stack.pop();
         self.this_stack.pop();
         self.class_context_stack.pop();
-        let result = if let Some(rv) = self.return_value.take() {
+        let mut result = if let Some(rv) = self.return_value.take() {
             rv
         } else {
             // Return value from function-name variable
@@ -51001,6 +51284,30 @@ impl Simulator {
                 .and_then(|l| l.get(&ret_name).cloned())
                 .unwrap_or(Value::zero(32))
         };
+        // §13.4.1: the return value takes the function's declared type — a
+        // `function signed [7:0]` truncates its result to 8 bits (150 -> -106),
+        // a `function [3:0]` to 4 bits. The return var was sized 32 and never
+        // narrowed, so `s_sum = a + b` returned the full-width sum. Resize
+        // integral returns to the declared width/signedness (skip real, string,
+        // and void — those aren't width-narrowed scalars).
+        if !result.is_real
+            && !Self::is_string_data_type(&fd.return_type)
+            && !matches!(
+                fd.return_type,
+                crate::ast::types::DataType::Void { .. }
+                    | crate::ast::types::DataType::Real { .. }
+            )
+        {
+            let w = super::elaborate::resolve_type_width(
+                &fd.return_type,
+                Some(&self.module.parameters),
+                Some(&self.module.typedefs),
+            );
+            if w > 0 && w != result.width {
+                result = result.resize(w);
+            }
+            result.is_signed = super::elaborate::is_type_signed(&fd.return_type);
+        }
         // Array formals copy element-wise; scalars go through `output_bindings`.
         for (param, caller, is_out) in std::mem::take(&mut assoc_params) {
             if param == caller {

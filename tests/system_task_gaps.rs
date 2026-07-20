@@ -439,3 +439,103 @@ fn sdf_annotation_overrides_specify_and_paths_agree() {
     let no_sdf = run(&[]);
     assert!(no_sdf.contains("T7 y=0"), "specify-only timing must be unchanged:\n{}", no_sdf);
 }
+
+/// §20.5: $bitstoreal must reinterpret a 64-bit pattern as an IEEE-754 double
+/// (inverse of $realtobits), not read the bits as an integer. The old
+/// pass-through left the result non-real, so `$bitstoreal(64'h3FF0…)` printed
+/// 4.6e18 instead of 1.0. Round-tripping a real through $realtobits →
+/// $bitstoreal must reproduce it exactly.
+#[test]
+fn bitstoreal_realtobits_roundtrip() {
+    const SRC: &str = r#"
+module top;
+  initial begin
+    $display("B1 %.4f", $bitstoreal(64'h3FF0000000000000));
+    $display("B2 %.4f", $bitstoreal(64'h4000000000000000));
+    $display("RT %016h", $realtobits(1.0));
+    $display("ROUND %.5f", $bitstoreal($realtobits(3.14159)));
+  end
+endmodule
+"#;
+    let sim = simulate(SRC, 100).expect("simulate failed");
+    let joined: String = sim
+        .output
+        .iter()
+        .map(|o| o.message.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(joined.contains("B1 1.0000"), "$bitstoreal(0x3FF0…)=1.0:\n{}", joined);
+    assert!(joined.contains("B2 2.0000"), "$bitstoreal(0x4000…)=2.0:\n{}", joined);
+    assert!(joined.contains("RT 3ff0000000000000"), "$realtobits(1.0) bits:\n{}", joined);
+    assert!(joined.contains("ROUND 3.14159"), "round-trip must be exact:\n{}", joined);
+}
+
+/// §20.4: $itor honors the operand's sign ($itor(-5) = -5.0, not 4.29e9), and
+/// $rtoi returns a SIGNED `integer` (so %d prints -3, not 4294967293).
+#[test]
+fn itor_rtoi_signed() {
+    const SRC: &str = r#"
+module top;
+  initial begin
+    $display("I1 %.2f", $itor(5));
+    $display("I2 %.2f", $itor(-5));
+    $display("R1 %0d", $rtoi(3.7));
+    $display("R2 %0d", $rtoi(-3.7));
+  end
+endmodule
+"#;
+    let sim = simulate(SRC, 100).expect("simulate failed");
+    let joined: String = sim
+        .output
+        .iter()
+        .map(|o| o.message.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(joined.contains("I1 5.00"), "$itor(5)=5.0:\n{}", joined);
+    assert!(joined.contains("I2 -5.00"), "$itor(-5)=-5.0:\n{}", joined);
+    assert!(joined.contains("R1 3"), "$rtoi(3.7)=3:\n{}", joined);
+    assert!(joined.contains("R2 -3"), "$rtoi(-3.7)=-3:\n{}", joined);
+}
+
+/// §20.15.1: no-seed $random must draw from the global RNG, not return a
+/// constant 0. It used to be stuck at 0, so every `$random` stimulus was 0.
+#[test]
+fn random_no_seed_varies() {
+    const SRC: &str = r#"
+module top;
+  int nonzero, i, v, seen_neg;
+  initial begin
+    nonzero = 0; seen_neg = 0;
+    for (i = 0; i < 40; i++) begin
+      v = $random;
+      if (v != 0) nonzero++;
+      if (v < 0)  seen_neg++;
+    end
+    $display("NZ %0d NEG %0d", nonzero, seen_neg);
+  end
+endmodule
+"#;
+    let sim = simulate(SRC, 100).expect("simulate failed");
+    let joined: String = sim
+        .output
+        .iter()
+        .map(|o| o.message.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    // Essentially all of 40 draws are non-zero, and $random is signed so some
+    // are negative — proves it's a real 32-bit stream, not a stuck 0.
+    let nz: i32 = joined
+        .split("NZ ")
+        .nth(1)
+        .and_then(|s| s.split_whitespace().next())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let neg: i32 = joined
+        .split("NEG ")
+        .nth(1)
+        .and_then(|s| s.split_whitespace().next())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    assert!(nz >= 38, "$random must vary (got {} non-zero of 40):\n{}", nz, joined);
+    assert!(neg > 0, "$random is signed — expected some negatives:\n{}", joined);
+}

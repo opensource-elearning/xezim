@@ -12411,16 +12411,27 @@ impl Simulator {
                         // signal_table and elide if the range bits already
                         // match (the partial-range counterpart of the
                         // simple NbaAssign eval-time elision).
-                        let mut new_val = signal_table[*sig_id].clone();
-                        let mut any_change = false;
-                        for bit_pos in low..=high {
-                            let new_bit = val.get_bit((bit_pos - low) as usize);
-                            if new_val.get_bit(bit_pos as usize) != new_bit {
-                                new_val.set_bit(bit_pos as usize, new_bit);
-                                any_change = true;
+                        // Compare FIRST (no clone): flop reloads usually match, and
+                        // the unconditional clone of a wide signal (1 byte/bit Vec)
+                        // was a top allocator cost on c910. Clone + merge only from
+                        // the first differing bit.
+                        let mut first_diff = None;
+                        {
+                            let src = &signal_table[*sig_id];
+                            for bit_pos in low..=high {
+                                if src.get_bit(bit_pos as usize)
+                                    != val.get_bit((bit_pos - low) as usize)
+                                {
+                                    first_diff = Some(bit_pos);
+                                    break;
+                                }
                             }
                         }
-                        if any_change {
+                        if let Some(start) = first_diff {
+                            let mut new_val = signal_table[*sig_id].clone();
+                            for bit_pos in start..=high {
+                                new_val.set_bit(bit_pos as usize, val.get_bit((bit_pos - low) as usize));
+                            }
                             nba_out.push(NbaFast {
                                 signal_id: *sig_id,
                                 value: new_val,
@@ -12821,16 +12832,27 @@ impl Simulator {
                     let (low, high) = if hi >= lo { (*lo, *hi) } else { (*hi, *lo) };
                     let w = high - low + 1;
                     let val = vm_regs[*val_reg as usize].resize(w);
-                    let mut new_val = view[*sig_id].clone();
-                    let mut any_change = false;
-                    for bit_pos in low..=high {
-                        let nb = val.get_bit((bit_pos - low) as usize);
-                        if new_val.get_bit(bit_pos as usize) != nb {
-                            new_val.set_bit(bit_pos as usize, nb);
-                            any_change = true;
+                    // Compare FIRST (no clone): flop reloads usually match, and
+                    // the unconditional clone of a wide signal (1 byte/bit Vec)
+                    // was a top allocator cost on c910. Clone + merge only from
+                    // the first differing bit.
+                    let mut first_diff = None;
+                    {
+                        let src = &view[*sig_id];
+                        for bit_pos in low..=high {
+                            if src.get_bit(bit_pos as usize)
+                                != val.get_bit((bit_pos - low) as usize)
+                            {
+                                first_diff = Some(bit_pos);
+                                break;
+                            }
                         }
                     }
-                    if any_change {
+                    if let Some(start) = first_diff {
+                        let mut new_val = view[*sig_id].clone();
+                        for bit_pos in start..=high {
+                            new_val.set_bit(bit_pos as usize, val.get_bit((bit_pos - low) as usize));
+                        }
                         view[*sig_id] = new_val;
                         dirtied.push(*sig_id as u32);
                     }
@@ -12915,16 +12937,27 @@ impl Simulator {
                         }
                         nba_out[i].value = new_val;
                     } else {
-                        let mut new_val = view[*sig_id].clone();
-                        let mut any_change = false;
-                        for bit_pos in low..=high {
-                            let nb = val.get_bit((bit_pos - low) as usize);
-                            if new_val.get_bit(bit_pos as usize) != nb {
-                                new_val.set_bit(bit_pos as usize, nb);
-                                any_change = true;
+                        // Compare FIRST (no clone): flop reloads usually match, and
+                        // the unconditional clone of a wide signal (1 byte/bit Vec)
+                        // was a top allocator cost on c910. Clone + merge only from
+                        // the first differing bit.
+                        let mut first_diff = None;
+                        {
+                            let src = &view[*sig_id];
+                            for bit_pos in low..=high {
+                                if src.get_bit(bit_pos as usize)
+                                    != val.get_bit((bit_pos - low) as usize)
+                                {
+                                    first_diff = Some(bit_pos);
+                                    break;
+                                }
                             }
                         }
-                        if any_change {
+                        if let Some(start) = first_diff {
+                            let mut new_val = view[*sig_id].clone();
+                            for bit_pos in start..=high {
+                                new_val.set_bit(bit_pos as usize, val.get_bit((bit_pos - low) as usize));
+                            }
                             nba_out.push(NbaFast {
                                 signal_id: *sig_id,
                                 value: new_val,
@@ -13397,16 +13430,27 @@ impl Simulator {
                     } else {
                         // Wide path: build merged value, compare against
                         // signal_table[id], push only on real change.
-                        let mut new_val = self.signal_table[id].clone();
-                        let mut any_change = false;
-                        for bit_pos in low..=high {
-                            let new_bit = val.get_bit((bit_pos - low) as usize);
-                            if new_val.get_bit(bit_pos as usize) != new_bit {
-                                new_val.set_bit(bit_pos as usize, new_bit);
-                                any_change = true;
+                        // Compare FIRST (no clone): flop reloads usually match, and
+                        // the unconditional clone of a wide signal (1 byte/bit Vec)
+                        // was a top allocator cost on c910. Clone + merge only from
+                        // the first differing bit.
+                        let mut first_diff = None;
+                        {
+                            let src = &self.signal_table[id];
+                            for bit_pos in low..=high {
+                                if src.get_bit(bit_pos as usize)
+                                    != val.get_bit((bit_pos - low) as usize)
+                                {
+                                    first_diff = Some(bit_pos);
+                                    break;
+                                }
                             }
                         }
-                        if any_change {
+                        if let Some(start) = first_diff {
+                            let mut new_val = self.signal_table[id].clone();
+                            for bit_pos in start..=high {
+                                new_val.set_bit(bit_pos as usize, val.get_bit((bit_pos - low) as usize));
+                            }
                             self.nba_fast_index.insert(id, self.nba_fast.len());
                             self.nba_fast.push(NbaFast {
                                 block_index: 0,
@@ -13481,16 +13525,27 @@ impl Simulator {
                                 );
                             }
                         } else {
-                            let mut new_val = self.signal_table[id].clone();
-                            let mut any_change = false;
-                            for bit_pos in low..=high_eff {
-                                let new_bit = val.get_bit((bit_pos - low) as usize);
-                                if new_val.get_bit(bit_pos as usize) != new_bit {
-                                    new_val.set_bit(bit_pos as usize, new_bit);
-                                    any_change = true;
+                            // Compare FIRST (no clone): flop reloads usually match, and
+                            // the unconditional clone of a wide signal (1 byte/bit Vec)
+                            // was a top allocator cost on c910. Clone + merge only from
+                            // the first differing bit.
+                            let mut first_diff = None;
+                            {
+                                let src = &self.signal_table[id];
+                                for bit_pos in low..=high_eff {
+                                    if src.get_bit(bit_pos as usize)
+                                        != val.get_bit((bit_pos - low) as usize)
+                                    {
+                                        first_diff = Some(bit_pos);
+                                        break;
+                                    }
                                 }
                             }
-                            if any_change {
+                            if let Some(start) = first_diff {
+                                let mut new_val = self.signal_table[id].clone();
+                                for bit_pos in start..=high_eff {
+                                    new_val.set_bit(bit_pos as usize, val.get_bit((bit_pos - low) as usize));
+                                }
                                 self.nba_fast_index.insert(id, self.nba_fast.len());
                                 self.nba_fast.push(NbaFast {
                                     block_index: 0,
@@ -13878,16 +13933,27 @@ impl Simulator {
                                     );
                                 }
                             } else {
-                                let mut new_val = self.signal_table[eid].clone();
-                                let mut any_change = false;
-                                for bit_pos in low..=high_eff {
-                                    let new_bit = val.get_bit((bit_pos - low) as usize);
-                                    if new_val.get_bit(bit_pos as usize) != new_bit {
-                                        new_val.set_bit(bit_pos as usize, new_bit);
-                                        any_change = true;
+                                // Compare FIRST (no clone): flop reloads usually match, and
+                                // the unconditional clone of a wide signal (1 byte/bit Vec)
+                                // was a top allocator cost on c910. Clone + merge only from
+                                // the first differing bit.
+                                let mut first_diff = None;
+                                {
+                                    let src = &self.signal_table[eid];
+                                    for bit_pos in low..=high_eff {
+                                        if src.get_bit(bit_pos as usize)
+                                            != val.get_bit((bit_pos - low) as usize)
+                                        {
+                                            first_diff = Some(bit_pos);
+                                            break;
+                                        }
                                     }
                                 }
-                                if any_change {
+                                if let Some(start) = first_diff {
+                                    let mut new_val = self.signal_table[eid].clone();
+                                    for bit_pos in start..=high_eff {
+                                        new_val.set_bit(bit_pos as usize, val.get_bit((bit_pos - low) as usize));
+                                    }
                                     self.nba_fast_index.insert(eid, self.nba_fast.len());
                                     self.nba_fast.push(NbaFast {
                                         block_index: 0,

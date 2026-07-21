@@ -56936,8 +56936,17 @@ impl Simulator {
             }
         }
         // uvm_root::run_test calls report_server.report_summarize() after the
-        // report phase — emit the summary block.
-        self.emit_uvm_report_summary();
+        // report phase — emit the summary block. Only when the run showed any
+        // UVM evidence (components, objections, or tallied reports): a pure-SV
+        // design that merely drains its event loop must not end with a UVM
+        // Report Summary.
+        if !comps.is_empty()
+            || self.uvm_obj_raised
+            || self.uvm_sev_counts.iter().any(|&c| c > 0)
+            || !self.uvm_id_counts.is_empty()
+        {
+            self.emit_uvm_report_summary();
+        }
     }
 
     /// Triggered when the run-phase objection count returns to 0 (after a

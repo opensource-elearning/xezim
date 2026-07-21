@@ -2602,13 +2602,9 @@ impl<'a> BytecodeCompiler<'a> {
             // Time literal magnitude in tick units (1 ns), matching the
             // interpreter's value-context handling.
             NumberLiteral::Time(s) => Some(Value::from_u64((*s * 1e9) as u64, 64)),
-            NumberLiteral::UnbasedUnsized(c) => Some(match c {
-                '0' => Value::zero(32),
-                '1' => Value::ones(32),
-                'x' | 'X' => Value::new(32),
-                'z' | 'Z' => Value::all_z(32),
-                _ => Value::new(32),
-            }),
+            // §5.7.1: unbased-unsized literal — a 1-bit FILL value; the Value
+            // binary ops and resize replicate it to the consuming context.
+            NumberLiteral::UnbasedUnsized(c) => Some(Value::fill_of(*c)),
         }
     }
 

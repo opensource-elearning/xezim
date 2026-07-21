@@ -12458,6 +12458,19 @@ impl Simulator {
                     }
                 }
                 Insn::Select(dest, cond, then_r, else_r) => {
+                    // §11.4.11 + §5.7.1: a fill branch ('z/'1/...) takes the
+                    // width of the other branch (tristate lowering builds
+                    // `cond ? then : 'z`; a 1-bit z leaking through would
+                    // zero-extend at the assign instead of z-filling).
+                    {
+                        let (tw, tf) = (vm_regs[*then_r as usize].width, vm_regs[*then_r as usize].is_fill);
+                        let (ew, ef) = (vm_regs[*else_r as usize].width, vm_regs[*else_r as usize].is_fill);
+                        if tf && !ef {
+                            vm_regs[*then_r as usize] = vm_regs[*then_r as usize].resize(ew);
+                        } else if ef && !tf {
+                            vm_regs[*else_r as usize] = vm_regs[*else_r as usize].resize(tw);
+                        }
+                    }
                     let v = if vm_regs[*cond as usize].has_unknown() {
                         let t = &vm_regs[*then_r as usize];
                         let e = &vm_regs[*else_r as usize];
@@ -12862,6 +12875,19 @@ impl Simulator {
                     }
                 }
                 Insn::Select(dest, cond, then_r, else_r) => {
+                    // §11.4.11 + §5.7.1: a fill branch ('z/'1/...) takes the
+                    // width of the other branch (tristate lowering builds
+                    // `cond ? then : 'z`; a 1-bit z leaking through would
+                    // zero-extend at the assign instead of z-filling).
+                    {
+                        let (tw, tf) = (vm_regs[*then_r as usize].width, vm_regs[*then_r as usize].is_fill);
+                        let (ew, ef) = (vm_regs[*else_r as usize].width, vm_regs[*else_r as usize].is_fill);
+                        if tf && !ef {
+                            vm_regs[*then_r as usize] = vm_regs[*then_r as usize].resize(ew);
+                        } else if ef && !tf {
+                            vm_regs[*else_r as usize] = vm_regs[*else_r as usize].resize(tw);
+                        }
+                    }
                     let v = if vm_regs[*cond as usize].has_unknown() {
                         let t = &vm_regs[*then_r as usize];
                         let e = &vm_regs[*else_r as usize];
@@ -13445,6 +13471,19 @@ impl Simulator {
                     }
                 }
                 Insn::Select(dest, cond, then_r, else_r) => {
+                    // §11.4.11 + §5.7.1: a fill branch ('z/'1/...) takes the
+                    // width of the other branch (tristate lowering builds
+                    // `cond ? then : 'z`; a 1-bit z leaking through would
+                    // zero-extend at the assign instead of z-filling).
+                    {
+                        let (tw, tf) = (self.vm_regs[*then_r as usize].width, self.vm_regs[*then_r as usize].is_fill);
+                        let (ew, ef) = (self.vm_regs[*else_r as usize].width, self.vm_regs[*else_r as usize].is_fill);
+                        if tf && !ef {
+                            self.vm_regs[*then_r as usize] = self.vm_regs[*then_r as usize].resize(ew);
+                        } else if ef && !tf {
+                            self.vm_regs[*else_r as usize] = self.vm_regs[*else_r as usize].resize(tw);
+                        }
+                    }
                     let v = if self.vm_regs[*cond as usize].has_unknown() {
                         let t = self.vm_regs[*then_r as usize].clone();
                         let e = self.vm_regs[*else_r as usize].clone();
@@ -27501,8 +27540,15 @@ impl Simulator {
                 if c.has_unknown() {
                     // IEEE 1800 §11.4.11 Table 11-21: per-bit merge — bit is known
                     // only where both branches agree; otherwise X.
-                    let t = self.eval_expr_ctx(then_expr, ctx_width);
-                    let e = self.eval_expr_ctx(else_expr, ctx_width);
+                    let mut t = self.eval_expr_ctx(then_expr, ctx_width);
+                    let mut e = self.eval_expr_ctx(else_expr, ctx_width);
+                    // §5.7.1: a fill branch widens to the other branch before
+                    // the per-bit merge (resize consumes the fill flag).
+                    if t.is_fill && !e.is_fill {
+                        t = t.resize(e.width);
+                    } else if e.is_fill && !t.is_fill {
+                        e = e.resize(t.width);
+                    }
                     // A REAL result cannot hold X, so the bitwise merge would
                     // read the IEEE-754 bits of the operands as garbage (e.g. a
                     // real `1000.0` came out as 4.65e18). §11.3.1: the result is
@@ -30358,13 +30404,9 @@ impl Simulator {
             // behaviour. (Delay contexts route through eval_delay_ticks, which
             // applies the timescale/precision conversion.)
             NumberLiteral::Time(s) => Value::from_f64(*s * 1e9),
-            NumberLiteral::UnbasedUnsized(c) => match c {
-                '0' => Value::zero(32),
-                '1' => Value::ones(32),
-                'x' | 'X' => Value::new(32), // all X
-                'z' | 'Z' => Value::all_z(32),
-                _ => Value::new(32),
-            },
+            // §5.7.1: unbased-unsized literal — a 1-bit FILL value; binary ops
+            // and resize replicate it to the consuming context's width.
+            NumberLiteral::UnbasedUnsized(c) => Value::fill_of(*c),
         }
     }
 

@@ -15352,10 +15352,36 @@ impl Simulator {
     /// warning and the instance is dropped (output left undriven).
     fn build_udp_entries(&mut self, entries: &mut Vec<CombEntry>) {
         let insts = std::mem::take(&mut self.module.udp_instances);
+        // `--primitive-verbose`: print every UDP instance with its source
+        // location and each terminal's resolution (net + bit, constant, or
+        // failure), so a dropped vendor cell can be diagnosed from the log
+        // without the design sources at hand.
+        let pv = xezim_core::primitive_verbose();
         for inst in insts {
+            if pv {
+                let loc = self
+                    .span_file_line_in(inst.output.span, None)
+                    .unwrap_or_else(|| format!("source offset {}", inst.output.span.start));
+                eprintln!(
+                    "[primitive-verbose] UDP '{}' instance '{}' ({}) — {} input terminal(s)",
+                    inst.udp_name,
+                    inst.inst_path,
+                    loc,
+                    inst.inputs.len()
+                );
+            }
             // Resolve output + input terminals to single bit refs.
             let out_ref = match self.try_resolve_bit_ref(&inst.output, None) {
-                Some(b) => b,
+                Some(b) => {
+                    if pv {
+                        eprintln!(
+                            "[primitive-verbose]   out  -> net '{}' bit {}",
+                            self.name_for_id(b.sig_id as usize),
+                            b.bit
+                        );
+                    }
+                    b
+                }
                 None => {
                     eprintln!(
                         "\n========================================================================\n\
@@ -15368,24 +15394,72 @@ impl Simulator {
                 }
             };
             let mut in_refs = Vec::with_capacity(inst.inputs.len());
-            let mut bad = false;
-            for e in &inst.inputs {
-                match self.try_resolve_bit_ref(e, None) {
-                    Some(b) => in_refs.push(b),
-                    None => {
-                        bad = true;
-                        break;
+            let mut bad: Option<(usize, String)> = None;
+            for (ti, e) in inst.inputs.iter().enumerate() {
+                if let Some(b) = self.try_resolve_bit_ref(e, None) {
+                    if pv {
+                        eprintln!(
+                            "[primitive-verbose]   in#{} -> net '{}' bit {}",
+                            ti,
+                            self.name_for_id(b.sig_id as usize),
+                            b.bit
+                        );
                     }
+                    in_refs.push(b);
+                    continue;
                 }
+                // A CONSTANT terminal (power/ground pins of power-aware
+                // vendor cells are routinely tied to 1'b1/1'b0/'x/'z):
+                // encode it as a sentinel BitRef — sig_id=u32::MAX, bit =
+                // the 4-state code — read directly by eval_udp and skipped
+                // by dependency registration (a constant never changes).
+                let mut ce: &Expression = e;
+                while let ExprKind::Paren(inner) = &ce.kind {
+                    ce = inner;
+                }
+                if let ExprKind::Number(num) = &ce.kind {
+                    let v = self.eval_number(num);
+                    let code = v.get_bit_code(0) as u32;
+                    if pv {
+                        eprintln!(
+                            "[primitive-verbose]   in#{} -> constant {}",
+                            ti,
+                            ['0', '1', 'x', 'z'][code as usize % 4]
+                        );
+                    }
+                    in_refs.push(BitRef {
+                        sig_id: u32::MAX,
+                        bit: code,
+                    });
+                    continue;
+                }
+                let desc = self
+                    .span_file_line_in(e.span, None)
+                    .unwrap_or_else(|| format!("source offset {}", e.span.start));
+                if pv {
+                    let snippet = self
+                        .span_source_snippet_in(e.span, None)
+                        .unwrap_or_else(|| "<expression>".to_string());
+                    eprintln!(
+                        "[primitive-verbose]   in#{} -> FAILED: '{}' at {} is not a 1-bit net, \
+                         constant bit-select, or literal",
+                        ti, snippet, desc
+                    );
+                }
+                bad = Some((ti, desc));
+                break;
             }
-            if bad {
+            if let Some((ti, desc)) = bad {
                 eprintln!(
                     "\n========================================================================\n\
                      Warning: UDP INPUT UNRESOLVED — primitive '{}' instance '{}'\n\
-                     an input terminal net could not be resolved to a single 1-bit net.\n\
-                     Consequence: this instance is DROPPED; its output is left UNDRIVEN.\n\
+                     input terminal #{} ({}) could not be resolved to a single 1-bit net\n\
+                     (supported: a 1-bit net, a constant bit-select of a packed vector,\n\
+                     or a constant literal). Consequence: this instance is DROPPED; its\n\
+                     output is left UNDRIVEN — downstream logic (e.g. a reset/clock\n\
+                     chain through this cell) will never activate.\n\
                      ========================================================================\n",
-                    inst.udp_name, inst.inst_path
+                    inst.udp_name, inst.inst_path, ti, desc
                 );
                 continue;
             }
@@ -15397,7 +15471,11 @@ impl Simulator {
                 _ => 2u8, // x (default start state)
             };
             let n = in_refs.len();
-            let read_ids: Vec<usize> = in_refs.iter().map(|b| b.sig_id as usize).collect();
+            let read_ids: Vec<usize> = in_refs
+                .iter()
+                .filter(|b| b.sig_id != u32::MAX)
+                .map(|b| b.sig_id as usize)
+                .collect();
             let write_ids: Vec<usize> = vec![out_ref.sig_id as usize];
             self.udp_runtime.push(UdpRuntime {
                 udp_name: inst.udp_name.clone(),
@@ -15458,7 +15536,12 @@ impl Simulator {
         }
         for i in 0..n {
             let b = self.udp_runtime[idx].in_refs[i];
-            let code = self.signal_table[b.sig_id as usize].get_bit_code(b.bit as usize);
+            let code = if b.sig_id == u32::MAX {
+                // Constant terminal (see build_udp_entries): the code IS the value.
+                b.bit as u8
+            } else {
+                self.signal_table[b.sig_id as usize].get_bit_code(b.bit as usize)
+            };
             cur[i] = if code >= 2 { 2 } else { code }; // 0,1,x (z->x)
         }
 

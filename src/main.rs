@@ -1422,7 +1422,7 @@ suppressed but the explicit SDF annotation still applies."
             );
         }
     }
-    if !lib_dirs.is_empty() || !lib_files.is_empty() || lib_exts.is_some() {
+    if !lib_dirs.is_empty() || !lib_files.is_empty() || lib_exts.is_some() || primitive_verbose {
         xezim::set_library_cli(xezim::LibraryCli {
             lib_files: lib_files.clone(),
             lib_dirs: lib_dirs.clone(),

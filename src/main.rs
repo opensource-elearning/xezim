@@ -108,7 +108,7 @@ fn print_usage() {
     eprintln!("  --preprocess     Run the preprocessor only; emit expanded text");
     eprintln!("  --dump-tokens    With --parse, print the token stream");
     eprintln!("  --dump-ast       With --parse, print the AST");
-    eprintln!("  --max-time <n>   Set maximum simulation time (default: 100000)");
+    eprintln!("  --max-time <n>[ps|ns|us|ms|s]   Maximum simulation time; bare <n> is ns (default: 100000)");
     eprintln!("  --sim_debug      Enable simulator [DEBUG]/[OPT] output");
     eprintln!("  --dump-timescales  Print each module's timescale before the run (no source");
     eprintln!("                     $printtimescale needed); flags modules with no `timescale.");
@@ -215,6 +215,47 @@ fn parse_timescale_value(d: &str) -> Result<(i32, i32), String> {
 
 /// Build the `--module-timescale` configuration from raw option strings,
 /// validating units and detecting conflicting named assignments.
+/// Parse a `--max-time` value: a bare number is NANOSECONDS (historical
+/// default), an attached suffix selects the unit: `30000000ps`, `30us`,
+/// `1ms`, `2s` (case-insensitive; `us` or `µs`). Returns nanoseconds.
+/// A customer run set `--max-time 30000000` intending picoseconds under a
+/// 1ps timescale and got 30 ms — the unit was invisible and unspellable.
+fn parse_max_time(raw: &str) -> Result<u64, String> {
+    let t = raw.trim();
+    let lower = t.to_ascii_lowercase();
+    let (num_str, factor_ns): (&str, f64) = if let Some(n) = lower.strip_suffix("ps") {
+        (n, 1e-3)
+    } else if let Some(n) = lower.strip_suffix("ns") {
+        (n, 1.0)
+    } else if let Some(n) = lower.strip_suffix("µs") {
+        (n, 1e3)
+    } else if let Some(n) = lower.strip_suffix("us") {
+        (n, 1e3)
+    } else if let Some(n) = lower.strip_suffix("ms") {
+        (n, 1e6)
+    } else if let Some(n) = lower.strip_suffix('s') {
+        (n, 1e9)
+    } else {
+        (lower.as_str(), 1.0)
+    };
+    let num: f64 = num_str
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid --max-time value '{}' (expected <n>[ps|ns|us|ms|s])", raw))?;
+    if !(num > 0.0) {
+        return Err(format!("--max-time must be positive, got '{}'", raw));
+    }
+    let ns = num * factor_ns;
+    let rounded = ns.round();
+    if rounded < 1.0 {
+        return Err(format!(
+            "--max-time '{}' is below 1 ns; the cap is tracked in whole nanoseconds",
+            raw
+        ));
+    }
+    Ok(rounded as u64)
+}
+
 fn build_module_timescale_cli(raw: &[String]) -> Result<xezim::ModuleTimescaleCli, String> {
     let mut cli = xezim::ModuleTimescaleCli::default();
     for spec in raw {
@@ -1040,7 +1081,22 @@ fn main() {
             "--max-time" => {
                 i += 1;
                 if i < args.len() {
-                    max_time = args[i].parse().unwrap_or(100_000);
+                    match parse_max_time(&args[i]) {
+                        Ok(v) => max_time = v,
+                        Err(e) => {
+                            eprintln!("{}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
+            _ if arg.starts_with("--max-time=") => {
+                match parse_max_time(&arg["--max-time=".len()..]) {
+                    Ok(v) => max_time = v,
+                    Err(e) => {
+                        eprintln!("{}", e);
+                        std::process::exit(1);
+                    }
                 }
             }
             "--settle-limit" => {
@@ -1412,7 +1468,7 @@ suppressed but the explicit SDF annotation still applies."
                     Ok(Some(elab)) => {
                         println!("=== xezim {} ===", env!("CARGO_PKG_VERSION"));
                         println!("Loaded compiled: {}", sf);
-                        println!("Max time: {}", max_time);
+                        println!("Max time: {} ns", max_time);
                         println!("------------------------------");
                         let total_start = std::time::Instant::now();
                         xezim::compiler::simulator::set_sim_debug(sim_debug);
@@ -1682,7 +1738,7 @@ suppressed but the explicit SDF annotation still applies."
     }
 
     println!("=== xezim {} ===", env!("CARGO_PKG_VERSION"));
-    println!("Max time: {}", max_time);
+    println!("Max time: {} ns", max_time);
     println!("------------------------------");
     xezim::compiler::simulator::set_sim_debug(sim_debug);
     xezim::compiler::simulator::set_dump_timescales(dump_timescales);

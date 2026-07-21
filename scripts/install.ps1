@@ -14,6 +14,9 @@
 
 $ErrorActionPreference = 'Stop'
 
+# Force TLS 1.2 for older Windows/.NET versions
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
 # ---- Config ----
 $Workspace = Join-Path $HOME "xezim-workspace"
 $GitHubOrg = "aionhw"
@@ -23,8 +26,10 @@ $Repos = @("xezim-core", "xezim")
 function Write-Log($msg)  { Write-Host " ✅ $msg" -ForegroundColor Green }
 function Write-Warn($msg) { Write-Host " ⚠️  $msg" -ForegroundColor Yellow }
 function Write-Info($msg) { Write-Host " ➡️  $msg" -ForegroundColor Cyan }
-function Write-Step($msg) { Write-Host " ➡️  $msg" -ForegroundColor White }
 function Write-Fail($msg) { Write-Host " ❌ $msg" -ForegroundColor Red; exit 1 }
+
+# ---- Cleanup trap ----
+try {
 
 # ---- Banner ----
 Write-Host ""
@@ -33,7 +38,8 @@ Write-Host "   Workspace: $Workspace"
 Write-Host ""
 
 # ---- Step 1: Check / Install Rust ----
-Write-Info "Step 1/4: Checking Rust toolchain..."
+Write-Info "Step 1/5: Checking Rust toolchain..."
+
 $haveRust = $false
 try {
     $rustVersion = & rustc --version 2>$null
@@ -75,7 +81,8 @@ if (-not $haveRust) {
 }
 
 # ---- Step 2: Check / Install Git ----
-Write-Info "Step 2/4: Checking Git..."
+Write-Info "Step 2/5: Checking Git..."
+
 $haveGit = $false
 try {
     $gitVersion = & git --version 2>$null
@@ -156,7 +163,8 @@ if (-not $haveGit) {
 }
 
 # ---- Step 3: Clone repos ----
-Write-Info "Step 3/4: Setting up workspace..."
+Write-Info "Step 3/5: Setting up workspace..."
+
 
 # Create workspace
 if (-not (Test-Path $Workspace)) {
@@ -178,7 +186,8 @@ foreach ($repo in $Repos) {
         }
     } else {
         Write-Info "Cloning $repo..."
-        & git clone --quiet $repoUrl $repoDir 2>&1 | Out-Null
+        & git clone $repoUrl $repoDir
+
         if ($LASTEXITCODE -ne 0) {
             Write-Fail "Failed to clone $repoUrl"
         }
@@ -197,7 +206,8 @@ Write-Log "Workspace structure verified."
 $XezimTagExplicit = $false
 $XezimTag = if ($env:XEZIM_TAG) { $XezimTagExplicit = $true; $env:XEZIM_TAG } else { $null }
 if (-not $XezimTag) {
-    Write-Step "Detecting latest release tag from git..."
+    Write-Info "Detecting latest release tag from git..."
+
     Push-Location (Join-Path $Workspace "xezim")
     try {
         $latestTag = & git tag --sort=-creatordate | Select-Object -First 1
@@ -213,11 +223,14 @@ if (-not $XezimTag) {
     }
 }
 
-Write-Step "Checking out $XezimTag..."
+Write-Info "Checking out $XezimTag..."
+
 foreach ($repo in $Repos) {
     $repoDir = Join-Path $Workspace $repo
     Push-Location $repoDir
     try {
+        & git stash push -m "xezim-installer" 2>$null
+
         & git checkout $XezimTag 2>$null
         if ($LASTEXITCODE -eq 0) {
             Write-Log "$repo: checked out $XezimTag"
@@ -232,34 +245,67 @@ foreach ($repo in $Repos) {
         Pop-Location
     }
 }
-# ---- Step 5: Build ----
-Write-Info "Step 5/5: Building xezim (release mode)..."
-Write-Info "This may take 5-15 minutes on first build."
-Write-Host ""
 
-$mainDir = Join-Path $Workspace "xezim"
-Push-Location $mainDir
+# Quick exit if xezim already matches the target tag
+$alreadyInstalled = $false
 try {
-    # FIXME: remove -Awarnings once source warnings are cleaned up
-    $oldRustflags = $env:RUSTFLAGS
-    $env:RUSTFLAGS = "-Awarnings"
+    $localVer = & xezim --version 2>$null
+    if ($localVer) {
+        $tagVer = [regex]::Match($XezimTag, '\d+\.\d+\.\d+').Value
+        $localVerNum = [regex]::Match($localVer, '\d+\.\d+\.\d+').Value
+        if ($localVerNum -and $tagVer -and $localVerNum -eq $tagVer) {
+            Write-Host ""
+            Write-Host "🎉  xezim v$localVerNum is already installed and up to date!" -ForegroundColor White
+            Write-Host ""
+            Write-Host "   Workspace: $Workspace"
+            Write-Host ""
+            Write-Host "   Update later to check for new versions:"
+            Write-Host "      irm https://raw.githubusercontent.com/aionhw/xezim/main/scripts/install.ps1 | iex"
+            Write-Host ""
+            exit 0
+        }
+    }
+} catch { }
+
+# ---- Step 5: Build ----
+$mainDir = Join-Path $Workspace "xezim"
+$binary = Join-Path $mainDir "target" "release" "xezim.exe"
+
+# Skip build if binary exists and source hasn't changed
+$skipBuild = $false
+if (Test-Path $binary) {
+    $srcTimes = Get-ChildItem -Path "$mainDir\src" -Recurse -Filter *.rs -ErrorAction SilentlyContinue | Measure-Object -Property LastWriteTime -Maximum
+    $binTime = (Get-Item $binary -ErrorAction SilentlyContinue).LastWriteTime
+    if ($srcTimes.Maximum -and $binTime -and $binTime -gt $srcTimes.Maximum) {
+        Write-Log "Binary is current (tag: $XezimTag). Skipping build."
+        $skipBuild = $true
+    }
+}
+
+if (-not $skipBuild) {
+    Write-Info "Step 5/5: Building xezim (release mode)..."
+    Write-Info "This may take 5-15 minutes on first build."
+    Write-Host ""
+
+    Push-Location $mainDir
     try {
-        & cargo build --release
-        if ($LASTEXITCODE -ne 0) {
-            Write-Fail "Build failed. Check the output above for errors."
+        # FIXME: remove -Awarnings once source warnings are cleaned up
+        $oldRustflags = $env:RUSTFLAGS
+        $env:RUSTFLAGS = "-Awarnings"
+        try {
+            & cargo build --release
+            if ($LASTEXITCODE -ne 0) {
+                Write-Fail "Build failed. Check the output above for errors."
+            }
+        } finally {
+            $env:RUSTFLAGS = $oldRustflags
         }
     } finally {
-        $env:RUSTFLAGS = $oldRustflags
+        Pop-Location
     }
-} finally {
-    Pop-Location
 }
 
-$binary = Join-Path $mainDir "target" "release" "xezim.exe"
-if (-not (Test-Path $binary)) {
-    # Try without .exe
-    $binary = Join-Path $mainDir "target" "release" "xezim"
-}
+
 if (Test-Path $binary) {
     Write-Log "Build successful! Binary: $binary"
 } else {
@@ -322,3 +368,8 @@ Write-Host "   Update later:"
 Write-Host "      irm https://raw.githubusercontent.com/aionhw/xezim/main/scripts/install.ps1 | iex"
 Write-Host "      `$env:XEZIM_TAG='v0.9.6'; irm https://raw.githubusercontent.com/aionhw/xezim/main/scripts/install.ps1 | iex"
 Write-Host ""
+} catch {
+    Write-Host " ❌ Installation failed: $_" -ForegroundColor Red
+    exit 1
+}
+

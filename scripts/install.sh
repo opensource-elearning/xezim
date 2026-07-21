@@ -115,7 +115,7 @@ install_rust() {
         fi
     else
         warn "Rust not found. Installing via rustup..."
-        download "https://sh.rustup.rs" | sh -s -- -y --quiet 2>/dev/null || {
+        download "https://sh.rustup.rs" | sh -s -- -y --quiet || {
             fail "rustup installation failed. Install manually: https://rustup.rs"
         }
         log "Rust installed."
@@ -147,7 +147,9 @@ clone_repos() {
             git fetch --tags --quiet 2>/dev/null || true
         else
             info "Cloning $repo..."
-            git clone --quiet "$repo_url" "$repo_dir"
+            git clone --quiet --depth 1 "$repo_url" "$repo_dir"
+            # Shallow fetch tags for version detection
+            cd "$repo_dir" && git fetch --depth 1 --tags --quiet 2>/dev/null || true
         fi
         log "$repo ready."
     done
@@ -181,7 +183,8 @@ resolve_tag() {
 
     for repo in "$REPO_CORE" "$REPO_MAIN"; do
         cd "$WORKSPACE/$repo"
-        git stash --quiet 2>/dev/null || true
+        # Stash local changes that would prevent checkout
+        git stash push -m "xezim-installer" 2>/dev/null || true
         if git checkout "$XEZIM_TAG" 2>/dev/null; then
             log "$repo: checked out $XEZIM_TAG"
         else
@@ -193,54 +196,65 @@ resolve_tag() {
     done
 }
 
-# ---- Build ----
+# ---- Build (skips if binary is current) ----
 build_xezim() {
-    info "Building xezim (release mode)..."
-    info "This may take 3-10 minutes on first build."
-    echo ""
-
-    cd "$WORKSPACE/$REPO_MAIN"
-    # FIXME: remove -Awarnings once source warnings are cleaned up
-    RUSTFLAGS="-Awarnings" cargo build --release 2>&1
-
     BINARY="$WORKSPACE/$REPO_MAIN/$BIN_DIR_REL/xezim"
-    if [ ! -f "$BINARY" ]; then
-        fail "Build failed — binary not found at $BINARY."
+    cd "$WORKSPACE/$REPO_MAIN"
+
+	# Skip build if binary exists and source hasn't changed since last build
+    if [ -f "$BINARY" ]; then
+        # Cross-platform: find newer sources (Linux stat -c, macOS stat -f)
+        local newest_src=0
+        case "$(uname -s)" in
+            Darwin) newest_src=$(find src -name '*.rs' -exec stat -f %m {} + 2>/dev/null | sort -rn | head -1 || echo 0) ;;
+            *)      newest_src=$(find src -name '*.rs' -exec stat -c %Y {} + 2>/dev/null | sort -rn | head -1 || echo 0) ;;
+        esac
+        local bin_time
+        case "$(uname -s)" in
+            Darwin) bin_time=$(stat -f %m "$BINARY" 2>/dev/null || echo 0) ;;
+            *)      bin_time=$(stat -c %Y "$BINARY" 2>/dev/null || echo 0) ;;
+        esac
+        [ "$bin_time" -gt "$newest_src" ] 2>/dev/null && { log "Binary is current (tag: $XEZIM_TAG). Skipping build."; return; }
     fi
 
-    local binary_size
-    binary_size=$(du -h "$BINARY" 2>/dev/null | cut -f1 || echo "unknown")
-    log "Build successful! ($binary_size)"
+    info "Building xezim (release mode)..."
+    info "This may take 3-10 minutes."
+    echo ""
+
+    # FIXME: remove -Awarnings once source warnings are cleaned up
+    RUSTFLAGS="-Awarnings" cargo build --release
+
+    [ -f "$BINARY" ] || fail "Build failed — binary not found at $BINARY."
+    log "Build successful! ($(du -h "$BINARY" 2>/dev/null | cut -f1))"
 }
 
-# ---- Install system-wide ----
+# ---- Install system-wide (no sudo required) ----
 install_binary() {
     info "Installing xezim globally..."
 
     BINARY="$WORKSPACE/$REPO_MAIN/$BIN_DIR_REL/xezim"
     INSTALLED=0
 
-    # Strategy 1: Symlink to /usr/local/bin
+    # Strategy 1: Symlink to /usr/local/bin (needs sudo, only tries if passwordless)
     if [ "$INSTALLED" -eq 0 ] && [ -d "/usr/local/bin" ]; then
-        if command -v sudo &>/dev/null; then
+        if command -v sudo &>/dev/null && sudo -n true 2>/dev/null; then
             sudo ln -sf "$BINARY" /usr/local/bin/xezim 2>/dev/null && INSTALLED=1
         elif [ "$(id -u)" = "0" ]; then
             ln -sf "$BINARY" /usr/local/bin/xezim 2>/dev/null && INSTALLED=1
         fi
     fi
 
-    # Strategy 2: Symlink to ~/.local/bin (no sudo needed)
+    # Strategy 2: Symlink to ~/.local/bin (no sudo, works for everyone)
     if [ "$INSTALLED" -eq 0 ]; then
         LOCAL_BIN="${XDG_DATA_HOME:-$HOME/.local}/bin"
         mkdir -p "$LOCAL_BIN"
-        if ln -sf "$BINARY" "$LOCAL_BIN/xezim" 2>/dev/null; then
-            export PATH="$LOCAL_BIN:$PATH"
-            _add_to_shell_config 'export PATH="$PATH:$LOCAL_BIN"'
-            command -v xezim &>/dev/null && INSTALLED=1
-        fi
+        ln -sf "$BINARY" "$LOCAL_BIN/xezim" 2>/dev/null || true
+        export PATH="$LOCAL_BIN:$PATH"
+        _add_to_shell_config 'export PATH="$PATH:$LOCAL_BIN"'
+        command -v xezim &>/dev/null && INSTALLED=1
     fi
 
-    # Strategy 3: Add binary dir to PATH directly
+    # Strategy 3: Add binary dir to PATH directly (works everywhere)
     if [ "$INSTALLED" -eq 0 ]; then
         XEZIM_DIR="$WORKSPACE/$REPO_MAIN/$BIN_DIR_REL"
         export PATH="$XEZIM_DIR:$PATH"
@@ -251,7 +265,7 @@ install_binary() {
     if [ "$INSTALLED" -eq 1 ]; then
         log "xezim is now available in your terminal."
     else
-        warn "Could not install globally. Use xezim from the workspace directory."
+        warn "Using xezim from workspace directory."
         export PATH="$WORKSPACE/$REPO_MAIN/$BIN_DIR_REL:$PATH"
     fi
 }
@@ -317,6 +331,24 @@ echo ""
 install_rust
 clone_repos
 resolve_tag
+
+# Quick exit if xezim already matches the target tag
+if command -v xezim &>/dev/null; then
+    local_ver=$(xezim --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)
+    tag_ver=$(echo "$XEZIM_TAG" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)
+    if [ -n "$local_ver" ] && [ "$local_ver" = "$tag_ver" ]; then
+        echo ""
+        echo -e "${BOLD}🎉  xezim v$local_ver is already installed and up to date!${NC}"
+        echo ""
+        echo "   Workspace: $WORKSPACE"
+        echo ""
+        echo "   Update later to check for new versions:"
+        echo "      curl -fsSL https://raw.githubusercontent.com/aionhw/xezim/main/scripts/install.sh | sh"
+        echo ""
+        exit 0
+    fi
+fi
+
 build_xezim
 install_binary
 smoke_test

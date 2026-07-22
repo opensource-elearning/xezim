@@ -61,25 +61,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Tests the install script end-to-end: clones both repos, builds, and installs xezim
+      # Clone xezim-core as sibling for --local mode
+      - name: Clone xezim-core (sibling)
+        run: git clone --depth 1 https://github.com/opensource-elearning/xezim-core.git ../xezim-core
+
+      # Tests the install script end-to-end using local checkout (--local)
       - name: Run installer
         run: |
-          bash scripts/install.sh
+          bash scripts/install.sh --local
 
       - name: Verify xezim
         run: |
-          ~/xezim-workspace/xezim/target/release/xezim --help
-          ~/xezim-workspace/xezim/target/release/xezim --version
-
-      - name: Run smoke test
-        run: |
-          cd ~/xezim-workspace/xezim
-          ./target/release/xezim --version
+          xezim --help
+          xezim --version
 
       - name: Run test suite
-        run: |
-          cd ~/xezim-workspace/xezim
-          cargo test --release
+        run: cargo test --release
 
   install-windows:
     runs-on: windows-latest
@@ -89,11 +86,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Run installer
-        run: .\scripts\install.ps1
+      # Clone xezim-core as sibling
+      - name: Clone xezim-core (sibling)
+        run: git clone --depth 1 https://github.com/opensource-elearning/xezim-core.git ../xezim-core
+
+      # Build directly (install.ps1 clones from remote main, not PR branch)
+      - name: Build xezim (release)
+        run: cargo build --release
 
       - name: Verify xezim
         run: |
-          $bin = "$env:USERPROFILE\xezim-workspace\xezim\target\release\xezim.exe"
+          $bin = "${{ github.workspace }}\target\release\xezim.exe"
           & $bin --help
           & $bin --version

@@ -4,9 +4,6 @@ on:
   pull_request:
     types: [opened, synchronize, ready_for_review]
     branches: [main]
-    paths-ignore:
-      - '.github/workflows/**'
-      - 'scripts/**'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -49,4 +46,4 @@ jobs:
             | Formatting (cargo fmt) | ${{ steps.fmt.outcome == 'failure' && '❌ Failed' || '✅ Passed' }} |
             | Clippy | ${{ steps.clippy.outcome == 'failure' && '⚠️ Suggestions' || '✅ Passed' }} |
 
-            **To fix:** Comment `/fix-lint` on this PR — it will run `cargo fmt` and push the fixes automatically.
+            **To fix:** Comment `/fix-lint` on this PR — it will run `cargo fmt` and `cargo clippy --fix` and push the fixes automatically.

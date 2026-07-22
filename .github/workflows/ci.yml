@@ -28,34 +28,24 @@ jobs:
         id: fmt
         run: cargo fmt --check
         continue-on-error: true  # let post-comment step run
-      - name: Post auto-fix suggestion
-        if: steps.fmt.outcome == 'failure' && github.event_name == 'pull_request'
-        uses: peter-evans/create-or-update-comment@v5.0.0
-        with:
-          issue-number: ${{ github.event.pull_request.number }}
-          body: |
-            ## ❌ Formatting check failed
-
-            The `cargo fmt` check found code that doesn't follow Rust style conventions.
-
-            **To fix:** Comment `/fix-lint` on this PR — it will run `cargo fmt` and push the fixes automatically.
       # Clippy scoped to xezim only (--no-deps ignores sibling repo warnings)
       - name: Lint
         id: clippy
         run: cargo clippy --no-deps -p xezim
         continue-on-error: true  # FIXME: remove once source warnings are cleaned up
-      # Posts a PR comment when clippy finds issues, so user knows to run /fix-lint
-      - name: Post auto-fix suggestion
-        if: steps.clippy.outcome == 'failure' && github.event_name == 'pull_request'
+      # Posts a consolidated PR comment when lint finds issues
+      - name: Post lint results
+        if: (steps.fmt.outcome == 'failure' || steps.clippy.outcome == 'failure') && github.event_name == 'pull_request'
         uses: peter-evans/create-or-update-comment@v5.0.0
         with:
           issue-number: ${{ github.event.pull_request.number }}
           body: |
-            ## ⚠️ Clippy has suggestions
+            ## 📋 Lint check results
 
-            `cargo clippy` found some code patterns that could be improved.
+            ${{ steps.fmt.outcome == 'failure' && '❌ **Formatting** — `cargo fmt` found code that doesn\'t follow Rust style conventions.' || '' }}
+            ${{ steps.clippy.outcome == 'failure' && '⚠️ **Clippy** — `cargo clippy` found patterns that could be improved.' || '' }}
 
-            **To fix:** Comment `/fix-lint` on this PR — it will run `cargo clippy --fix` and `cargo fmt` automatically.
+            **To fix:** Comment `/fix-lint` on this PR — it will run `cargo fmt` ${{ (steps.fmt.outcome == 'failure' && steps.clippy.outcome == 'failure') && 'and `cargo clippy --fix`' || (steps.clippy.outcome == 'failure' && 'and `cargo clippy --fix`') || '' }} and push automatically.
 
   install:
     runs-on: ubuntu-latest

@@ -84,3 +84,47 @@ endmodule
         "the final-cycle display racing $finish must still print"
     );
 }
+
+#[test]
+fn event_fired_by_resumed_waiter_reaches_peer_same_tick() {
+    // §14.13 regression: a process resumed on a clock edge that fires `-> ev`
+    // must wake a peer parked on `@(ev)` in the SAME time step. The
+    // waiters-first inline execution otherwise swallowed the follow-up
+    // delivery pass, stranding the peer until the next tick (issue #40 TC9).
+    let sim = simulate(
+        r#"
+module tb;
+  logic clk = 0;
+  event ev;
+  time trig_t, samp_t;
+  bit ok = 0;
+  always #5 clk = ~clk;
+  initial begin
+    fork
+      begin
+        @(posedge clk); @(posedge clk);  // 2 cycles
+        trig_t = $time;
+        -> ev;
+      end
+      begin
+        @(posedge clk);                  // 1 cycle, then park on ev
+        @(ev);
+        samp_t = $time;
+        if (samp_t == trig_t) ok = 1;
+      end
+    join
+    #1 $display("OK=%b t=%0t,%0t", ok, trig_t, samp_t);
+    $finish;
+  end
+endmodule
+"#,
+        1000,
+    )
+    .expect("sim");
+    let msgs: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
+    assert!(
+        msgs.iter().any(|m| m == "OK=1 t=15,15"),
+        "event from resumed waiter didn't reach peer same-tick; output: {:?}",
+        msgs
+    );
+}

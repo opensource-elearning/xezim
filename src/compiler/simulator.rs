@@ -22925,25 +22925,42 @@ impl Simulator {
         }
         if waiters_first && !self.event_waiters.is_empty() {
             let _t_w = self.profile_timing.then(std::time::Instant::now);
-            let conts = self.drain_triggered_event_waiters();
-            if let Some(t) = _t_w {
-                self.prof_edge_waiters += t.elapsed().as_nanos() as u64;
-            }
-            for (pid, stmts) in conts {
-                if self.finished {
+            // Drain and run triggered waiters, then RE-DRAIN: a resumed
+            // continuation may `-> ev` or write a signal that triggers ANOTHER
+            // parked waiter in the SAME time step (thread A resumes on a clock
+            // edge and fires `ev`; thread B parked on `@(ev)` must wake now,
+            // not next tick — §14.13 clocking-block synchronization). Running
+            // inline swallows the follow-up pass the old event-queue path gave,
+            // so loop until no waiter fires. Bounded against #0 event ping-pong.
+            let mut settle_guard = 0u32;
+            loop {
+                let conts = self.drain_triggered_event_waiters();
+                if conts.is_empty() {
                     break;
                 }
-                self.run_scheduled_process(pid, &stmts);
-                if !self.is_pid_suspended(pid) {
-                    self.child_finished(pid);
+                for (pid, stmts) in conts {
+                    if self.finished {
+                        break;
+                    }
+                    self.run_scheduled_process(pid, &stmts);
+                    if !self.is_pid_suspended(pid) {
+                        self.child_finished(pid);
+                    }
+                    // A continuation that ended on a break/return leaves its
+                    // control flags set; everything downstream of this edge
+                    // pass (edge blocks' fallback exec, SVA actions) runs
+                    // through exec_statement, which no-ops while they're up.
+                    self.break_flag = false;
+                    self.continue_flag = false;
+                    self.return_flag = false;
                 }
-                // A continuation that ended on a break/return leaves its
-                // control flags set; everything downstream of this edge pass
-                // (edge blocks' fallback exec, SVA actions) runs through
-                // exec_statement, which no-ops while they're up. Clear them.
-                self.break_flag = false;
-                self.continue_flag = false;
-                self.return_flag = false;
+                settle_guard += 1;
+                if self.finished || settle_guard > 10_000 {
+                    break;
+                }
+            }
+            if let Some(t) = _t_w {
+                self.prof_edge_waiters += t.elapsed().as_nanos() as u64;
             }
             // A `$finish` from one of these continuations ends the run AFTER
             // this edge delivery completes: the same edge's always blocks

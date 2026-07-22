@@ -120,9 +120,11 @@ fn print_usage() {
     eprintln!("                     overrides a `timeunit`/`timeprecision` decl or an active `timescale.");
     eprintln!("  --threads <n>    Worker threads (default: 1 = single-thread).");
     eprintln!("                   n>=2 offloads stdout writes to a background thread.");
-    eprintln!("  --cache-dir <dir> Store/reuse content-addressed elaborated designs");
+    eprintln!("  --cache          Enable the EXPERIMENTAL warm-start design cache (off by default;");
+    eprintln!("                   also enabled by XEZIM_ENABLE_CACHE=1 or --cache-dir).");
+    eprintln!("  --cache-dir <dir> Store/reuse content-addressed elaborated designs (implies --cache)");
     eprintln!("                    (default: $XEZIM_CACHE_DIR or $XDG_CACHE_HOME/xezim/designs).");
-    eprintln!("  --no-cache       Disable the automatic elaborated-design cache.");
+    eprintln!("  --no-cache       Force-disable the design cache (default; XEZIM_NO_CACHE=1 too).");
     eprintln!("  -l, --log <file> Redirect all stdout/stderr (including DPI output) to <file>
   -v <file>        Library file: modules compiled only to resolve instantiations
   --primitive-verbose  Show parse/adoption diagnostics for explicit -v files
@@ -775,7 +777,12 @@ fn main() {
     let mut sv2023_mode = true;
     let mut strict_checks = true;
     let mut source_delay_select: u8 = 1;
-    let mut design_cache_enabled = env::var("XEZIM_NO_CACHE").ok().as_deref() != Some("1");
+    // Warm-start design cache is EXPERIMENTAL and OFF by default — every run
+    // does a full cold elaboration. Opt in with `XEZIM_ENABLE_CACHE=1`, the
+    // `--cache` flag, or `--cache-dir <dir>`. `XEZIM_NO_CACHE=1` still force-
+    // disables (kept so existing scripts that set it keep working).
+    let mut design_cache_enabled = env::var("XEZIM_ENABLE_CACHE").ok().as_deref() == Some("1")
+        && env::var("XEZIM_NO_CACHE").ok().as_deref() != Some("1");
     let mut design_cache_dir: Option<PathBuf> = None;
     let mut verbose = false;
     let mut _output_file: Option<String> = None;
@@ -1247,6 +1254,10 @@ fn main() {
             }
             "--no-cache" => {
                 design_cache_enabled = false;
+            }
+            "--cache" => {
+                // Explicit opt-in to the experimental warm-start cache.
+                design_cache_enabled = true;
             }
             "--emit-hypergraph" => {
                 i += 1;

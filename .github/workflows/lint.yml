@@ -1,0 +1,47 @@
+name: Lint
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review]
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: rustfmt, clippy
+      # Clone xezim-core as sibling — required for cargo fmt/clippy to resolve path = "../xezim-core"
+      - name: Clone xezim-core
+        run: git clone --depth 1 https://github.com/opensource-elearning/xezim-core.git ../xezim-core
+      - name: Check formatting
+        id: fmt
+        run: cargo fmt --check
+      # Clippy scoped to xezim only (--no-deps ignores sibling repo warnings)
+      - name: Lint
+        id: clippy
+        if: always()  # run even if fmt failed
+        run: cargo clippy --no-deps -p xezim
+      # Posts a consolidated PR comment when lint finds issues
+      - name: Post lint results
+        if: always() && (steps.fmt.outcome == 'failure' || steps.clippy.outcome == 'failure') && github.event_name == 'pull_request'
+        uses: peter-evans/create-or-update-comment@v5.0.0
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          body: |
+            ## 📋 Lint check results
+
+            ${{ steps.fmt.outcome == 'failure' && '❌ **Formatting** — `cargo fmt` found code that doesn\'t follow Rust style conventions.' || '' }}
+            ${{ steps.clippy.outcome == 'failure' && '⚠️ **Clippy** — `cargo clippy` found patterns that could be improved.' || '' }}
+
+            **To fix:** Comment `/fix-lint` on this PR — it will run `cargo fmt` ${{ (steps.fmt.outcome == 'failure' && steps.clippy.outcome == 'failure') && 'and `cargo clippy --fix`' || (steps.clippy.outcome == 'failure' && 'and `cargo clippy --fix`') || '' }} and push automatically.

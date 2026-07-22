@@ -1,0 +1,36 @@
+name: Install Linux
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review]
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  install-ubuntu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      # Clone xezim-core as sibling for --local mode
+      - name: Clone xezim-core (sibling)
+        run: git clone --depth 1 https://github.com/opensource-elearning/xezim-core.git ../xezim-core
+
+      # Tests the install script end-to-end using local checkout (--local)
+      - name: Run installer
+        run: |
+          bash scripts/install.sh --local
+
+      - name: Verify xezim
+        run: |
+          xezim --help || true
+          xezim -V || true
+
+      - name: Run test suite
+        run: cargo test --release

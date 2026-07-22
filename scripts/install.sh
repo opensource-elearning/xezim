@@ -345,7 +345,7 @@ smoke_test() {
     fi
 
     local version_output
-    version_output=$("$BINARY" --version 2>/dev/null || true)
+    version_output=$("$BINARY" -V 2>/dev/null || true)
     if [ -n "$version_output" ]; then log "$version_output"; fi
 }
 
@@ -369,7 +369,7 @@ resolve_tag
 
 # Quick exit if xezim already matches the target tag
 if command -v xezim &>/dev/null; then
-    local_ver=$(xezim --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)
+    local_ver=$(xezim -V 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)
     tag_ver=$(echo "$XEZIM_TAG" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)
     # Compare only when both sides resolved — avoid false mismatch on "main"
     if [ -n "$local_ver" ] && [ -n "$tag_ver" ] && [ "$local_ver" = "$tag_ver" ]; then

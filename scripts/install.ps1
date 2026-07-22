@@ -249,7 +249,7 @@ foreach ($repo in $Repos) {
 # Quick exit if xezim already matches the target tag
 $alreadyInstalled = $false
 try {
-    $localVer = & xezim --version 2>$null
+    $localVer = & xezim -V 2>$null
     if ($localVer) {
         $tagVer = [regex]::Match($XezimTag, '\d+\.\d+\.\d+').Value
         $localVerNum = [regex]::Match($localVer, '\d+\.\d+\.\d+').Value

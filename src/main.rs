@@ -81,6 +81,7 @@ fn spawn_memory_watchdog() {
                     // SIGKILL self — bypasses panic handlers, no Drop runs,
                     // but ensures the process actually exits even if a thread
                     // is stuck inside a long allocation.
+                    #[cfg(unix)]
                     unsafe {
                         libc::kill(pid as i32, libc::SIGKILL);
                     }

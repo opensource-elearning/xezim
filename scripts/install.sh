@@ -371,7 +371,8 @@ resolve_tag
 if command -v xezim &>/dev/null; then
     local_ver=$(xezim --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)
     tag_ver=$(echo "$XEZIM_TAG" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)
-    if [ -n "$local_ver" ] && [ "$local_ver" = "$tag_ver" ]; then
+    # Compare only when both sides resolved — avoid false mismatch on "main"
+    if [ -n "$local_ver" ] && [ -n "$tag_ver" ] && [ "$local_ver" = "$tag_ver" ]; then
         echo ""
         echo -e "${BOLD}🎉  xezim v$local_ver is already installed and up to date!${NC}"
         echo ""

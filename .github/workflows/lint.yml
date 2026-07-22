@@ -4,6 +4,9 @@ on:
   pull_request:
     types: [opened, synchronize, ready_for_review]
     branches: [main]
+    paths-ignore:
+      - '.github/workflows/**'
+      - 'scripts/**'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

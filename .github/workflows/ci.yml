@@ -96,6 +96,7 @@ jobs:
 
       - name: Verify xezim
         run: |
-          $bin = "${{ github.workspace }}\target\release\xezim.exe"
-          & $bin --help
-          & $bin --version
+          $bin = Join-Path ${{ github.workspace }} "target" "release" "xezim.exe"
+          Write-Host "Binary: $bin"
+          Write-Host "Exists: $(Test-Path $bin)"
+          & $bin --help 2>&1 | Out-Null

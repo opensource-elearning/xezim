@@ -346,7 +346,7 @@ smoke_test() {
 
     local version_output
     version_output=$("$BINARY" --version 2>/dev/null || true)
-    [ -n "$version_output" ] && log "$version_output"
+    if [ -n "$version_output" ]; then log "$version_output"; fi
 }
 
 # =============================================================================

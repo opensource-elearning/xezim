@@ -32,16 +32,18 @@ jobs:
         id: clippy
         if: always()  # run even if fmt failed
         run: cargo clippy --no-deps -p xezim
-      # Posts a consolidated PR comment when lint finds issues
+      # Build dynamic lint comment body and post it
       - name: Post lint results
         if: always() && (steps.fmt.outcome == 'failure' || steps.clippy.outcome == 'failure') && github.event_name == 'pull_request'
         uses: peter-evans/create-or-update-comment@v5.0.0
         with:
           issue-number: ${{ github.event.pull_request.number }}
           body: |
-            ## 📋 Lint check results
+            ## Lint check results
 
-            ${{ steps.fmt.outcome == 'failure' && '❌ **Formatting** — `cargo fmt` found code that doesn\'t follow Rust style conventions.' || '' }}
-            ${{ steps.clippy.outcome == 'failure' && '⚠️ **Clippy** — `cargo clippy` found patterns that could be improved.' || '' }}
+            | Check | Status |
+            |-------|--------|
+            | Formatting (cargo fmt) | ${{ steps.fmt.outcome == 'failure' && '❌ Failed' || '✅ Passed' }} |
+            | Clippy | ${{ steps.clippy.outcome == 'failure' && '⚠️ Suggestions' || '✅ Passed' }} |
 
-            **To fix:** Comment `/fix-lint` on this PR — it will run `cargo fmt` ${{ (steps.fmt.outcome == 'failure' && steps.clippy.outcome == 'failure') && 'and `cargo clippy --fix`' || (steps.clippy.outcome == 'failure' && 'and `cargo clippy --fix`') || '' }} and push automatically.
+            **To fix:** Comment `/fix-lint` on this PR — it will run `cargo fmt` and push the fixes automatically.

@@ -6,10 +6,10 @@
     xezim (SystemVerilog simulator) from source.
 
     Usage (latest):
-        irm https://raw.githubusercontent.com/aionhw/xezim/main/scripts/install.ps1 | iex
+        irm https://raw.githubusercontent.com/opensource-elearning/xezim/main/scripts/install.ps1 | iex
 
     Usage (specific tag):
-        $env:XEZIM_TAG='v0.9.6'; irm https://raw.githubusercontent.com/aionhw/xezim/main/scripts/install.ps1 | iex
+        $env:XEZIM_TAG='v0.9.6'; irm https://raw.githubusercontent.com/opensource-elearning/xezim/main/scripts/install.ps1 | iex
 #>
 
 $ErrorActionPreference = 'Stop'
@@ -19,7 +19,7 @@ $ErrorActionPreference = 'Stop'
 
 # ---- Config ----
 $Workspace = Join-Path $HOME "xezim-workspace"
-$GitHubOrg = "aionhw"
+$GitHubOrg = "opensource-elearning"
 $Repos = @("xezim-core", "xezim")
 
 # ---- Helper functions ----
@@ -233,7 +233,7 @@ foreach ($repo in $Repos) {
 
         & git checkout $XezimTag 2>$null
         if ($LASTEXITCODE -eq 0) {
-            Write-Log "$repo: checked out $XezimTag"
+            Write-Log "${repo}: checked out $XezimTag"
         } else {
             if ($XezimTagExplicit) {
                 Write-Fail "Tag/branch '$XezimTag' not found in $repo. Please verify the tag name and try again."
@@ -260,7 +260,7 @@ try {
             Write-Host "   Workspace: $Workspace"
             Write-Host ""
             Write-Host "   Update later to check for new versions:"
-            Write-Host "      irm https://raw.githubusercontent.com/aionhw/xezim/main/scripts/install.ps1 | iex"
+            Write-Host "      irm https://raw.githubusercontent.com/opensource-elearning/xezim/main/scripts/install.ps1 | iex"
             Write-Host ""
             exit 0
         }
@@ -365,8 +365,8 @@ Write-Host "      cd $mainDir"
 Write-Host "      .\target\release\xezim examples\full_adder.sv examples\tb_adder.sv"
 Write-Host ""
 Write-Host "   Update later:"
-Write-Host "      irm https://raw.githubusercontent.com/aionhw/xezim/main/scripts/install.ps1 | iex"
-Write-Host "      `$env:XEZIM_TAG='v0.9.6'; irm https://raw.githubusercontent.com/aionhw/xezim/main/scripts/install.ps1 | iex"
+Write-Host "      irm https://raw.githubusercontent.com/opensource-elearning/xezim/main/scripts/install.ps1 | iex"
+Write-Host "      `$env:XEZIM_TAG='v0.9.6'; irm https://raw.githubusercontent.com/opensource-elearning/xezim/main/scripts/install.ps1 | iex"
 Write-Host ""
 } catch {
     Write-Host " ❌ Installation failed: $_" -ForegroundColor Red

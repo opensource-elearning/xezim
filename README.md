@@ -16,24 +16,24 @@ The simulator parses SystemVerilog source code, builds an internal representatio
 
 Install the latest release:
 ```bash
-curl -fsSL https://raw.githubusercontent.com/aionhw/xezim/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/opensource-elearning/xezim/main/scripts/install.sh | sh
 ```
 
 Install a specific version (one-time):
 ```bash
-XEZIM_TAG=v0.9.6 curl -fsSL https://raw.githubusercontent.com/aionhw/xezim/main/scripts/install.sh | sh
+XEZIM_TAG=v0.9.6 curl -fsSL https://raw.githubusercontent.com/opensource-elearning/xezim/main/scripts/install.sh | sh
 ```
 
 ## Windows (PowerShell)
 
 Install the latest release:
 ```powershell
-irm https://raw.githubusercontent.com/aionhw/xezim/main/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/opensource-elearning/xezim/main/scripts/install.ps1 | iex
 ```
 
 Install a specific version (one-time):
 ```powershell
-$env:XEZIM_TAG='v0.9.6'; irm https://raw.githubusercontent.com/aionhw/xezim/main/scripts/install.ps1 | iex
+$env:XEZIM_TAG='v0.9.6'; irm https://raw.githubusercontent.com/opensource-elearning/xezim/main/scripts/install.ps1 | iex
 ```
 
 > The installers auto-detect the latest stable release from git tags. Set `XEZIM_TAG` to pin any specific version. See the [Build](#build) section below for manual installation steps.

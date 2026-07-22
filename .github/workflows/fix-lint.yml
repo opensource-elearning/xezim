@@ -25,7 +25,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Clone xezim-core (sibling dependency)
-        run: git clone --depth 1 https://github.com/aionhw/xezim-core.git ../xezim-core
+        run: git clone --depth 1 https://github.com/opensource-elearning/xezim-core.git ../xezim-core
 
       - name: Auto-fix formatting
         run: cargo fmt

@@ -3,8 +3,8 @@
 #  xezim — Production-grade installer for Linux & macOS
 #
 #  Usage:
-#    curl -fsSL https://raw.githubusercontent.com/aionhw/xezim/main/scripts/install.sh | sh
-#    XEZIM_TAG=v0.9.6 curl -fsSL https://raw.githubusercontent.com/aionhw/xezim/main/scripts/install.sh | sh
+#    curl -fsSL https://raw.githubusercontent.com/opensource-elearning/xezim/main/scripts/install.sh | sh
+#    XEZIM_TAG=v0.9.6 curl -fsSL https://raw.githubusercontent.com/opensource-elearning/xezim/main/scripts/install.sh | sh
 #
 #  What this does:
 #    1. Checks prerequisites (git, curl/wget)
@@ -29,7 +29,7 @@ done
 
 # ---- Config ----
 WORKSPACE="$HOME/xezim-workspace"
-GITHUB_ORG="aionhw"
+GITHUB_ORG="opensource-elearning"
 REPO_CORE="xezim-core"
 REPO_MAIN="xezim"
 BIN_DIR_REL="target/release"
@@ -104,7 +104,7 @@ detect_os() {
     case "$(uname -s)" in
         Linux*)  echo "linux" ;;
         Darwin*) echo "macos" ;;
-        CYGWIN*|MINGW*|MSYS*) fail "Windows detected. Please use the PowerShell installer: irm https://raw.githubusercontent.com/aionhw/xezim/main/scripts/install.ps1 | iex" ;;
+        CYGWIN*|MINGW*|MSYS*) fail "Windows detected. Please use the PowerShell installer: irm https://raw.githubusercontent.com/opensource-elearning/xezim/main/scripts/install.ps1 | iex" ;;
         *)       fail "Unsupported OS: $(uname -s). This script supports Linux and macOS only." ;;
     esac
 }
@@ -378,7 +378,7 @@ if command -v xezim &>/dev/null; then
         echo "   Workspace: $WORKSPACE"
         echo ""
         echo "   Update later to check for new versions:"
-        echo "      curl -fsSL https://raw.githubusercontent.com/aionhw/xezim/main/scripts/install.sh | sh"
+        echo "      curl -fsSL https://raw.githubusercontent.com/opensource-elearning/xezim/main/scripts/install.sh | sh"
         echo ""
         exit 0
     fi
@@ -402,5 +402,5 @@ echo "   Example:"
 echo "      cd $WORKSPACE/$REPO_MAIN && xezim examples/full_adder.sv examples/tb_adder.sv"
 echo ""
 echo "   Update later:"
-echo "      curl -fsSL https://raw.githubusercontent.com/aionhw/xezim/main/scripts/install.sh | sh"
+echo "      curl -fsSL https://raw.githubusercontent.com/opensource-elearning/xezim/main/scripts/install.sh | sh"
 echo ""

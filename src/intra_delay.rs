@@ -131,9 +131,7 @@ fn extract_delay_and_rhs(b: &[u8], i: usize) -> Option<(usize, usize)> {
     } else {
         // `#5`, `#1.5ns`, `#delay_id` — one literal/identifier token.
         let mut k = j;
-        while k < b.len()
-            && (b[k].is_ascii_alphanumeric() || matches!(b[k], b'_' | b'$' | b'.'))
-        {
+        while k < b.len() && (b[k].is_ascii_alphanumeric() || matches!(b[k], b'_' | b'$' | b'.')) {
             k += 1;
         }
         if k == j {

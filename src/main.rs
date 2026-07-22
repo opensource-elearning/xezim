@@ -9,7 +9,10 @@ fn default_design_cache_dir() -> PathBuf {
         return PathBuf::from(path).join("xezim").join("designs");
     }
     if let Some(home) = env::var_os("HOME").filter(|p| !p.is_empty()) {
-        return PathBuf::from(home).join(".cache").join("xezim").join("designs");
+        return PathBuf::from(home)
+            .join(".cache")
+            .join("xezim")
+            .join("designs");
     }
     PathBuf::from(".xezim-cache")
 }
@@ -23,10 +26,14 @@ fn design_dependency_files(
     let default_exts = ["v".to_string(), "sv".to_string(), "V".to_string()];
     let exts = lib_exts.unwrap_or(&default_exts);
     for dir in lib_dirs {
-        let Ok(entries) = std::fs::read_dir(dir) else { continue };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let path = entry.path();
-            let Some(ext) = path.extension().and_then(|s| s.to_str()) else { continue };
+            let Some(ext) = path.extension().and_then(|s| s.to_str()) else {
+                continue;
+            };
             if path.is_file() && exts.iter().any(|candidate| candidate == ext) {
                 files.push(path);
             }
@@ -116,17 +123,28 @@ fn print_usage() {
     eprintln!("  --dpi-lib <so>   Load a DPI shared library (.so/.dylib/.dll)");
     eprintln!("  --vpi-lib <so>   Load a VPI module and run its vlog_startup_routines (-m)");
     eprintln!("  --module-timescale <unit>/<prec>            Timescale for every module with no");
-    eprintln!("                     [mod1,mod2=]<unit>/<prec>   explicit source-level timescale (the");
-    eprintln!("                     named form limits it to the listed modules). Repeatable. Never");
-    eprintln!("                     overrides a `timeunit`/`timeprecision` decl or an active `timescale.");
+    eprintln!(
+        "                     [mod1,mod2=]<unit>/<prec>   explicit source-level timescale (the"
+    );
+    eprintln!(
+        "                     named form limits it to the listed modules). Repeatable. Never"
+    );
+    eprintln!(
+        "                     overrides a `timeunit`/`timeprecision` decl or an active `timescale."
+    );
     eprintln!("  --threads <n>    Worker threads (default: 1 = single-thread).");
     eprintln!("                   n>=2 offloads stdout writes to a background thread.");
-    eprintln!("  --cache          Enable the EXPERIMENTAL warm-start design cache (off by default;");
+    eprintln!(
+        "  --cache          Enable the EXPERIMENTAL warm-start design cache (off by default;"
+    );
     eprintln!("                   also enabled by XEZIM_ENABLE_CACHE=1 or --cache-dir).");
-    eprintln!("  --cache-dir <dir> Store/reuse content-addressed elaborated designs (implies --cache)");
+    eprintln!(
+        "  --cache-dir <dir> Store/reuse content-addressed elaborated designs (implies --cache)"
+    );
     eprintln!("                    (default: $XEZIM_CACHE_DIR or $XDG_CACHE_HOME/xezim/designs).");
     eprintln!("  --no-cache       Force-disable the design cache (default; XEZIM_NO_CACHE=1 too).");
-    eprintln!("  -l, --log <file> Redirect all stdout/stderr (including DPI output) to <file>
+    eprintln!(
+        "  -l, --log <file> Redirect all stdout/stderr (including DPI output) to <file>
   -v <file>        Library file: modules compiled only to resolve instantiations
   --primitive-verbose  Show parse/adoption diagnostics for explicit -v files
   -y <dir>         Library directory: <module>.<ext> loaded on demand
@@ -135,7 +153,8 @@ fn print_usage() {
   +delay_mode_zero Force all structural (specify/SDF) delays to 0 (fast functional GLS)
   +delay_mode_unit Collapse every nonzero structural delay to 1 time unit
   +mindelays/+typdelays/+maxdelays  min:typ:max selection (specify + SDF; default typ)
-  +notimingcheck   Accepted no-op (specify timing checks are not modeled)");
+  +notimingcheck   Accepted no-op (specify timing checks are not modeled)"
+    );
     eprintln!("  --xtrace <file>  Emit an XTrace dump to <file> (compliance Level 0:");
     eprintln!("                   dictionary + time + signal deltas + event records).");
     eprintln!("                   A '.zst'/'.zstd' suffix zstd-compresses the stream.");
@@ -182,7 +201,12 @@ fn parse_time_literal(s: &str) -> Result<i32, String> {
         "1" => 0,
         "10" => 1,
         "100" => 2,
-        other => return Err(format!("invalid time mantissa '{}' (must be 1, 10, or 100)", other)),
+        other => {
+            return Err(format!(
+                "invalid time mantissa '{}' (must be 1, 10, or 100)",
+                other
+            ))
+        }
     };
     let unit_exp = match unit.trim() {
         "s" => 0,
@@ -199,7 +223,10 @@ fn parse_time_literal(s: &str) -> Result<i32, String> {
 /// Parse a `<unit>/<precision>` timescale value, checking precision <= unit.
 fn parse_timescale_value(d: &str) -> Result<(i32, i32), String> {
     let (u, p) = d.split_once('/').ok_or_else(|| {
-        format!("invalid --module-timescale value '{}' (expected <unit>/<precision>)", d)
+        format!(
+            "invalid --module-timescale value '{}' (expected <unit>/<precision>)",
+            d
+        )
     })?;
     let ue = parse_time_literal(u)?;
     let pe = parse_time_literal(p)?;
@@ -241,10 +268,12 @@ fn parse_max_time(raw: &str) -> Result<u64, String> {
     } else {
         (lower.as_str(), 1.0)
     };
-    let num: f64 = num_str
-        .trim()
-        .parse()
-        .map_err(|_| format!("invalid --max-time value '{}' (expected <n>[ps|ns|us|ms|s])", raw))?;
+    let num: f64 = num_str.trim().parse().map_err(|_| {
+        format!(
+            "invalid --max-time value '{}' (expected <n>[ps|ns|us|ms|s])",
+            raw
+        )
+    })?;
     if !(num > 0.0) {
         return Err(format!("--max-time must be positive, got '{}'", raw));
     }
@@ -349,9 +378,16 @@ fn handle_gls_flag(flag: &str) -> bool {
         // present — recognized, no behavior change.
         "+delay_mode_path" | "-delay_mode_path" => {}
         // Timing-check control: nothing to disable (checks aren't modeled).
-        "+no_notifier" | "+no_tchk_msg" | "+neg_tchk" | "+nonegdelay"
-        | "+old_ntc" | "+ntc_warn" | "+nosdferror" | "+nocelldefinepragma"
-        | "+sdf_verbose" | "+sdfverbose" => {}
+        "+no_notifier"
+        | "+no_tchk_msg"
+        | "+neg_tchk"
+        | "+nonegdelay"
+        | "+old_ntc"
+        | "+ntc_warn"
+        | "+nosdferror"
+        | "+nocelldefinepragma"
+        | "+sdf_verbose"
+        | "+sdfverbose" => {}
         // Behavior xezim cannot model — warn once, don't pretend.
         "+delay_mode_distributed" | "-delay_mode_distributed" => {
             eprintln!(
@@ -361,8 +397,12 @@ fn handle_gls_flag(flag: &str) -> bool {
                 flag
             );
         }
-        "+pulse_e" | "+pulse_r" | "+pulse_int_e" | "+pulse_int_r"
-        | "+transport_int_delays" | "+transport_path_delays"
+        "+pulse_e"
+        | "+pulse_r"
+        | "+pulse_int_e"
+        | "+pulse_int_r"
+        | "+transport_int_delays"
+        | "+transport_path_delays"
         | "+multisource_int_delays" => {
             eprintln!(
                 "Warning: {} (pulse/transport/multisource delay control) is not modeled by xezim; \
@@ -1455,7 +1495,9 @@ suppressed but the explicit SDF annotation still applies."
     }
 
     if design_cache_enabled && mode == Mode::Simulate {
-        let directory = design_cache_dir.clone().unwrap_or_else(default_design_cache_dir);
+        let directory = design_cache_dir
+            .clone()
+            .unwrap_or_else(default_design_cache_dir);
         let dependency_files = design_dependency_files(&lib_files, &lib_dirs, lib_exts.as_deref());
         let semantic_salt = format!(
             "sv2023={};strict={};delay_select={};module_timescale={:?};lib_dirs={:?};lib_files={:?};lib_exts={:?};nospecify={}",

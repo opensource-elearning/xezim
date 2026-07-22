@@ -72,8 +72,14 @@ module top;
 endmodule
 "#;
     let out = run_xezim(src, "modlevel");
-    assert!(out.contains("PASS static"), "static typedef dispatch failed:\n{out}");
-    assert!(out.contains("PASS virtual"), "virtual typedef dispatch failed:\n{out}");
+    assert!(
+        out.contains("PASS static"),
+        "static typedef dispatch failed:\n{out}"
+    );
+    assert!(
+        out.contains("PASS virtual"),
+        "virtual typedef dispatch failed:\n{out}"
+    );
     assert!(!out.contains("FAIL"), "unexpected FAIL:\n{out}");
 }
 

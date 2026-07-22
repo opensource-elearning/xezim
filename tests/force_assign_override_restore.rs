@@ -10,7 +10,11 @@
 use xezim::simulate;
 
 fn output_of(sim: &xezim::compiler::Simulator) -> String {
-    sim.output.iter().map(|o| o.message.as_str()).collect::<Vec<_>>().join("\n")
+    sim.output
+        .iter()
+        .map(|o| o.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// `force` overrides a blocking-assign flop, and `release` lets it resume.
@@ -32,8 +36,16 @@ module top;
 endmodule
 "#;
     let out = output_of(&simulate(SRC, 100).expect("sim"));
-    assert!(out.contains("F 1"), "force must override the flop:\n{}", out);
-    assert!(out.contains("R 0"), "release must let the flop resume:\n{}", out);
+    assert!(
+        out.contains("F 1"),
+        "force must override the flop:\n{}",
+        out
+    );
+    assert!(
+        out.contains("R 0"),
+        "release must let the flop resume:\n{}",
+        out
+    );
 }
 
 /// Same for a non-blocking flop and `assign`/`deassign`.
@@ -55,6 +67,14 @@ module top;
 endmodule
 "#;
     let out = output_of(&simulate(SRC, 100).expect("sim"));
-    assert!(out.contains("A 1"), "assign must override the flop:\n{}", out);
-    assert!(out.contains("D 0"), "deassign must let the flop resume:\n{}", out);
+    assert!(
+        out.contains("A 1"),
+        "assign must override the flop:\n{}",
+        out
+    );
+    assert!(
+        out.contains("D 0"),
+        "deassign must let the flop resume:\n{}",
+        out
+    );
 }

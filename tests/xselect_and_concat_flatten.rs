@@ -49,10 +49,26 @@ module tb;
 endmodule
 "#;
     let sim = simulate(SRC, 100).expect("simulate failed");
-    assert_eq!(flag(&sim, "pass_diff"), 1, "x-select must merge per bit: 1100/1010 -> 1xx0");
-    assert_eq!(flag(&sim, "pass_same"), 1, "identical operands must merge with no x bits");
-    assert_eq!(flag(&sim, "pass_z"), 1, "z select must merge like x: 1110/1010 -> 1x10");
-    assert_eq!(flag(&sim, "pass_zz"), 1, "z/z bits must merge to x (Table 11-21)");
+    assert_eq!(
+        flag(&sim, "pass_diff"),
+        1,
+        "x-select must merge per bit: 1100/1010 -> 1xx0"
+    );
+    assert_eq!(
+        flag(&sim, "pass_same"),
+        1,
+        "identical operands must merge with no x bits"
+    );
+    assert_eq!(
+        flag(&sim, "pass_z"),
+        1,
+        "z select must merge like x: 1110/1010 -> 1x10"
+    );
+    assert_eq!(
+        flag(&sim, "pass_zz"),
+        1,
+        "z/z bits must merge to x (Table 11-21)"
+    );
 }
 
 /// §10.10.1: nested plain braces in an unpacked-array concatenation flatten.
@@ -81,9 +97,21 @@ module tb;
 endmodule
 "#;
     let sim = simulate(SRC, 100).expect("simulate failed");
-    assert_eq!(flag(&sim, "pass_a"), 1, "a = {{1, {{2, 3}}}} must flatten to {{1, 2, 3}}");
-    assert_eq!(flag(&sim, "pass_d"), 1, "nested braces must flatten recursively");
-    assert_eq!(flag(&sim, "pass_b"), 1, "'{{...}} sub-array patterns must not flatten");
+    assert_eq!(
+        flag(&sim, "pass_a"),
+        1,
+        "a = {{1, {{2, 3}}}} must flatten to {{1, 2, 3}}"
+    );
+    assert_eq!(
+        flag(&sim, "pass_d"),
+        1,
+        "nested braces must flatten recursively"
+    );
+    assert_eq!(
+        flag(&sim, "pass_b"),
+        1,
+        "'{{...}} sub-array patterns must not flatten"
+    );
 }
 
 /// §10.10.1: a queue/array operand inside an unpacked concatenation splices
@@ -110,6 +138,14 @@ module tb;
 endmodule
 "#;
     let sim = simulate(SRC, 100).expect("simulate failed");
-    assert_eq!(flag(&sim, "pass_q2"), 1, "queue operand in concat must splice its elements");
-    assert_eq!(flag(&sim, "pass_q3"), 1, "queue splice must survive nested-brace flattening");
+    assert_eq!(
+        flag(&sim, "pass_q2"),
+        1,
+        "queue operand in concat must splice its elements"
+    );
+    assert_eq!(
+        flag(&sim, "pass_q3"),
+        1,
+        "queue splice must survive nested-brace flattening"
+    );
 }

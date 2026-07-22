@@ -103,7 +103,11 @@ endmodule
         u(&sim, "flag")
     };
     // Plain contradictions across widths / signedness: all must be 0.
-    assert_eq!(unsat("logic [31:0] v;", "v >= 100; v <= 5;"), 0, "32-bit UNSAT");
+    assert_eq!(
+        unsat("logic [31:0] v;", "v >= 100; v <= 5;"),
+        0,
+        "32-bit UNSAT"
+    );
     assert_eq!(unsat("int v;", "v >= 100; v <= 5;"), 0, "signed UNSAT");
     assert_eq!(
         unsat("logic [63:0] v;", "v >= 64'h8000_0000_0000_0000; v <= 5;"),
@@ -111,8 +115,16 @@ endmodule
         "64-bit UNSAT must not report false success"
     );
     // A satisfiable set must still report 1.
-    assert_eq!(unsat("logic [31:0] v;", "v >= 100; v <= 200;"), 1, "SAT must be 1");
-    assert_eq!(unsat("logic [31:0] v;", "v >= 4294967290;"), 1, "SAT high-band must be 1");
+    assert_eq!(
+        unsat("logic [31:0] v;", "v >= 100; v <= 200;"),
+        1,
+        "SAT must be 1"
+    );
+    assert_eq!(
+        unsat("logic [31:0] v;", "v >= 4294967290;"),
+        1,
+        "SAT high-band must be 1"
+    );
 }
 
 /// The narrow-band case in isolation, across several seeds: every solve must

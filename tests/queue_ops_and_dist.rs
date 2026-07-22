@@ -143,6 +143,10 @@ fn whole_queue_assignment_deep_copies_struct_elements() {
 #[test]
 fn dist_buckets_are_as_wide_as_their_bounds() {
     let sim = simulate(DIST64, 100).expect("simulate failed");
-    assert_eq!(u(&sim, "out_of_range"), 0, "dist truncated a 64-bit range to 32 bits");
+    assert_eq!(
+        u(&sim, "out_of_range"),
+        0,
+        "dist truncated a 64-bit range to 32 bits"
+    );
     assert_eq!(u(&sim, "in_range"), 300);
 }

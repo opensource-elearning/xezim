@@ -90,7 +90,11 @@ fn every_pattern_form_works_on_a_local_array() {
     let sim = simulate(LOCAL_ARRAYS, 100).expect("simulate failed");
     assert_eq!(u(&sim, "rep2"), 7, "replication");
     assert_eq!(u(&sim, "dflt3"), 9, "default:");
-    assert_eq!(u(&sim, "nested"), 3, "a local 2-D array was registered as 1-D");
+    assert_eq!(
+        u(&sim, "nested"),
+        3,
+        "a local 2-D array was registered as 1-D"
+    );
     assert_eq!(u(&sim, "sarr_a"), 2, "an unpacked-struct element read 0");
 }
 

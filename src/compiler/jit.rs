@@ -105,11 +105,7 @@ pub unsafe extern "C" fn xezim_jit_schedule_nba(sim: *mut u8, id: u32, val_bits:
 /// (the bulk of NBA cost — HashMap insert + Vec push — remains in
 /// Tier B/C territory).
 #[no_mangle]
-pub unsafe extern "C" fn xezim_jit_schedule_nba_fast(
-    sim: *mut u8,
-    id: u32,
-    val_bits: u64,
-) {
+pub unsafe extern "C" fn xezim_jit_schedule_nba_fast(sim: *mut u8, id: u32, val_bits: u64) {
     let sim = &mut *(sim as *mut crate::compiler::simulator::Simulator);
     sim.jit_schedule_nba_fast(id as usize, val_bits);
 }
@@ -155,7 +151,11 @@ pub unsafe extern "C" fn xezim_jit_blocking_assign_range_dyn(
 
 /// Load an array element value as u64.
 #[no_mangle]
-pub unsafe extern "C" fn xezim_jit_load_array_elem(sim: *mut u8, name_ptr: *const u8, idx: i64) -> u64 {
+pub unsafe extern "C" fn xezim_jit_load_array_elem(
+    sim: *mut u8,
+    name_ptr: *const u8,
+    idx: i64,
+) -> u64 {
     let sim = &mut *(sim as *mut crate::compiler::simulator::Simulator);
     let name = std::ffi::CStr::from_ptr(name_ptr as *const i8).to_string_lossy();
     sim.jit_load_array_elem(&name, idx)
@@ -223,10 +223,10 @@ mod stub {
 mod enabled {
     use super::super::bytecode::Insn;
     use super::{
-        xezim_jit_blocking_assign_range_dyn, xezim_jit_inputs_have_xz,
-        xezim_jit_load_array_elem, xezim_jit_load_signal, xezim_jit_schedule_nba,
-        xezim_jit_schedule_nba_bit_dyn, xezim_jit_schedule_nba_fast,
-        xezim_jit_schedule_nba_range_dyn, xezim_jit_store_signal, JitFn,
+        xezim_jit_blocking_assign_range_dyn, xezim_jit_inputs_have_xz, xezim_jit_load_array_elem,
+        xezim_jit_load_signal, xezim_jit_schedule_nba, xezim_jit_schedule_nba_bit_dyn,
+        xezim_jit_schedule_nba_fast, xezim_jit_schedule_nba_range_dyn, xezim_jit_store_signal,
+        JitFn,
     };
     use cranelift::codegen::ir::{FuncRef, StackSlot};
     use cranelift::prelude::*;
@@ -411,7 +411,8 @@ mod enabled {
                     }
                 }
             }
-            self.codegen_block(insns, num_regs, &input_ids, xz_ptr, xz_len).ok()
+            self.codegen_block(insns, num_regs, &input_ids, xz_ptr, xz_len)
+                .ok()
         }
 
         fn codegen_block(
@@ -504,7 +505,11 @@ mod enabled {
                 .map_err(|_| ())?;
             let nba_bit_id: FuncId = self
                 .module
-                .declare_function("xezim_jit_schedule_nba_bit_dyn", Linkage::Import, &nba_bit_sig)
+                .declare_function(
+                    "xezim_jit_schedule_nba_bit_dyn",
+                    Linkage::Import,
+                    &nba_bit_sig,
+                )
                 .map_err(|_| ())?;
             let blk_range_id: FuncId = self
                 .module
@@ -634,15 +639,15 @@ mod enabled {
                         // resized). Matches the bridge fn's `continue`.
                         continue;
                     }
-                    let byte = builder.ins().load(
-                        types::I8,
-                        MemFlags::trusted(),
-                        xz_base,
-                        id as i32,
-                    );
+                    let byte =
+                        builder
+                            .ins()
+                            .load(types::I8, MemFlags::trusted(), xz_base, id as i32);
                     acc = builder.ins().bor(acc, byte);
                 }
-                builder.ins().brif(acc, fallback_block, &[], entry_block, &[prelude_sim_ptr]);
+                builder
+                    .ins()
+                    .brif(acc, fallback_block, &[], entry_block, &[prelude_sim_ptr]);
             } else {
                 // Materialise input_ids as a fixed stack-slot u32 array,
                 // then call xezim_jit_inputs_have_xz(sim, ptr, n).
@@ -761,23 +766,19 @@ mod enabled {
                     // queue[len], bump len.  No FFI call.  Saves ~25-30 ns
                     // per NBA vs the Tier A fast bridge.
                     Insn::NbaAssign(sig_id, val_reg, width)
-                        if signal_widths
-                            .get(*sig_id)
-                            .map_or(false, |&w| w == *width)
+                        if signal_widths.get(*sig_id).map_or(false, |&w| w == *width)
                             && nba_side_queue.is_some() =>
                     {
                         let (base_ptr, len_ptr, _cap) = nba_side_queue.unwrap();
-                        let v = builder
-                            .ins()
-                            .stack_load(types::I64, reg_slots[*val_reg as usize], 0);
+                        let v =
+                            builder
+                                .ins()
+                                .stack_load(types::I64, reg_slots[*val_reg as usize], 0);
                         // Load current length (u32) from *len_ptr.
                         let len_addr = builder.ins().iconst(pointer_type, len_ptr as i64);
-                        let len = builder.ins().load(
-                            types::I32,
-                            MemFlags::trusted(),
-                            len_addr,
-                            0,
-                        );
+                        let len = builder
+                            .ins()
+                            .load(types::I32, MemFlags::trusted(), len_addr, 0);
                         // Compute slot address: base + len * 16 (sizeof JitNbaSideEntry).
                         let base = builder.ins().iconst(pointer_type, base_ptr as i64);
                         let len64 = builder.ins().uextend(types::I64, len);
@@ -786,14 +787,10 @@ mod enabled {
                         let slot = builder.ins().iadd(base, offset);
                         // Write signal_id (u32) at offset 0.
                         let sid = builder.ins().iconst(types::I32, *sig_id as i64);
-                        builder
-                            .ins()
-                            .store(MemFlags::trusted(), sid, slot, 0);
+                        builder.ins().store(MemFlags::trusted(), sid, slot, 0);
                         // Write val_bits (u64) at offset 8 (skip the 4-byte
                         // pad after signal_id).
-                        builder
-                            .ins()
-                            .store(MemFlags::trusted(), v, slot, 8);
+                        builder.ins().store(MemFlags::trusted(), v, slot, 8);
                         // Increment len.
                         let one = builder.ins().iconst(types::I32, 1);
                         let new_len = builder.ins().iadd(len, one);
@@ -807,13 +804,12 @@ mod enabled {
                     // width).  Otherwise fall through to the existing
                     // 4-arg bridge below.
                     Insn::NbaAssign(sig_id, val_reg, width)
-                        if signal_widths
-                            .get(*sig_id)
-                            .map_or(false, |&w| w == *width) =>
+                        if signal_widths.get(*sig_id).map_or(false, |&w| w == *width) =>
                     {
-                        let v = builder
-                            .ins()
-                            .stack_load(types::I64, reg_slots[*val_reg as usize], 0);
+                        let v =
+                            builder
+                                .ins()
+                                .stack_load(types::I64, reg_slots[*val_reg as usize], 0);
                         let id = builder.ins().iconst(types::I32, *sig_id as i64);
                         builder.ins().call(nba_fast_ref, &[sim_ptr, id, v]);
                     }
@@ -824,19 +820,15 @@ mod enabled {
                     // Falls through to the FFI path when storage is
                     // unset (XEZIM_INLINE_BITS=0) or sid out of range.
                     Insn::LoadSignal(dest, sig_id) | Insn::LoadSignalSigned(dest, sig_id)
-                        if inline_storage
-                            .map_or(false, |(_, len)| (*sig_id as u32) < len) =>
+                        if inline_storage.map_or(false, |(_, len)| (*sig_id as u32) < len) =>
                     {
                         let (base_ptr, _len) = inline_storage.unwrap();
                         let base = builder.ins().iconst(pointer_type, base_ptr as i64);
                         // Each [u64; 2] entry is 16 bytes; val_bits is at offset 0.
                         let offset = (*sig_id as i32) * 16;
-                        let val = builder.ins().load(
-                            types::I64,
-                            MemFlags::trusted(),
-                            base,
-                            offset,
-                        );
+                        let val = builder
+                            .ins()
+                            .load(types::I64, MemFlags::trusted(), base, offset);
                         builder.ins().stack_store(val, reg_slots[*dest as usize], 0);
                     }
                     other => {
@@ -1060,9 +1052,7 @@ mod enabled {
                 let lo = builder
                     .ins()
                     .stack_load(types::I64, regs[*lo_reg as usize], 0);
-                builder
-                    .ins()
-                    .call(blk_range_ref, &[sim_ptr, id, hi, lo, v]);
+                builder.ins().call(blk_range_ref, &[sim_ptr, id, hi, lo, v]);
             }
             NbaAssign(sig_id, val_reg, width) => {
                 let v = builder
@@ -1094,9 +1084,7 @@ mod enabled {
                 let lo = builder
                     .ins()
                     .stack_load(types::I64, regs[*lo_reg as usize], 0);
-                builder
-                    .ins()
-                    .call(nba_range_ref, &[sim_ptr, id, hi, lo, v]);
+                builder.ins().call(nba_range_ref, &[sim_ptr, id, hi, lo, v]);
             }
             NbaAssignBitDyn(sig_id, idx_reg, val_reg) => {
                 let v = builder

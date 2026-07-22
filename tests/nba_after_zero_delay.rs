@@ -79,6 +79,14 @@ endmodule
     let sim = simulate(SRC, 100).expect("simulate failed");
     let ra = lookup(&sim, "ra") & 0xFFFFFFFF;
     let rb = lookup(&sim, "rb") & 0xFFFFFFFF;
-    assert_eq!(ra, 2, "after #0 a must hold the swapped value 2, got {}", ra);
-    assert_eq!(rb, 1, "after #0 b must hold the swapped value 1, got {}", rb);
+    assert_eq!(
+        ra, 2,
+        "after #0 a must hold the swapped value 2, got {}",
+        ra
+    );
+    assert_eq!(
+        rb, 1,
+        "after #0 b must hold the swapped value 1, got {}",
+        rb
+    );
 }

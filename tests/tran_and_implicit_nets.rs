@@ -82,7 +82,11 @@ fn tran_keeps_high_impedance_when_undriven() {
 #[test]
 fn a_cross_module_reference_does_not_declare_its_root_as_a_net() {
     let sim = simulate(XMR, 100).expect("simulate failed");
-    assert_eq!(u(&sim, "observed"), 0xA, "the cross-module read was clobbered");
+    assert_eq!(
+        u(&sim, "observed"),
+        0xA,
+        "the cross-module read was clobbered"
+    );
 }
 
 /// §28.8 compliance: the resolution table, the conditional switches, and the
@@ -149,7 +153,11 @@ fn bidirectional_switches_follow_the_resolution_table() {
         .expect("fails")
         .to_u64()
         .unwrap_or(99);
-    assert_eq!(fails, 0, "{} of the 9 IEEE 1800-2017 §28.8 checks failed", fails);
+    assert_eq!(
+        fails, 0,
+        "{} of the 9 IEEE 1800-2017 §28.8 checks failed",
+        fails
+    );
 }
 
 /// §6.6.1: a net with several continuous drivers resolves ALL of them, rather
@@ -175,9 +183,17 @@ endmodule
 fn a_net_resolves_all_of_its_continuous_drivers() {
     let sim = simulate(MULTI_DRIVER, 100).expect("simulate failed");
     assert_eq!(u(&sim, "none_z"), 1, "both drivers z -> z");
-    assert_eq!(u(&sim, "only_a"), 1, "one driver, one z -> the driven value");
+    assert_eq!(
+        u(&sim, "only_a"),
+        1,
+        "one driver, one z -> the driven value"
+    );
     assert_eq!(u(&sim, "only_b"), 1);
-    assert_eq!(u(&sim, "contention_x"), 1, "two conflicting drivers must give x");
+    assert_eq!(
+        u(&sim, "contention_x"),
+        1,
+        "two conflicting drivers must give x"
+    );
 }
 
 /// A `tran` declared in a SUB-MODULE, bridging two nets referenced through the
@@ -222,12 +238,24 @@ endmodule
 #[test]
 fn a_tran_in_a_submodule_bridges_hierarchical_terminals() {
     let sim = simulate(SUBMODULE_TRAN, 100).expect("simulate failed");
-    assert_eq!(u(&sim, "seen_l1"), 0xA, "a tran inside a sub-module was dropped");
-    assert_eq!(u(&sim, "seen_back"), 0x5, "the bridge must work in both directions");
+    assert_eq!(
+        u(&sim, "seen_l1"),
+        0xA,
+        "a tran inside a sub-module was dropped"
+    );
+    assert_eq!(
+        u(&sim, "seen_back"),
+        0x5,
+        "the bridge must work in both directions"
+    );
 }
 
 #[test]
 fn a_continuous_assign_to_a_cross_module_lvalue_reaches_the_net() {
     let sim = simulate(SUBMODULE_TRAN, 100).expect("simulate failed");
-    assert_eq!(u(&sim, "seen_probe"), 0xA, "the cross-module lvalue wrote a stray signal");
+    assert_eq!(
+        u(&sim, "seen_probe"),
+        0xA,
+        "the cross-module lvalue wrote a stray signal"
+    );
 }

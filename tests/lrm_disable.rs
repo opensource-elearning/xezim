@@ -103,7 +103,11 @@ fn u(sim: &xezim::compiler::Simulator, n: &str) -> u64 {
 #[test]
 fn disabling_a_loop_body_block_continues_the_loop() {
     let sim = simulate(LOOPS, 200).expect("simulate failed");
-    assert_eq!(u(&sim, "cont_sum"), 8, "0+1+3+4: disable inner must continue");
+    assert_eq!(
+        u(&sim, "cont_sum"),
+        8,
+        "0+1+3+4: disable inner must continue"
+    );
 }
 
 #[test]
@@ -116,15 +120,31 @@ fn disabling_a_block_enclosing_the_loop_breaks_out() {
 fn disabling_another_process_kills_it_and_spares_everyone_else() {
     let sim = simulate(PROCESSES, 200).expect("simulate failed");
     assert_eq!(u(&sim, "observed"), 0, "the disabled process still ran");
-    assert_eq!(u(&sim, "disabler_time"), 5, "the disabling process was truncated");
-    assert_eq!(u(&sim, "unrelated_time"), 20, "an unrelated event was dropped");
+    assert_eq!(
+        u(&sim, "disabler_time"),
+        5,
+        "the disabling process was truncated"
+    );
+    assert_eq!(
+        u(&sim, "unrelated_time"),
+        20,
+        "an unrelated event was dropped"
+    );
 }
 
 #[test]
 fn disabling_a_task_or_a_block_inside_one_leaves_no_stale_state() {
     let sim = simulate(TASKS, 200).expect("simulate failed");
-    assert_eq!(u(&sim, "steps"), 1, "disable <task> must end the invocation");
-    assert_eq!(u(&sim, "nested_steps"), 11, "execution resumes after the block");
+    assert_eq!(
+        u(&sim, "steps"),
+        1,
+        "disable <task> must end the invocation"
+    );
+    assert_eq!(
+        u(&sim, "nested_steps"),
+        11,
+        "execution resumes after the block"
+    );
     // A later, ordinary `break` still works.
     assert_eq!(u(&sim, "later_sum"), 1);
 }

@@ -8,8 +8,11 @@ use xezim::simulate;
 
 fn line(src: &str, tag: &str) -> String {
     let sim = simulate(src, 100).expect("sim");
-    sim.output.iter().find(|o| o.message.starts_with(tag))
-        .map(|o| o.message.clone()).unwrap_or_default()
+    sim.output
+        .iter()
+        .find(|o| o.message.starts_with(tag))
+        .map(|o| o.message.clone())
+        .unwrap_or_default()
 }
 
 #[test]
@@ -25,8 +28,16 @@ module t; initial begin\n\
   if (o1.in == o2.in) $display(\"B SHARED\"); else $display(\"B DIFF\");\n\
   $finish; end endmodule";
     // scalar `a` is copied then set independently; nested `in` handle is SHARED.
-    assert_eq!(line(src, "A "), "A o1a=5 o1inv=42", "scalar independent, nested handle shared");
-    assert_eq!(line(src, "B "), "B SHARED", "nested object handle must be shared");
+    assert_eq!(
+        line(src, "A "),
+        "A o1a=5 o1inv=42",
+        "scalar independent, nested handle shared"
+    );
+    assert_eq!(
+        line(src, "B "),
+        "B SHARED",
+        "nested object handle must be shared"
+    );
 }
 
 #[test]
@@ -39,5 +50,9 @@ module t; initial begin\n\
   $display(\"V %0d\", c2.a);\n\
   $finish; end endmodule";
     // must copy c1.a (=5), NOT run the constructor (which sets a=7).
-    assert_eq!(line(src, "V "), "V 5", "copy must take source value, not construct");
+    assert_eq!(
+        line(src, "V "),
+        "V 5",
+        "copy must take source value, not construct"
+    );
 }

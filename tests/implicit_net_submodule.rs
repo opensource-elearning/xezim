@@ -18,7 +18,10 @@ use xezim::simulate;
 fn u64_of(sim: &xezim::compiler::Simulator, names: &[&str]) -> u64 {
     for n in names {
         if let Some(v) = sim.get_signal(n) {
-            return v.to_u64().unwrap_or_else(|| panic!("{n} has X/Z, expected defined")) & 0xFFFF_FFFF;
+            return v
+                .to_u64()
+                .unwrap_or_else(|| panic!("{n} has X/Z, expected defined"))
+                & 0xFFFF_FFFF;
         }
     }
     panic!("none of these signals found: {names:?}");
@@ -85,7 +88,10 @@ fn implicit_net_in_submodule_cont_assign_one_level() {
     // net `mid` was never created, the cont-assigns get dropped and `y`
     // stays X (to_u64 panics) or 0 — never the live computed value.
     let y = u64_of(&sim, &["tb.y", "y"]);
-    assert_eq!(y, 0, "after a=0xFF,b=0xF1 (a[0]^b[0]=0) -> y should be 0; got {y}");
+    assert_eq!(
+        y, 0,
+        "after a=0xFF,b=0xF1 (a[0]^b[0]=0) -> y should be 0; got {y}"
+    );
 }
 
 #[test]
@@ -93,6 +99,12 @@ fn implicit_net_in_submodule_two_levels_deep() {
     let sim = simulate(SRC_2LEVEL, 50).expect("simulate failed");
     let saw_one = u64_of(&sim, &["tb.saw_one", "saw_one"]);
     let saw_zero = u64_of(&sim, &["tb.saw_zero", "saw_zero"]);
-    assert_eq!(saw_one, 2, "leaf.en (implicit net) gating output: expected o===1 twice, got {saw_one}");
-    assert_eq!(saw_zero, 2, "expected o===0 twice (g&d == 0), got {saw_zero}");
+    assert_eq!(
+        saw_one, 2,
+        "leaf.en (implicit net) gating output: expected o===1 twice, got {saw_one}"
+    );
+    assert_eq!(
+        saw_zero, 2,
+        "expected o===0 twice (g&d == 0), got {saw_zero}"
+    );
 }

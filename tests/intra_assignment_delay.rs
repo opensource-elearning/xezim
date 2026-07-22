@@ -33,9 +33,17 @@ endmodule
 #[test]
 fn blocking_intra_delay_suspends_then_assigns() {
     let sim = simulate(BLOCKING_SUSPENDS, 100).expect("simulate failed");
-    assert_eq!(u(&sim, "seen_early"), 0, "assignment landed before the delay expired");
+    assert_eq!(
+        u(&sim, "seen_early"),
+        0,
+        "assignment landed before the delay expired"
+    );
     assert_eq!(u(&sim, "x"), 7);
-    assert_eq!(u(&sim, "t_after"), 3, "statement did not block for the delay");
+    assert_eq!(
+        u(&sim, "t_after"),
+        3,
+        "statement did not block for the delay"
+    );
 }
 
 /// §9.4.5 capture semantics: the RHS is evaluated BEFORE the delay, so later
@@ -58,8 +66,16 @@ endmodule
 #[test]
 fn rhs_is_evaluated_before_the_delay() {
     let sim = simulate(RHS_CAPTURED, 100).expect("simulate failed");
-    assert_eq!(u(&sim, "x"), 1, "forked intra-assignment read the post-fork w");
-    assert_eq!(u(&sim, "y"), 19, "in-process intra-assignment lost the captured RHS");
+    assert_eq!(
+        u(&sim, "x"),
+        1,
+        "forked intra-assignment read the post-fork w"
+    );
+    assert_eq!(
+        u(&sim, "y"),
+        19,
+        "in-process intra-assignment lost the captured RHS"
+    );
 }
 
 /// Nonblocking form `lhs <= #d rhs`: the process does NOT block, the RHS is
@@ -80,7 +96,11 @@ endmodule
 #[test]
 fn nonblocking_intra_delay_defers_the_update_without_blocking() {
     let sim = simulate(NBA_FORM, 100).expect("simulate failed");
-    assert_eq!(u(&sim, "t_fork"), 0, "an NBA with intra-assignment delay blocked the process");
+    assert_eq!(
+        u(&sim, "t_fork"),
+        0,
+        "an NBA with intra-assignment delay blocked the process"
+    );
     assert_eq!(u(&sim, "mid"), 0, "the delayed NBA update landed too early");
     assert_eq!(u(&sim, "fin"), 5, "the delayed NBA update never landed");
 }

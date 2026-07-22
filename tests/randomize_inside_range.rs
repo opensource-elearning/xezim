@@ -37,7 +37,11 @@ fn u(sim: &xezim::compiler::Simulator, n: &str) -> u64 {
 #[test]
 fn inside_range_never_leaves_its_bounds() {
     let sim = simulate(SRC, 100).expect("simulate failed");
-    assert_eq!(u(&sim, "out_of_range"), 0, "randomize produced a value outside the range");
+    assert_eq!(
+        u(&sim, "out_of_range"),
+        0,
+        "randomize produced a value outside the range"
+    );
 }
 
 #[test]
@@ -50,6 +54,14 @@ fn inside_range_spans_the_whole_interval() {
     let above = u(&sim, "above_4k");
     let below = u(&sim, "at_or_below_4k");
     assert_eq!(above + below, 3000);
-    assert!(above > 300, "only {} of 3000 draws exceeded the old 4096 cap", above);
-    assert!(below > 300, "only {} of 3000 draws fell below the old cap", below);
+    assert!(
+        above > 300,
+        "only {} of 3000 draws exceeded the old 4096 cap",
+        above
+    );
+    assert!(
+        below > 300,
+        "only {} of 3000 draws fell below the old cap",
+        below
+    );
 }

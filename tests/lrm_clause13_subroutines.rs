@@ -97,7 +97,11 @@ fn omitted_formals_take_their_defaults_with_named_args() {
     // f_dflt defaults are a=2, b=3
     assert_eq!(u(&sim, "fn_dflt0"), 23);
     assert_eq!(u(&sim, "fn_dflt1"), 93);
-    assert_eq!(u(&sim, "fn_dflt_named"), 29, "f_dflt(.b(9)) must keep a's default");
+    assert_eq!(
+        u(&sim, "fn_dflt_named"),
+        29,
+        "f_dflt(.b(9)) must keep a's default"
+    );
 }
 
 #[test]
@@ -118,5 +122,9 @@ fn unpacked_array_arguments_pass_in_and_ref_writes_come_back() {
 fn an_input_array_formal_is_not_written_back() {
     let sim = simulate(INPUT_ARRAY, 100).expect("simulate failed");
     assert_eq!(u(&sim, "ret"), 999, "the formal itself is writable");
-    assert_eq!(u(&sim, "kept"), 1, "an input array must not write back to the caller");
+    assert_eq!(
+        u(&sim, "kept"),
+        1,
+        "an input array must not write back to the caller"
+    );
 }

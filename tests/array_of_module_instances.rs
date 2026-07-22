@@ -7,7 +7,11 @@
 use xezim::simulate;
 
 fn out_of(sim: &xezim::compiler::Simulator) -> String {
-    sim.output.iter().map(|o| o.message.as_str()).collect::<Vec<_>>().join("\n")
+    sim.output
+        .iter()
+        .map(|o| o.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[test]
@@ -21,7 +25,11 @@ module top;
 endmodule
 "#;
     let out = out_of(&simulate(SRC, 100).expect("sim"));
-    assert!(out.contains("R a"), "each element drives out[k]=din[k]:\n{}", out);
+    assert!(
+        out.contains("R a"),
+        "each element drives out[k]=din[k]:\n{}",
+        out
+    );
 }
 
 #[test]
@@ -41,7 +49,11 @@ module top;
 endmodule
 "#;
     let out = out_of(&simulate(SRC, 100).expect("sim"));
-    assert!(out.contains("F c"), "flop bank latches din per bit (want F c):\n{}", out);
+    assert!(
+        out.contains("F c"),
+        "flop bank latches din per bit (want F c):\n{}",
+        out
+    );
 }
 
 /// Non-zero-based / offset range: `m[3:1]` connected to `out[3:1]` must map
@@ -58,5 +70,9 @@ module top;
 endmodule
 "#;
     let out = out_of(&simulate(SRC, 100).expect("sim"));
-    assert!(out.contains("O 1010"), "offset-range array drives absolute bits:\n{}", out);
+    assert!(
+        out.contains("O 1010"),
+        "offset-range array drives absolute bits:\n{}",
+        out
+    );
 }

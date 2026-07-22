@@ -115,7 +115,11 @@ fn queue_of_queues_and_sized_new_on_an_element() {
     let sim = simulate(SRC, 100).expect("simulate failed");
     assert_eq!(u(&sim, "qq_size"), 2, "int qq[$][$] element is not a queue");
     assert_eq!(u(&sim, "qq_elem"), 11);
-    assert_eq!(u(&sim, "dq_size"), 3, "d[i] = new[3] did not size the element");
+    assert_eq!(
+        u(&sim, "dq_size"),
+        3,
+        "d[i] = new[3] did not size the element"
+    );
     assert_eq!(u(&sim, "dq_elem"), 42);
 }
 

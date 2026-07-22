@@ -9,7 +9,11 @@ use xezim::simulate;
 
 fn out(src: &str) -> String {
     let sim = simulate(src, 1000).expect("simulate failed");
-    sim.output.iter().map(|o| o.message.clone()).collect::<Vec<_>>().join("\n")
+    sim.output
+        .iter()
+        .map(|o| o.message.clone())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// A failing property fires its `else` action every clock it fails.
@@ -21,8 +25,11 @@ module t; logic clk=0, a=1, b=0; always #5 clk=~clk;
   initial begin repeat(3) @(posedge clk); $finish; end
 endmodule
 "#);
-    assert!(o.matches("ELSE at").count() >= 3,
-        "failing a|->b must fire else each cycle; got: {}", o);
+    assert!(
+        o.matches("ELSE at").count() >= 3,
+        "failing a|->b must fire else each cycle; got: {}",
+        o
+    );
 }
 
 /// `req |=> ack` with ack arriving next cycle passes — the `else` stays silent.
@@ -39,8 +46,11 @@ module t; logic clk=0, req=0, ack=0; always #5 clk=~clk;
   end
 endmodule
 "#);
-    assert!(o.contains("DONE") && !o.contains("ELSE at"),
-        "passing implication must not fire else; got: {}", o);
+    assert!(
+        o.contains("DONE") && !o.contains("ELSE at"),
+        "passing implication must not fire else; got: {}",
+        o
+    );
 }
 
 /// A vacuous pass (false antecedent) must NOT run the pass action.
@@ -52,8 +62,11 @@ module t; logic clk=0, a=0, b=0; always #5 clk=~clk;
   initial begin repeat(3) @(posedge clk); $display("DONE"); $finish; end
 endmodule
 "#);
-    assert!(o.contains("DONE") && !o.contains("PASSACT"),
-        "vacuous pass must not run the pass action; got: {}", o);
+    assert!(
+        o.contains("DONE") && !o.contains("PASSACT"),
+        "vacuous pass must not run the pass action; got: {}",
+        o
+    );
 }
 
 /// `cover property` runs its action on each match.
@@ -65,5 +78,9 @@ module t; logic clk=0, a=1; always #5 clk=~clk;
   initial begin repeat(3) @(posedge clk); $finish; end
 endmodule
 "#);
-    assert!(o.matches("COV at").count() >= 3, "cover must fire on each match; got: {}", o);
+    assert!(
+        o.matches("COV at").count() >= 3,
+        "cover must fire on each match; got: {}",
+        o
+    );
 }

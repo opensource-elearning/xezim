@@ -85,9 +85,17 @@ fn create_pointer_rotation_correct_for_all_amounts() {
     let sim = simulate(SRC, 200).expect("simulate failed");
     let base = 0x00000020u32; // one-hot at bit 5
 
-    for (n, name) in [(1, "cap_r1"), (2, "cap_r2"), (3, "cap_r3"), (4, "cap_r4"),
-                      (5, "cap_r5"), (6, "cap_r6"), (7, "cap_r7"), (8, "cap_r8"),
-                      (9, "cap_r9")] {
+    for (n, name) in [
+        (1, "cap_r1"),
+        (2, "cap_r2"),
+        (3, "cap_r3"),
+        (4, "cap_r4"),
+        (5, "cap_r5"),
+        (6, "cap_r6"),
+        (7, "cap_r7"),
+        (8, "cap_r8"),
+        (9, "cap_r9"),
+    ] {
         let got = lookup(&sim, name) as u32;
         let exp = rotl(base, n);
         assert_eq!(

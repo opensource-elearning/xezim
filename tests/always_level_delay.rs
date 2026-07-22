@@ -9,7 +9,11 @@ use xezim::simulate;
 
 fn out(src: &str) -> String {
     let sim = simulate(src, 100000).expect("simulate failed");
-    sim.output.iter().map(|o| o.message.clone()).collect::<Vec<_>>().join("\n")
+    sim.output
+        .iter()
+        .map(|o| o.message.clone())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The delayed level-sensitive always propagates its assignment.
@@ -22,7 +26,11 @@ module t;
   initial begin #1 a=1; #20 $display("Z=%0b", z); $finish; end
 endmodule
 "#);
-    assert!(o.contains("Z=1"), "delayed level-always must propagate a->z; got: {}", o);
+    assert!(
+        o.contains("Z=1"),
+        "delayed level-always must propagate a->z; got: {}",
+        o
+    );
 }
 
 /// Initial blocks must NOT be starved by the presence of such an always.
@@ -59,7 +67,11 @@ module mid(input a, output z); leaf l(.a(a), .z(z)); endmodule
 `timescale 1ps/1ps
 module leaf(input a, output reg z); initial z=0; always @(a) #5 z=a; endmodule
 "#);
-    assert!(o.contains("SEEN="), "top must observe z's posedge (not TIMEOUT); got: {}", o);
+    assert!(
+        o.contains("SEEN="),
+        "top must observe z's posedge (not TIMEOUT); got: {}",
+        o
+    );
     assert!(!o.contains("TIMEOUT"), "must not time out; got: {}", o);
 }
 
@@ -74,5 +86,9 @@ module t;
   initial begin #1 a=1; end
 endmodule
 "#);
-    assert!(o.contains("PZ=1"), "no-delay level-always must still fire at t=1; got: {}", o);
+    assert!(
+        o.contains("PZ=1"),
+        "no-delay level-always must still fire at t=1; got: {}",
+        o
+    );
 }

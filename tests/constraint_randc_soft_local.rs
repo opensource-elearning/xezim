@@ -175,7 +175,11 @@ endmodule
 #[test]
 fn randomize_null_checks_instead_of_randomizing() {
     let sim = simulate(CHECK_SRC, 100).expect("simulate failed");
-    assert_eq!(u(&sim, "ok_valid"), 1, "checker rejected a legal value (§18.11)");
+    assert_eq!(
+        u(&sim, "ok_valid"),
+        1,
+        "checker rejected a legal value (§18.11)"
+    );
     assert_eq!(
         u(&sim, "ok_illegal"),
         0,
@@ -191,7 +195,11 @@ fn randomize_null_checks_instead_of_randomizing() {
         0,
         "checker failed to catch an unmatched in-line condition (§18.11.1)"
     );
-    assert_eq!(u(&sim, "mutated"), 0, "randomize(null) changed a rand variable");
+    assert_eq!(
+        u(&sim, "mutated"),
+        0,
+        "randomize(null) changed a rand variable"
+    );
 }
 
 /// §18.7.1 — `local::data_val` inside the in-line constraint names the CALLER's

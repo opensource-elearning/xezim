@@ -7,7 +7,12 @@ use xezim::simulate;
 fn passes(src: &str) -> bool {
     match simulate(src, 100_000) {
         Ok(sim) => {
-            let out: String = sim.output.iter().map(|o| o.message.clone()).collect::<Vec<_>>().join("\n");
+            let out: String = sim
+                .output
+                .iter()
+                .map(|o| o.message.clone())
+                .collect::<Vec<_>>()
+                .join("\n");
             out.contains("PASSED") && !out.contains("FAILED")
         }
         Err(_) => false,
@@ -18,7 +23,8 @@ fn passes(src: &str) -> bool {
 /// `x[i++] += 2`) evaluates the index exactly once (ivtest pr3390385).
 #[test]
 fn lvalue_index_side_effect_single_eval() {
-    assert!(passes(r#"
+    assert!(passes(
+        r#"
 module tb;
 reg [1:0] i, j;
 reg [3:0] x[0:2];
@@ -40,14 +46,16 @@ initial begin
    if (error == 0) $display("PASSED"); else $display("FAILED");
 end
 endmodule
-"#));
+"#
+    ));
 }
 
 /// §7.4.1: nested index on a 3-D packed vector selects the element slice,
 /// with $bits agreeing at each level (ivtest br_gh112a).
 #[test]
 fn packed_3d_nested_index_descending() {
-    assert!(passes(r#"
+    assert!(passes(
+        r#"
 module t;
 reg [1:0][15:0][7:0] array;
 reg failed = 0;
@@ -72,14 +80,16 @@ initial begin
   if (failed) $display("FAILED"); else $display("PASSED");
 end
 endmodule
-"#));
+"#
+    ));
 }
 
 /// §7.4.1: ascending packed ranges label the LEFT bound as the
 /// most-significant element (ivtest br_gh112b).
 #[test]
 fn packed_3d_nested_index_ascending() {
-    assert!(passes(r#"
+    assert!(passes(
+        r#"
 module t;
 reg [0:1][0:15][0:7] array;
 reg failed = 0;
@@ -101,14 +111,16 @@ initial begin
   if (failed) $display("FAILED"); else $display("PASSED");
 end
 endmodule
-"#));
+"#
+    ));
 }
 
 /// §7.4.1: non-zero-based and negative packed bounds normalize per
 /// dimension, with signed index expressions (ivtest br_gh112c/e/f).
 #[test]
 fn packed_3d_nested_index_offset_and_negative_bounds() {
-    assert!(passes(r#"
+    assert!(passes(
+        r#"
 module t;
 reg [2:1][16:1][8:1] a;
 reg [0:-1][14:-1][6:-1] b;
@@ -137,7 +149,8 @@ initial begin
   if (failed) $display("FAILED"); else $display("PASSED");
 end
 endmodule
-"#));
+"#
+    ));
 }
 
 /// §7.4.2: writes and reads through a packed array of packed struct nested
@@ -145,7 +158,8 @@ endmodule
 /// storage (ivtest gh161a/gh161b).
 #[test]
 fn nested_packed_struct_array_member_rw() {
-    assert!(passes(r#"
+    assert!(passes(
+        r#"
 module test();
    typedef struct packed { logic [31:0] sub_local; } row_entry_t;
    typedef struct packed {
@@ -174,7 +188,8 @@ module test();
       $display("PASSED");
    end
 endmodule
-"#));
+"#
+    ));
 }
 
 /// §8.12 vs constructor call: `foo[i] = new(i)` with an INT arg constructs —
@@ -182,7 +197,8 @@ endmodule
 /// the int's value collides with a live heap index (ivtest sv_foreach3/4).
 #[test]
 fn class_new_int_arg_is_construction_not_copy() {
-    assert!(passes(r#"
+    assert!(passes(
+        r#"
 module main;
    class test_t;
       reg [7:0] a;
@@ -204,7 +220,8 @@ module main;
    container_t dut;
    initial begin dut = new; dut.run; end
 endmodule
-"#));
+"#
+    ));
 }
 
 /// Multi-dim fixed class-array member: element writes/reads (`foo[i][j]`)
@@ -212,7 +229,8 @@ endmodule
 /// previously only the first dimension was recorded (ivtest sv_foreach3/4).
 #[test]
 fn class_member_2d_array_rw_and_foreach() {
-    assert!(passes(r#"
+    assert!(passes(
+        r#"
 module main;
    class test_t;
       reg [1:0] a;
@@ -249,14 +267,16 @@ module main;
    container_t dut;
    initial begin dut = new; dut.run; end
 endmodule
-"#));
+"#
+    ));
 }
 
 /// §12.7.3: a foreach loop var BEYOND the unpacked dims iterates the
 /// element's packed dimension (ivtest sv_foreach5).
 #[test]
 fn foreach_packed_dim_loop_var() {
-    assert!(passes(r#"
+    assert!(passes(
+        r#"
 module test();
 reg [3:0] array[0:1][0:2];
 reg [3:0] expected;
@@ -276,7 +296,8 @@ initial begin
   if (failed) $display("FAILED"); else $display("PASSED");
 end
 endmodule
-"#));
+"#
+    ));
 }
 
 /// §7.4.1: genloop port connections onto elements of a multi-D PACKED net
@@ -284,7 +305,8 @@ endmodule
 /// element slice, and `foo[i]` reads a slice, not a bit (ivtest packeda2).
 #[test]
 fn packed_net_elem_port_connection() {
-    assert!(passes(r#"
+    assert!(passes(
+        r#"
 module main;
    wire logic [3:0][7:0] foo;
    genvar idx;
@@ -306,7 +328,8 @@ endmodule
 module test (output logic[7:0] sum, input logic [7:0]a);
    assign sum = a + 8'd5;
 endmodule
-"#));
+"#
+    ));
 }
 
 /// §6.6.1: an undriven net reads Z, not X — and bits of a net nothing
@@ -314,7 +337,8 @@ endmodule
 /// struct_packed_write_read2's word_se0/sw0/ep0 checks).
 #[test]
 fn undriven_net_defaults_to_z() {
-    assert!(passes(r#"
+    assert!(passes(
+        r#"
 module main;
    typedef struct packed {
       logic [7:0] high;
@@ -335,7 +359,8 @@ module main;
       $display("PASSED");
    end
 endmodule
-"#));
+"#
+    ));
 }
 
 /// Nested cont-assign selects on a multi-D packed NET write the addressed
@@ -343,7 +368,8 @@ endmodule
 /// ContAssign path: infer_lhs_width must not truncate to 1 bit).
 #[test]
 fn packed_net_nested_index_cont_assign() {
-    assert!(passes(r#"
+    assert!(passes(
+        r#"
 module main;
    wire logic [1:0][3:0][7:0] foo;
    assign foo[0][0] = 8'hA5;
@@ -357,5 +383,6 @@ module main;
       $display("PASSED");
    end
 endmodule
-"#));
+"#
+    ));
 }

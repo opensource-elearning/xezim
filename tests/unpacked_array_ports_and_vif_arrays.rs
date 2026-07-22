@@ -116,5 +116,8 @@ module top;
 endmodule
 "#,
     );
-    assert!(out.contains("VIF_GENERATE_PASS"), "unexpected output:\n{out}");
+    assert!(
+        out.contains("VIF_GENERATE_PASS"),
+        "unexpected output:\n{out}"
+    );
 }

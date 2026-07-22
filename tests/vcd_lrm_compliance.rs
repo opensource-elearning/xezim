@@ -44,10 +44,7 @@ fn dump(tag: &str, src: &str) -> String {
 /// The `$var` declaration line for `name`.
 fn var_line(vcd: &str, name: &str) -> String {
     vcd.lines()
-        .find(|l| {
-            l.starts_with("$var")
-                && l.split_whitespace().nth(4) == Some(name)
-        })
+        .find(|l| l.starts_with("$var") && l.split_whitespace().nth(4) == Some(name))
         .unwrap_or_else(|| panic!("no $var for `{}` in:\n{}", name, vcd))
         .to_string()
 }
@@ -167,7 +164,10 @@ module behav;
 endmodule
 "#,
     );
-    assert_eq!(var_line(&vcd, "a"), format!("$var reg 4 {} a [3:0] $end", id_of(&vcd, "a")));
+    assert_eq!(
+        var_line(&vcd, "a"),
+        format!("$var reg 4 {} a [3:0] $end", id_of(&vcd, "a"))
+    );
     // `bx` — an all-x vector left-extends back to full width (§21.7.2.1), and is
     // what a reference simulator writes. See `leading_run_suppression_matches_reference_...`.
     assert_eq!(records(&vcd, "a"), vec!["bx", "b1", "b10"]);
@@ -193,8 +193,16 @@ endmodule
 "#;
     let one = dump("depth1", &SRC.replace("DEPTH", "1"));
     var_line(&one, "t");
-    assert!(!one.contains("$scope module u_mid"), "depth 1 must not descend:\n{}", one);
-    assert!(!one.contains(" m $end"), "depth 1 must not descend:\n{}", one);
+    assert!(
+        !one.contains("$scope module u_mid"),
+        "depth 1 must not descend:\n{}",
+        one
+    );
+    assert!(
+        !one.contains(" m $end"),
+        "depth 1 must not descend:\n{}",
+        one
+    );
 
     let all = dump("depth0", &SRC.replace("DEPTH", "0"));
     var_line(&all, "t");
@@ -202,13 +210,14 @@ endmodule
     var_line(&all, "deep");
 
     // A scope argument BELOW the top selects just that subtree.
-    let sub = dump(
-        "depthsub",
-        &SRC.replace("DEPTH, top", "0, top.u_mid"),
-    );
+    let sub = dump("depthsub", &SRC.replace("DEPTH, top", "0, top.u_mid"));
     var_line(&sub, "m");
     var_line(&sub, "deep");
-    assert!(!sub.contains(" t $end"), "u_mid subtree must not carry `t`:\n{}", sub);
+    assert!(
+        !sub.contains(" t $end"),
+        "u_mid subtree must not carry `t`:\n{}",
+        sub
+    );
 }
 
 /// §21.7.2.1: a `real` is declared `$var real 64` and its changes are
@@ -231,7 +240,10 @@ module tb;
 endmodule
 "#,
     );
-    assert_eq!(var_line(&vcd, "r"), format!("$var real 64 {} r $end", id_of(&vcd, "r")));
+    assert_eq!(
+        var_line(&vcd, "r"),
+        format!("$var real 64 {} r $end", id_of(&vcd, "r"))
+    );
     assert_eq!(records(&vcd, "r"), vec!["r0", "r3.14", "r-2.5"]);
     assert!(
         !vcd.contains("b0100000000001001"),
@@ -399,11 +411,27 @@ module tb;
 endmodule
 "#,
     );
-    assert!(var_line(&vcd, "outs[0]").starts_with("$var wire 4 "), "{}", vcd);
-    assert!(var_line(&vcd, "outs[1]").starts_with("$var wire 4 "), "{}", vcd);
-    assert!(var_line(&vcd, "mem[0]").starts_with("$var reg 8 "), "{}", vcd);
+    assert!(
+        var_line(&vcd, "outs[0]").starts_with("$var wire 4 "),
+        "{}",
+        vcd
+    );
+    assert!(
+        var_line(&vcd, "outs[1]").starts_with("$var wire 4 "),
+        "{}",
+        vcd
+    );
+    assert!(
+        var_line(&vcd, "mem[0]").starts_with("$var reg 8 "),
+        "{}",
+        vcd
+    );
     // The aggregate must NOT also appear as one wide vector.
-    assert!(!vcd.contains(" outs $end"), "net array must not flatten:\n{}", vcd);
+    assert!(
+        !vcd.contains(" outs $end"),
+        "net array must not flatten:\n{}",
+        vcd
+    );
     assert_eq!(records(&vcd, "outs[0]").last().unwrap(), "b101");
     assert_eq!(records(&vcd, "outs[1]").last().unwrap(), "b110");
     assert_eq!(records(&vcd, "mem[1]").last().unwrap(), "b100010");
@@ -437,12 +465,28 @@ endmodule
     let on = body.find("$dumpon").expect("no $dumpon block");
     assert!(off < on);
     // The off block drives `a` to x, and is time-stamped.
-    assert!(body[off..on].contains("bx "), "$dumpoff must dump x:\n{}", vcd);
-    assert!(body[..off].trim_end().ends_with("#1"), "$dumpoff needs a #t:\n{}", vcd);
+    assert!(
+        body[off..on].contains("bx "),
+        "$dumpoff must dump x:\n{}",
+        vcd
+    );
+    assert!(
+        body[..off].trim_end().ends_with("#1"),
+        "$dumpoff needs a #t:\n{}",
+        vcd
+    );
     // Nothing was emitted for `a` between the two blocks...
-    assert!(!body[off..on].contains("b111 "), "off-window change leaked:\n{}", vcd);
+    assert!(
+        !body[off..on].contains("b111 "),
+        "off-window change leaked:\n{}",
+        vcd
+    );
     // ...and $dumpon restates the value it reached while off.
-    assert!(body[on..].contains("b111 "), "$dumpon must restate values:\n{}", vcd);
+    assert!(
+        body[on..].contains("b111 "),
+        "$dumpon must restate values:\n{}",
+        vcd
+    );
 }
 
 /// §21.7.1.5: `$dumpall` writes a checkpoint of every dumped variable's current
@@ -469,7 +513,11 @@ endmodule
     let body = vcd.split("$enddefinitions $end").nth(1).unwrap();
     let at = body.find("$dumpall").expect("no $dumpall block");
     let block = &body[at..body[at..].find("$end").unwrap() + at];
-    assert!(block.contains(&format!("b1001 {}", id_of(&vcd, "a"))), "{}", vcd);
+    assert!(
+        block.contains(&format!("b1001 {}", id_of(&vcd, "a"))),
+        "{}",
+        vcd
+    );
     assert!(block.contains(&format!("1{}", id_of(&vcd, "b"))), "{}", vcd);
 }
 
@@ -507,7 +555,11 @@ endmodule
     assert!(body.contains("#25\n$dumpall"), "{}", body);
     // §21.7.2: the file is closed at the final simulation time, so the last
     // value spans to the end of the run instead of stopping at #23.
-    assert!(body.trim_end().ends_with("#27"), "no closing time marker:\n{}", body);
+    assert!(
+        body.trim_end().ends_with("#27"),
+        "no closing time marker:\n{}",
+        body
+    );
 }
 
 /// A net threaded down three levels of hierarchy through whole-net port
@@ -573,7 +625,12 @@ fn port_connected_nets_share_one_identifier_code() {
 
     // ONE record per change, not one per hierarchical name: the checkpoint x,
     // then each of the two `src` writes exactly once.
-    assert_eq!(records(&vcd, "src"), vec!["bx", "b10000", "b100000"], "{}", vcd);
+    assert_eq!(
+        records(&vcd, "src"),
+        vec!["bx", "b10000", "b100000"],
+        "{}",
+        vcd
+    );
     // The clock's 8 edges over 40ns, once each.
     assert_eq!(records(&vcd, "clk").len(), 1 + 8, "{}", vcd);
 }
@@ -636,11 +693,18 @@ endmodule
 /// its own code and its own records.
 #[test]
 fn aliasing_does_not_break_dumpvars_depth_or_scope_filtering() {
-    let one = dump("aliasdepth1", &PORT_HIER.replace("$dumpvars(0, top)", "$dumpvars(1, top)"));
+    let one = dump(
+        "aliasdepth1",
+        &PORT_HIER.replace("$dumpvars(0, top)", "$dumpvars(1, top)"),
+    );
     // Depth 1: only the top level's own objects.
     var_line(&one, "clk");
     assert_eq!(var_lines_all(&one, "clk").len(), 1, "{}", one);
-    assert!(!one.contains("$scope module u_mid"), "depth 1 must not descend:\n{}", one);
+    assert!(
+        !one.contains("$scope module u_mid"),
+        "depth 1 must not descend:\n{}",
+        one
+    );
     assert_eq!(records(&one, "clk").len(), 1 + 8, "{}", one);
 
     // A scope argument below the top: `src` is outside the dump, so `mdin` is
@@ -649,9 +713,18 @@ fn aliasing_does_not_break_dumpvars_depth_or_scope_filtering() {
         "aliasscope",
         &PORT_HIER.replace("$dumpvars(0, top)", "$dumpvars(0, top.u_mid)"),
     );
-    assert!(!sub.contains(" src $end"), "u_mid subtree must not carry `src`:\n{}", sub);
+    assert!(
+        !sub.contains(" src $end"),
+        "u_mid subtree must not carry `src`:\n{}",
+        sub
+    );
     assert_eq!(id_of(&sub, "mdin"), id_of(&sub, "din"), "{}", sub);
-    assert_eq!(records(&sub, "mdin"), vec!["bx", "b10000", "b100000"], "{}", sub);
+    assert_eq!(
+        records(&sub, "mdin"),
+        vec!["bx", "b10000", "b100000"],
+        "{}",
+        sub
+    );
 }
 
 /// §21.7.2.1: an unpacked-array ELEMENT carries the bit range of the element,
@@ -681,9 +754,17 @@ endmodule
         let l = var_line(&vcd, &format!("mem[{}]", i));
         assert!(l.ends_with(&format!(" mem[{}] [7:0] $end", i)), "{}", l);
     }
-    assert!(var_line(&vcd, "hi[0]").ends_with(" hi[0] [15:8] $end"), "{}", vcd);
+    assert!(
+        var_line(&vcd, "hi[0]").ends_with(" hi[0] [15:8] $end"),
+        "{}",
+        vcd
+    );
     // A scalar element has no range to declare.
-    assert!(var_line(&vcd, "bits[0]").ends_with(" bits[0] $end"), "{}", vcd);
+    assert!(
+        var_line(&vcd, "bits[0]").ends_with(" bits[0] $end"),
+        "{}",
+        vcd
+    );
 }
 
 /// §21.7.2.1 value-change records: a reader LEFT-EXTENDS a value shorter than
@@ -769,9 +850,21 @@ module top;
 endmodule
 "#,
     );
-    assert!(var_line(&vcd, "src").starts_with("$var reg 4 "), "{}", var_line(&vcd, "src"));
-    assert!(var_line(&vcd, "snk").starts_with("$var wire 4 "), "{}", var_line(&vcd, "snk"));
-    assert!(var_line(&vcd, "cpy").starts_with("$var wire 4 "), "{}", var_line(&vcd, "cpy"));
+    assert!(
+        var_line(&vcd, "src").starts_with("$var reg 4 "),
+        "{}",
+        var_line(&vcd, "src")
+    );
+    assert!(
+        var_line(&vcd, "snk").starts_with("$var wire 4 "),
+        "{}",
+        var_line(&vcd, "snk")
+    );
+    assert!(
+        var_line(&vcd, "cpy").starts_with("$var wire 4 "),
+        "{}",
+        var_line(&vcd, "cpy")
+    );
     // The child's own port formals: an input port is fed by the port connect
     // (continuous → wire); `dout` is written by an always block (→ reg).
     let child: Vec<&str> = vcd
@@ -782,12 +875,16 @@ endmodule
         .take_while(|l| !l.starts_with("$upscope"))
         .collect();
     assert!(
-        child.iter().any(|l| l.starts_with("$var wire 4 ") && l.ends_with(" din [3:0] $end")),
+        child
+            .iter()
+            .any(|l| l.starts_with("$var wire 4 ") && l.ends_with(" din [3:0] $end")),
         "{:?}",
         child
     );
     assert!(
-        child.iter().any(|l| l.starts_with("$var reg 4 ") && l.ends_with(" dout [3:0] $end")),
+        child
+            .iter()
+            .any(|l| l.starts_with("$var reg 4 ") && l.ends_with(" dout [3:0] $end")),
         "{:?}",
         child
     );

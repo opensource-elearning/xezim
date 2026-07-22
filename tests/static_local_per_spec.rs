@@ -78,7 +78,8 @@ endmodule
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stdout.contains("PASS share") && stdout.contains("PASS distinct")
+        stdout.contains("PASS share")
+            && stdout.contains("PASS distinct")
             && !stdout.contains("FAIL"),
         "function-local static per-spec keying failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );

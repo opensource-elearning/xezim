@@ -49,5 +49,9 @@ endmodule
 "#);
     assert!(o.contains("V=a"), "variable deposit:\n{}", o);
     assert!(o.contains("D=1"), "deposit on driven net visible:\n{}", o);
-    assert!(o.contains("O=0"), "driver must override the deposit:\n{}", o);
+    assert!(
+        o.contains("O=0"),
+        "driver must override the deposit:\n{}",
+        o
+    );
 }

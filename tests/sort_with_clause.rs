@@ -118,7 +118,11 @@ fn a_nested_member_can_be_the_sort_key() {
 fn unique_returns_a_deduped_queue_and_leaves_the_source_alone() {
     let sim = simulate(SRC, 100).expect("simulate failed");
     assert_eq!(u(&sim, "uniq_size"), 2);
-    assert_eq!(u(&sim, "src_size"), 3, "unique() must not shrink its source");
+    assert_eq!(
+        u(&sim, "src_size"),
+        3,
+        "unique() must not shrink its source"
+    );
     // First occurrence of each key survives.
     assert_eq!(
         line(&sim, "UNIQ="),

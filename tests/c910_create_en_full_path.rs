@@ -144,10 +144,10 @@ fn cont_assign_propagates_through_4_hop_chain() {
     let sim = simulate(SRC, 200).expect("simulate failed");
 
     let zero_count = lookup(&sim, "saw_create_en_zero") & 0xFFFFFFFF;
-    let one_count  = lookup(&sim, "saw_create_en_one") & 0xFFFFFFFF;
-    let x_count    = lookup(&sim, "saw_create_en_x") & 0xFFFFFFFF;
+    let one_count = lookup(&sim, "saw_create_en_one") & 0xFFFFFFFF;
+    let x_count = lookup(&sim, "saw_create_en_x") & 0xFFFFFFFF;
     let stuck_zero = lookup(&sim, "num_create_en_should_be_zero_but_was_x") & 0xFFFFFFFF;
-    let stuck_one  = lookup(&sim, "num_create_en_should_be_one_but_was_x") & 0xFFFFFFFF;
+    let stuck_one = lookup(&sim, "num_create_en_should_be_one_but_was_x") & 0xFFFFFFFF;
 
     assert_eq!(
         x_count, 0,
@@ -155,6 +155,14 @@ fn cont_assign_propagates_through_4_hop_chain() {
          {} cases expected 0 got X, {} cases expected 1 got X",
         x_count, stuck_zero, stuck_one
     );
-    assert_eq!(zero_count, 3, "Expected 3 cases of create_en=0, got {}", zero_count);
-    assert_eq!(one_count, 1, "Expected 1 case of create_en=1, got {}", one_count);
+    assert_eq!(
+        zero_count, 3,
+        "Expected 3 cases of create_en=0, got {}",
+        zero_count
+    );
+    assert_eq!(
+        one_count, 1,
+        "Expected 1 case of create_en=1, got {}",
+        one_count
+    );
 }

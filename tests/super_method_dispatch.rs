@@ -139,9 +139,21 @@ module tb;
 endmodule
 "#;
     let sim = simulate(SRC, 100).expect("simulate failed");
-    assert_eq!(lookup(&sim, "bx"), 11, "super.new chain must reach Base::new(v+1)");
-    assert_eq!(lookup(&sim, "dy"), 10, "Derived::new body must run after super.new");
-    assert_eq!(lookup(&sim, "gz"), 5, "Grand::new body must run after super.new");
+    assert_eq!(
+        lookup(&sim, "bx"),
+        11,
+        "super.new chain must reach Base::new(v+1)"
+    );
+    assert_eq!(
+        lookup(&sim, "dy"),
+        10,
+        "Derived::new body must run after super.new"
+    );
+    assert_eq!(
+        lookup(&sim, "gz"),
+        5,
+        "Grand::new body must run after super.new"
+    );
     assert_eq!(
         lookup(&sim, "total"),
         26,

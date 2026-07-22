@@ -70,9 +70,21 @@ module tb;
 endmodule
 "#;
     let sim = simulate(SRC, 100).expect("simulation failed");
-    assert_eq!(u(&sim, "thread_repeats"), 1, "process srandom(seed) did not reproduce the $urandom sequence");
-    assert_eq!(u(&sim, "object_repeats"), 1, "object srandom(seed) did not reproduce the randomize() value");
-    assert_eq!(u(&sim, "thread_varies"), 1, "the seeded thread stream is stuck on one value");
+    assert_eq!(
+        u(&sim, "thread_repeats"),
+        1,
+        "process srandom(seed) did not reproduce the $urandom sequence"
+    );
+    assert_eq!(
+        u(&sim, "object_repeats"),
+        1,
+        "object srandom(seed) did not reproduce the randomize() value"
+    );
+    assert_eq!(
+        u(&sim, "thread_varies"),
+        1,
+        "the seeded thread stream is stuck on one value"
+    );
 }
 
 /// §18.14.2: `get_randstate()` captures the thread's stream; `set_randstate()`
@@ -126,10 +138,26 @@ module tb;
 endmodule
 "#;
     let sim = simulate(SRC, 100).expect("simulation failed");
-    assert_eq!(u(&sim, "state_nonempty"), 1, "get_randstate() returned an empty string");
-    assert_eq!(u(&sim, "seq_matches"), 1, "set_randstate() did not replay the captured $urandom sequence");
-    assert_eq!(u(&sim, "seq_varies"), 1, "the captured stream is stuck on one value");
-    assert_eq!(u(&sim, "shuffle_matches"), 1, "set_randstate() did not reproduce the shuffle() permutation");
+    assert_eq!(
+        u(&sim, "state_nonempty"),
+        1,
+        "get_randstate() returned an empty string"
+    );
+    assert_eq!(
+        u(&sim, "seq_matches"),
+        1,
+        "set_randstate() did not replay the captured $urandom sequence"
+    );
+    assert_eq!(
+        u(&sim, "seq_varies"),
+        1,
+        "the captured stream is stuck on one value"
+    );
+    assert_eq!(
+        u(&sim, "shuffle_matches"),
+        1,
+        "set_randstate() did not reproduce the shuffle() permutation"
+    );
 }
 
 /// §18.14.1: every object owns its own stream, distinct from other objects' and
@@ -188,7 +216,19 @@ module tb;
 endmodule
 "#;
     let sim = simulate(SRC, 100).expect("simulation failed");
-    assert_eq!(u(&sim, "objects_independent"), 1, "two objects seeded alike do not have independent streams");
-    assert_eq!(u(&sim, "thread_unshifted"), 1, "obj.randomize() consumed draws from the thread's $urandom stream");
-    assert_eq!(u(&sim, "object_unshifted"), 1, "a process reseed disturbed the object's random stream");
+    assert_eq!(
+        u(&sim, "objects_independent"),
+        1,
+        "two objects seeded alike do not have independent streams"
+    );
+    assert_eq!(
+        u(&sim, "thread_unshifted"),
+        1,
+        "obj.randomize() consumed draws from the thread's $urandom stream"
+    );
+    assert_eq!(
+        u(&sim, "object_unshifted"),
+        1,
+        "a process reseed disturbed the object's random stream"
+    );
 }

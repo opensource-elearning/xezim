@@ -40,7 +40,11 @@ module tb;
 endmodule
 "#;
     let sim = simulate(SRC, 100).expect("simulate failed");
-    assert_eq!(lookup(&sim, "s_forced"), 0xCAFE, "force must override the variable");
+    assert_eq!(
+        lookup(&sim, "s_forced"),
+        0xCAFE,
+        "force must override the variable"
+    );
     assert_eq!(
         lookup(&sim, "s_blocked"),
         0xCAFE,
@@ -80,7 +84,11 @@ module tb;
 endmodule
 "#;
     let sim = simulate(SRC, 100).expect("simulate failed");
-    assert_eq!(lookup(&sim, "s_forced"), 0xFF, "force must override the net");
+    assert_eq!(
+        lookup(&sim, "s_forced"),
+        0xFF,
+        "force must override the net"
+    );
     assert_eq!(
         lookup(&sim, "s_driver_change"),
         0xFF,
@@ -117,7 +125,11 @@ module tb;
 endmodule
 "#;
     let sim = simulate(SRC, 100).expect("simulate failed");
-    assert_eq!(lookup(&sim, "s_assigned"), 0xF0F0, "assign must drive the variable");
+    assert_eq!(
+        lookup(&sim, "s_assigned"),
+        0xF0F0,
+        "assign must drive the variable"
+    );
     assert_eq!(
         lookup(&sim, "s_blocked"),
         0xF0F0,

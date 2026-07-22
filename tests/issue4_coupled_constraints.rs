@@ -167,7 +167,13 @@ endmodule
     for (label, src) in cases {
         for seed in [1u64, 2, 3, 7, 42, 99] {
             let sim = run_seed(src, seed);
-            assert_eq!(u(&sim, "rstatus"), 1, "{} seed {}: must succeed", label, seed);
+            assert_eq!(
+                u(&sim, "rstatus"),
+                1,
+                "{} seed {}: must succeed",
+                label,
+                seed
+            );
             let a = u(&sim, "gotA");
             let b = u(&sim, "gotB");
             assert!(
@@ -221,10 +227,24 @@ endmodule
         let mut seen = std::collections::HashSet::new();
         for seed in [1u64, 2, 3, 7, 42, 99] {
             let sim = run_seed(src, seed);
-            assert_eq!(u(&sim, "rstatus"), 1, "{} seed {}: must succeed", label, seed);
+            assert_eq!(
+                u(&sim, "rstatus"),
+                1,
+                "{} seed {}: must succeed",
+                label,
+                seed
+            );
             let a = u(&sim, "gotA");
             let b = u(&sim, "gotB");
-            assert_eq!(a + b, 50, "{} seed {}: A={} B={} sum must be 50", label, seed, a, b);
+            assert_eq!(
+                a + b,
+                50,
+                "{} seed {}: A={} B={} sum must be 50",
+                label,
+                seed,
+                a,
+                b
+            );
             seen.insert(a);
         }
         assert!(seen.len() > 1, "{}: A must vary across seeds", label);
@@ -317,8 +337,15 @@ module tb;
 endmodule
 "#;
     let sim = simulate(SRC, 10_000).expect("simulate failed");
-    assert_eq!(u(&sim, "bad"), 0, "every draw must be a declared enum member");
-    assert!(u(&sim, "uniq") > 1, "distribution must cover multiple members");
+    assert_eq!(
+        u(&sim, "bad"),
+        0,
+        "every draw must be a declared enum member"
+    );
+    assert!(
+        u(&sim, "uniq") > 1,
+        "distribution must cover multiple members"
+    );
 }
 
 /// §18.3 siblings of `std_randomize_enum_draws_declared_members_only`: the
@@ -363,9 +390,28 @@ endmodule
 "#;
     for seed in [1u64, 7, 42] {
         let sim = run_seed(SRC, seed);
-        assert_eq!(u(&sim, "bad_s"), 0, "seed {}: struct enum field out of member set", seed);
-        assert_eq!(u(&sim, "bad_a"), 0, "seed {}: array enum element out of member set", seed);
-        assert_eq!(u(&sim, "bad_q"), 0, "seed {}: queue enum element out of member set", seed);
-        assert!(u(&sim, "uniq") > 1, "seed {}: distribution must cover multiple members", seed);
+        assert_eq!(
+            u(&sim, "bad_s"),
+            0,
+            "seed {}: struct enum field out of member set",
+            seed
+        );
+        assert_eq!(
+            u(&sim, "bad_a"),
+            0,
+            "seed {}: array enum element out of member set",
+            seed
+        );
+        assert_eq!(
+            u(&sim, "bad_q"),
+            0,
+            "seed {}: queue enum element out of member set",
+            seed
+        );
+        assert!(
+            u(&sim, "uniq") > 1,
+            "seed {}: distribution must cover multiple members",
+            seed
+        );
     }
 }

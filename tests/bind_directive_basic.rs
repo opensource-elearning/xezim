@@ -47,17 +47,20 @@ fn bound_module_elaborates_and_asserts() {
     let sim = simulate(SRC, 100).expect("simulate failed");
     // 3 asserts ran (one per posedge after pc was set), 2 pass + 1 fail.
     assert_eq!(
-        sim.assertion_site_count(), 3,
+        sim.assertion_site_count(),
+        3,
         "expected 3 assertion sites from the bound monitor, got {}",
         sim.assertion_site_count()
     );
     assert_eq!(
-        sim.assertion_pass_total(), 2,
+        sim.assertion_pass_total(),
+        2,
         "expected 2 passes (pc==10, pc==20), got {}",
         sim.assertion_pass_total()
     );
     assert_eq!(
-        sim.assertion_fail_total(), 1,
+        sim.assertion_fail_total(),
+        1,
         "expected 1 fail (pc==999), got {}",
         sim.assertion_fail_total()
     );

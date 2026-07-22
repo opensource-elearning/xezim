@@ -40,7 +40,12 @@ endmodule
 "#;
     let out = output_of(&simulate(SRC, 200).expect("sim"));
     for want in ["T1 t=5", "T2 t=15", "T3 t=25"] {
-        assert!(out.contains(want), "@(cb) must fire on posedge clk, missing `{}`:\n{}", want, out);
+        assert!(
+            out.contains(want),
+            "@(cb) must fire on posedge clk, missing `{}`:\n{}",
+            want,
+            out
+        );
     }
 }
 
@@ -62,8 +67,16 @@ module top;
 endmodule
 "#;
     let out = output_of(&simulate(SRC, 200).expect("sim"));
-    assert!(out.contains("HH t=15"), "##2 must wait two posedges:\n{}", out);
-    assert!(out.contains("HH2 t=25"), "##1 stmt must wait one more posedge:\n{}", out);
+    assert!(
+        out.contains("HH t=15"),
+        "##2 must wait two posedges:\n{}",
+        out
+    );
+    assert!(
+        out.contains("HH2 t=25"),
+        "##1 stmt must wait one more posedge:\n{}",
+        out
+    );
 }
 
 #[test]
@@ -85,7 +98,11 @@ endmodule
 "#;
     let out = output_of(&simulate(SRC, 200).expect("sim"));
     assert!(out.contains("Z t=0"), "##0 must not wait:\n{}", out);
-    assert!(out.contains("Z3 t=25"), "##3 must wait three posedges:\n{}", out);
+    assert!(
+        out.contains("Z3 t=25"),
+        "##3 must wait three posedges:\n{}",
+        out
+    );
 }
 
 #[test]
@@ -106,5 +123,9 @@ module top;
 endmodule
 "#;
     let out = output_of(&simulate(SRC, 200).expect("sim"));
-    assert!(out.contains("F t=5"), "##1 must use the sole clocking block:\n{}", out);
+    assert!(
+        out.contains("F t=5"),
+        "##1 must use the sole clocking block:\n{}",
+        out
+    );
 }

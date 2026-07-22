@@ -45,7 +45,10 @@ fn iff_guard_blocks_until_condition_holds() {
     let sim = simulate(SRC, 200).expect("simulate failed");
     let did_wake = lookup(&sim, "did_wake") & 0x1;
     let woke_at = lookup(&sim, "woke_at") & 0xFFFFFFFF;
-    assert_eq!(did_wake, 1, "process never resumed past the iff-guarded wait");
+    assert_eq!(
+        did_wake, 1,
+        "process never resumed past the iff-guarded wait"
+    );
     // First posedge with rst_l high is t=25. Without the guard the wait
     // would have fired at the first posedge, t=5.
     assert_eq!(

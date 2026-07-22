@@ -19,7 +19,11 @@ use xezim::simulate;
 
 fn out(src: &str) -> String {
     let sim = simulate(src, 10_000).expect("simulate failed");
-    sim.output.iter().map(|o| o.message.clone()).collect::<Vec<_>>().join("\n")
+    sim.output
+        .iter()
+        .map(|o| o.message.clone())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[test]
@@ -36,8 +40,16 @@ module m; initial begin
   $display("QS=%0d,%s,%s", qs.size(), qs[0], qs[1]);
 end endmodule
 "#);
-    assert!(o.contains("QI=2,1,2"), "ref int queue not written back: {}", o);
-    assert!(o.contains("QS=2,a,b"), "ref string queue not written back: {}", o);
+    assert!(
+        o.contains("QI=2,1,2"),
+        "ref int queue not written back: {}",
+        o
+    );
+    assert!(
+        o.contains("QS=2,a,b"),
+        "ref string queue not written back: {}",
+        o
+    );
 }
 
 #[test]
@@ -61,7 +73,11 @@ module m; initial begin
   $display("V=%0d L=%0d", p::at(t, 1), p::at("xy", 1));
 end endmodule
 "#);
-    assert!(o.contains("V=121 L=121"), "passing a string var lost its bytes: {}", o);
+    assert!(
+        o.contains("V=121 L=121"),
+        "passing a string var lost its bytes: {}",
+        o
+    );
 }
 
 #[test]
@@ -73,7 +89,11 @@ module m; initial begin
   $display("W=%s", s);
 end endmodule
 "#);
-    assert!(o.contains("W=aZc"), "string[i]= wrote the wrong char: {}", o);
+    assert!(
+        o.contains("W=aZc"),
+        "string[i]= wrote the wrong char: {}",
+        o
+    );
 }
 
 #[test]
@@ -87,7 +107,11 @@ module m; initial begin
   $display("NQ=%p", n);
 end endmodule
 "#);
-    assert!(o.contains(r#"SQ='{"a", "bb"}"#), "string queue %p wrong: {}", o);
+    assert!(
+        o.contains(r#"SQ='{"a", "bb"}"#),
+        "string queue %p wrong: {}",
+        o
+    );
     assert!(o.contains("NQ='{1, 2}"), "int queue %p wrong: {}", o);
 }
 
@@ -101,7 +125,11 @@ module m; initial begin
   $display("C=%0d %p", q.size(), q);
 end endmodule
 "#);
-    assert!(o.contains("C=0 '{}"), "q = {{}} did not clear the queue: {}", o);
+    assert!(
+        o.contains("C=0 '{}"),
+        "q = {{}} did not clear the queue: {}",
+        o
+    );
 }
 
 #[test]
@@ -121,9 +149,21 @@ module m; initial begin
   $display("R=%s L=%0d", ai[1], ai[1].len());
 end endmodule
 "#);
-    assert!(o.contains(r#"AI='{0:"x", 1:"y"}"#), "int-keyed string assoc %p: {}", o);
-    assert!(o.contains(r#"SK='{"a":"apple"}"#), "string-keyed string assoc %p: {}", o);
-    assert!(o.contains("R=y L=1"), "string-valued assoc read broke: {}", o);
+    assert!(
+        o.contains(r#"AI='{0:"x", 1:"y"}"#),
+        "int-keyed string assoc %p: {}",
+        o
+    );
+    assert!(
+        o.contains(r#"SK='{"a":"apple"}"#),
+        "string-keyed string assoc %p: {}",
+        o
+    );
+    assert!(
+        o.contains("R=y L=1"),
+        "string-valued assoc read broke: {}",
+        o
+    );
 }
 
 /// The whole helper end to end: split on '.' then on ':', with a clear between.
@@ -154,5 +194,9 @@ module tb; initial begin
 end endmodule
 "#);
     assert!(o.contains(r#"DOT='{"a", "bb", "ccc"}"#), "dot split: {}", o);
-    assert!(o.contains(r#"COLON='{"x", "yy", "zzz"}"#), "colon split: {}", o);
+    assert!(
+        o.contains(r#"COLON='{"x", "yy", "zzz"}"#),
+        "colon split: {}",
+        o
+    );
 }

@@ -68,10 +68,18 @@ fn waiter_sees_pre_nba_state_of_current_cycle() {
     // If the fix is missing, snap_initial reads cnt POST-the t=15 edge_block
     // apply_nba — so snap_initial would be 1 instead of 0.
     let snap_initial = lookup(&sim, "cap_initial_at_t15") & 0xFFFFFFFF;
-    let snap_always  = lookup(&sim, "cap_always_at_t15") & 0xFFFFFFFF;
-    let cnt          = lookup(&sim, "cap_cnt_at_t15") & 0xFFFFFFFF;
-    assert_eq!(cnt, 1, "cnt at t=15 active region should be 1 (post-t=5-NBA), got {}", cnt);
-    assert_eq!(snap_always, 0, "snap_always at t=15 should be 0 (from t=5 NBA), got {}", snap_always);
+    let snap_always = lookup(&sim, "cap_always_at_t15") & 0xFFFFFFFF;
+    let cnt = lookup(&sim, "cap_cnt_at_t15") & 0xFFFFFFFF;
+    assert_eq!(
+        cnt, 1,
+        "cnt at t=15 active region should be 1 (post-t=5-NBA), got {}",
+        cnt
+    );
+    assert_eq!(
+        snap_always, 0,
+        "snap_always at t=15 should be 0 (from t=5 NBA), got {}",
+        snap_always
+    );
     assert_eq!(snap_initial, 0,
         "snap_initial at t=15 should be 0 (from t=5 NBA, NOT leaked from t=15 edge_block NBA), got {}",
         snap_initial);

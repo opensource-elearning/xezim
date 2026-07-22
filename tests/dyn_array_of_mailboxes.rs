@@ -95,7 +95,11 @@ fn u(sim: &xezim::compiler::Simulator, n: &str) -> u64 {
 fn dynamic_array_of_fixed_mailbox_rows_round_trips_every_element() {
     let sim = simulate(DYN_OUTER, 100).expect("simulate failed");
     assert_eq!(u(&sim, "iters"), 80, "foreach must visit 5 x 16 elements");
-    assert_eq!(u(&sim, "fails"), 0, "every mailbox must return its own datum");
+    assert_eq!(
+        u(&sim, "fails"),
+        0,
+        "every mailbox must return its own datum"
+    );
 }
 
 #[test]
@@ -108,7 +112,11 @@ fn fixed_2d_mailbox_array_elements_hold_distinct_handles() {
 #[test]
 fn mailbox_inside_an_interface_is_reachable_hierarchically() {
     let sim = simulate(IFACE_MBOX, 100).expect("simulate failed");
-    assert_eq!(u(&sim, "ok"), 1, "try_put through tif.ping_mbox must succeed");
+    assert_eq!(
+        u(&sim, "ok"),
+        1,
+        "try_put through tif.ping_mbox must succeed"
+    );
     assert_eq!(u(&sim, "n"), 1, "num() must see the queued item");
     assert_eq!(u(&sim, "got"), 42, "get must return the queued value");
 }

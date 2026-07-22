@@ -153,5 +153,9 @@ fn finish_line_is_not_printed_twice() {
         .lines()
         .filter(|l| l.contains("Simulation finished at time"))
         .count();
-    assert_eq!(n, 1, "result line must appear once, saw {}x:\n{}", n, logged);
+    assert_eq!(
+        n, 1,
+        "result line must appear once, saw {}x:\n{}",
+        n, logged
+    );
 }

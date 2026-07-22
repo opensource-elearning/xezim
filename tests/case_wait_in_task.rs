@@ -92,7 +92,11 @@ endmodule
 "#;
     let sim = simulate(src, 10).expect("simulate failed");
     assert_eq!(lookup(&sim, "a"), 7, "matched case arm ran");
-    assert_eq!(lookup(&sim, "b"), 1, "execution continued past the case/task");
+    assert_eq!(
+        lookup(&sim, "b"),
+        1,
+        "execution continued past the case/task"
+    );
 }
 
 /// The `default` arm of a case must be selected when no item matches, and if
@@ -120,7 +124,8 @@ endmodule
     let sim = simulate(src, 30).expect("simulate failed");
     // The default arm blocked on wait(flag) until t=10, then set got=222.
     assert_eq!(
-        lookup(&sim, "got"), 222,
+        lookup(&sim, "got"),
+        222,
         "default arm selected and blocked until flag rose"
     );
 }

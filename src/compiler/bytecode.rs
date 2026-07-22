@@ -28,7 +28,7 @@ pub enum Insn {
     /// to shrink `Insn` from 40 B to 32 B.
     LoadConst(RegId, Box<Value>),
     /// Load a signal from signal_table[signal_id] into a register.
-    LoadSignal(RegId, usize),      // (dest_reg, signal_id)
+    LoadSignal(RegId, usize), // (dest_reg, signal_id)
     /// Load a signal and mark it as signed.
     LoadSignalSigned(RegId, usize),
     /// Resize register to given width.
@@ -131,7 +131,7 @@ pub enum Insn {
     /// Marks end of a compiled block (no-op, helps debugging).
     /// Copy src register to dest register.
     Move(RegId, RegId), // (dest, src)
-    
+
     /// Fallback: invoke the AST interpreter on an untranslated statement.
     /// Used for rare constructs (e.g. $display, complex LHS) so an edge
     /// block containing one unsupported stmt can still run most of its
@@ -1725,20 +1725,20 @@ impl<'a> BytecodeCompiler<'a> {
                 Some(dest)
             }
             ExprKind::SystemCall { name, args } => match name.as_str() {
-                    "$signed" => {
-                        let r = self.compile_expr(args.first()?, 0)?;
-                        self.emit(Insn::SetSigned(r));
-                        Some(r)
-                    }
-                    "$unsigned" => {
-                        let r = self.compile_expr(args.first()?, 0)?;
-                        Some(r)
-                    }
-                    other => {
-                        self.bail("SystemCall_other");
-                        let _ = other;
-                        None
-                    }
+                "$signed" => {
+                    let r = self.compile_expr(args.first()?, 0)?;
+                    self.emit(Insn::SetSigned(r));
+                    Some(r)
+                }
+                "$unsigned" => {
+                    let r = self.compile_expr(args.first()?, 0)?;
+                    Some(r)
+                }
+                other => {
+                    self.bail("SystemCall_other");
+                    let _ = other;
+                    None
+                }
             },
             other => {
                 let n: &'static str = match other {
@@ -2349,10 +2349,10 @@ impl<'a> BytecodeCompiler<'a> {
                     // Packed multi-D vector: element is N bits, not 1.
                     if let Some(elem_w) = self.packed_elem_widths.and_then(|m| {
                         m.get(raw.as_str()).copied().or_else(|| {
-                                hier.path
-                                    .last()
-                                    .and_then(|s| m.get(s.name.name.as_str()).copied())
-                            })
+                            hier.path
+                                .last()
+                                .and_then(|s| m.get(s.name.name.as_str()).copied())
+                        })
                     }) {
                         if elem_w > 1 {
                             return elem_w;
@@ -2362,26 +2362,26 @@ impl<'a> BytecodeCompiler<'a> {
                     1
                 } else {
                     32
-            }
+                }
             }
             ExprKind::RangeSelect {
                 left, right, kind, ..
             } => match kind {
-                    RangeKind::IndexedUp | RangeKind::IndexedDown => {
-                        self.eval_const_expr(right).unwrap_or(32)
-                    }
-                    RangeKind::Constant => {
+                RangeKind::IndexedUp | RangeKind::IndexedDown => {
+                    self.eval_const_expr(right).unwrap_or(32)
+                }
+                RangeKind::Constant => {
                     if let (Some(l), Some(r)) =
                         (self.eval_const_expr(left), self.eval_const_expr(right))
                     {
-                            let (hi, lo) = if l >= r { (l, r) } else { (r, l) };
+                        let (hi, lo) = if l >= r { (l, r) } else { (r, l) };
                         hi.checked_sub(lo)
                             .and_then(|w| w.checked_add(1))
                             .unwrap_or(32)
                     } else {
                         32
+                    }
                 }
-            }
             },
             ExprKind::Concatenation(parts) => parts.iter().map(|p| self.infer_lhs_width(p)).sum(),
             _ => 32,
@@ -2447,12 +2447,12 @@ impl<'a> BytecodeCompiler<'a> {
                         let e = u32::try_from(r as i64).ok()?;
                         (l as i64).checked_pow(e)? as u64
                     }
-                    BinaryOp::ShiftLeft  | BinaryOp::ArithShiftLeft  => l.checked_shl(r as u32)?,
+                    BinaryOp::ShiftLeft | BinaryOp::ArithShiftLeft => l.checked_shl(r as u32)?,
                     BinaryOp::ShiftRight => l.checked_shr(r as u32)?,
                     BinaryOp::ArithShiftRight => ((l as i64).wrapping_shr(r as u32)) as u64,
-                    BinaryOp::BitAnd  => l & r,
-                    BinaryOp::BitOr   => l | r,
-                    BinaryOp::BitXor  => l ^ r,
+                    BinaryOp::BitAnd => l & r,
+                    BinaryOp::BitOr => l | r,
+                    BinaryOp::BitXor => l ^ r,
                     BinaryOp::BitXnor => !(l ^ r),
                     BinaryOp::Eq | BinaryOp::CaseEq => {
                         if l == r {
@@ -2503,9 +2503,9 @@ impl<'a> BytecodeCompiler<'a> {
             ExprKind::Unary { op, operand } => {
                 let v = self.eval_const_expr(operand)? as u64;
                 let r: u64 = match op {
-                    UnaryOp::Plus    => v,
-                    UnaryOp::Minus   => 0u64.wrapping_sub(v),
-                    UnaryOp::BitNot  => !v,
+                    UnaryOp::Plus => v,
+                    UnaryOp::Minus => 0u64.wrapping_sub(v),
+                    UnaryOp::BitNot => !v,
                     UnaryOp::LogNot => {
                         if v == 0 {
                             1
@@ -2544,7 +2544,7 @@ impl<'a> BytecodeCompiler<'a> {
                             1
                         }
                     }
-                    UnaryOp::BitXor  => (v.count_ones() & 1) as u64,
+                    UnaryOp::BitXor => (v.count_ones() & 1) as u64,
                     UnaryOp::BitXnor => 1 - ((v.count_ones() & 1) as u64),
                     _ => return None,
                 };
@@ -2658,7 +2658,7 @@ impl<'a> BytecodeCompiler<'a> {
         match &expr.kind {
             ExprKind::Ident(hier) => self
                 .lookup_signal_id(hier)
-                    .map(|id| self.signal_widths[id])
+                .map(|id| self.signal_widths[id])
                 .unwrap_or(0),
             ExprKind::Number(n) => self.eval_number_static(n).map(|v| v.width).unwrap_or(32),
             ExprKind::Binary { op, left, right } => {
@@ -2924,11 +2924,12 @@ impl<'a> BytecodeCompiler<'a> {
                 {
                     // Pre-resize at fuse time — the exec arm then only
                     // compares + clones-on-change, never resizes.
-                    (*c, Insn::NbaAssignConst(sig, Box::new(k.resize_for_assign(w)), w))
+                    (
+                        *c,
+                        Insn::NbaAssignConst(sig, Box::new(k.resize_for_assign(w)), w),
+                    )
                 }
-                (&Insn::LogNot(d, s), &Insn::BranchIfFalse(c, t))
-                    if c == d && (mode & 8) != 0 =>
-                {
+                (&Insn::LogNot(d, s), &Insn::BranchIfFalse(c, t)) if c == d && (mode & 8) != 0 => {
                     (d, Insn::BranchUnlessZero(s, t))
                 }
                 (&Insn::LoadSignal(r, sig), &Insn::BranchIfFalse(c, t))

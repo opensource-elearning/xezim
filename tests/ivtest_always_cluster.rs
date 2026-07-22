@@ -31,7 +31,10 @@ fn assert_passes(name: &str, src: &str) {
         .map(|o| o.message.as_str())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(out.contains("PASSED"), "{name}: no PASSED in output:\n{out}");
+    assert!(
+        out.contains("PASSED"),
+        "{name}: no PASSED in output:\n{out}"
+    );
     assert!(!out.contains("FAILED"), "{name}: printed FAILED:\n{out}");
 }
 

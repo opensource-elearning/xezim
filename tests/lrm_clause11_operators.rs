@@ -85,7 +85,11 @@ fn arithmetic_shift_right_honours_operand_signedness() {
 #[test]
 fn inside_uses_wildcard_equality_for_set_elements() {
     let sim = simulate(SRC, 100).expect("simulate failed");
-    assert_eq!(u(&sim, "wild_hit"), 1, "4'b1010 inside {{4'b10xx}} must match");
+    assert_eq!(
+        u(&sim, "wild_hit"),
+        1,
+        "4'b1010 inside {{4'b10xx}} must match"
+    );
     assert_eq!(u(&sim, "wild_miss"), 0);
     // An array operand's elements are patterns as well.
     assert_eq!(u(&sim, "wildq"), 1);

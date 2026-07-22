@@ -178,21 +178,37 @@ fn lookup(sim: &xezim::compiler::Simulator, name: &str) -> u64 {
 #[test]
 fn cross_instance_entry_routing_correct() {
     let sim = simulate(SRC, 500).expect("simulate failed");
-    let e2  = lookup(&sim, "cap_e2")  & 0xFFFF;
-    let e5  = lookup(&sim, "cap_e5")  & 0xFFFF;
+    let e2 = lookup(&sim, "cap_e2") & 0xFFFF;
+    let e5 = lookup(&sim, "cap_e5") & 0xFFFF;
     let e17 = lookup(&sim, "cap_e17") & 0xFFFF;
     let e31 = lookup(&sim, "cap_e31") & 0xFFFF;
-    assert_eq!(e2,  0xd70b, "entry 2 (instance e2.inst_data) wrong: 0x{:04x}", e2);
-    assert_eq!(e5,  0x4758, "entry 5 (instance e5.inst_data) wrong: 0x{:04x}", e5);
-    assert_eq!(e17, 0x5847, "entry 17 (instance e17.inst_data) wrong: 0x{:04x}", e17);
-    assert_eq!(e31, 0xe39d, "entry 31 (instance e31.inst_data) wrong: 0x{:04x}", e31);
+    assert_eq!(
+        e2, 0xd70b,
+        "entry 2 (instance e2.inst_data) wrong: 0x{:04x}",
+        e2
+    );
+    assert_eq!(
+        e5, 0x4758,
+        "entry 5 (instance e5.inst_data) wrong: 0x{:04x}",
+        e5
+    );
+    assert_eq!(
+        e17, 0x5847,
+        "entry 17 (instance e17.inst_data) wrong: 0x{:04x}",
+        e17
+    );
+    assert_eq!(
+        e31, 0xe39d,
+        "entry 31 (instance e31.inst_data) wrong: 0x{:04x}",
+        e31
+    );
 
-    let p2  = lookup(&sim, "cap_p2")  & 0xFFFF;
-    let p5  = lookup(&sim, "cap_p5")  & 0xFFFF;
+    let p2 = lookup(&sim, "cap_p2") & 0xFFFF;
+    let p5 = lookup(&sim, "cap_p5") & 0xFFFF;
     let p17 = lookup(&sim, "cap_p17") & 0xFFFF;
     let p31 = lookup(&sim, "cap_p31") & 0xFFFF;
-    assert_eq!(p2,  0xd70b, "pop via entry 2 mismatch: 0x{:04x}", p2);
-    assert_eq!(p5,  0x4758, "pop via entry 5 mismatch: 0x{:04x}", p5);
+    assert_eq!(p2, 0xd70b, "pop via entry 2 mismatch: 0x{:04x}", p2);
+    assert_eq!(p5, 0x4758, "pop via entry 5 mismatch: 0x{:04x}", p5);
     assert_eq!(p17, 0x5847, "pop via entry 17 mismatch: 0x{:04x}", p17);
     assert_eq!(p31, 0xe39d, "pop via entry 31 mismatch: 0x{:04x}", p31);
 }

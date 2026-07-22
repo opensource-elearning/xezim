@@ -15,7 +15,7 @@ use xezim_core::ast::decl::{
     ClassDeclaration, ClassItem, ClassMethodKind, ClassQualifier, ModuleItem, TypedefDeclaration,
 };
 use xezim_core::ast::expr::{
-    AssignmentPatternItem, Expression, ExprKind, NumberBase, NumberLiteral, RangeKind,
+    AssignmentPatternItem, ExprKind, Expression, NumberBase, NumberLiteral, RangeKind,
 };
 use xezim_core::ast::stmt::{Statement, StatementKind, VarDeclarator};
 use xezim_core::ast::types::{
@@ -166,7 +166,8 @@ fn check_output_port_defaults(
 ) {
     use xezim_core::ast::types::PortDirection;
     for p in ports {
-        if p.default.is_some() && matches!(p.direction, PortDirection::Output | PortDirection::Inout)
+        if p.default.is_some()
+            && matches!(p.direction, PortDirection::Output | PortDirection::Inout)
         {
             errs.push(format!(
                 "default value on subroutine {} port '{}' is not allowed (LRM 1800-2017 §13.5.3)",
@@ -329,12 +330,7 @@ fn check_enum_assign(items: &[ModuleItem], elab: &ElaboratedModule, errs: &mut V
     if enum_vars.is_empty() {
         return;
     }
-    fn flag(
-        lv: &Expression,
-        rv: &Expression,
-        enum_vars: &HashSet<String>,
-        errs: &mut Vec<String>,
-    ) {
+    fn flag(lv: &Expression, rv: &Expression, enum_vars: &HashSet<String>, errs: &mut Vec<String>) {
         // Only a whole-variable target (`e = ...`), never `e[i] = ...`.
         if matches!(lv.kind, ExprKind::Ident(_)) {
             if let Some(b) = base_ident(lv) {
@@ -481,9 +477,9 @@ fn for_each_proc_assign_lhs(stmt: &Statement, f: &mut dyn FnMut(&Expression)) {
                 for_each_proc_assign_lhs(e, f);
             }
         }
-        StatementKind::Case { items, .. } => {
-            items.iter().for_each(|it| for_each_proc_assign_lhs(&it.stmt, f))
-        }
+        StatementKind::Case { items, .. } => items
+            .iter()
+            .for_each(|it| for_each_proc_assign_lhs(&it.stmt, f)),
         StatementKind::For { body, .. }
         | StatementKind::Foreach { body, .. }
         | StatementKind::While { body, .. }
@@ -508,9 +504,7 @@ fn check_zero_slice(e: &Expression, elab: &ElaboratedModule, errs: &mut Vec<Stri
             if let Some(0) =
                 xezim_core::elaborate::const_eval_i64_with_params(right, Some(&elab.parameters))
             {
-                errs.push(
-                    "indexed part-select has zero width (LRM 1800-2017 §11.5.1)".to_string(),
-                );
+                errs.push("indexed part-select has zero width (LRM 1800-2017 §11.5.1)".to_string());
             }
         }
     }
@@ -626,8 +620,7 @@ fn for_each_stmt_expr(stmt: &Statement, f: &mut dyn FnMut(&Expression)) {
             for_each_expr(array, f);
             for_each_stmt_expr(body, f);
         }
-        StatementKind::While { condition, body }
-        | StatementKind::DoWhile { body, condition } => {
+        StatementKind::While { condition, body } | StatementKind::DoWhile { body, condition } => {
             for_each_expr(condition, f);
             for_each_stmt_expr(body, f);
         }
@@ -693,11 +686,7 @@ fn for_each_stmt(stmt: &Statement, f: &mut dyn FnMut(&Statement)) {
 ///    queues resize, so they are never an error and are skipped);
 ///  - the source width is taken ONLY when every operand is a plain in-scope
 ///    identifier of known fixed width — any unresolved operand bails the check.
-fn check_stream_widths(
-    items: &[ModuleItem],
-    elab: &ElaboratedModule,
-    errs: &mut Vec<String>,
-) {
+fn check_stream_widths(items: &[ModuleItem], elab: &ElaboratedModule, errs: &mut Vec<String>) {
     let vw = build_var_widths(items, elab);
     for it in items {
         match it {
@@ -821,11 +810,8 @@ fn fixed_int_width(dt: &DataType, elab: &ElaboratedModule) -> Option<u32> {
     ) {
         return None;
     }
-    let w = xezim_core::elaborate::resolve_type_width(
-        dt,
-        Some(&elab.parameters),
-        Some(&elab.typedefs),
-    );
+    let w =
+        xezim_core::elaborate::resolve_type_width(dt, Some(&elab.parameters), Some(&elab.typedefs));
     if w == 0 {
         None
     } else {
@@ -867,7 +853,9 @@ fn check_enum_type(dt: &DataType, elab: &ElaboratedModule, errs: &mut Vec<String
         if w != 0 {
             for m in &et.members {
                 if let Some(init) = &m.init {
-                    if let ExprKind::Number(NumberLiteral::Integer { size: Some(s), .. }) = &init.kind {
+                    if let ExprKind::Number(NumberLiteral::Integer { size: Some(s), .. }) =
+                        &init.kind
+                    {
                         if *s != w {
                             errs.push(format!(
                                 "enum member '{}': sized literal width {} differs from the enum base \
@@ -908,7 +896,10 @@ fn enum_base_is_signed(base: Option<&DataType>) -> bool {
 fn sized_literal_size(e: &Expression) -> Option<u32> {
     use xezim_core::ast::expr::UnaryOp;
     let inner = match &e.kind {
-        ExprKind::Unary { op: UnaryOp::Minus | UnaryOp::Plus, operand } => operand.as_ref(),
+        ExprKind::Unary {
+            op: UnaryOp::Minus | UnaryOp::Plus,
+            operand,
+        } => operand.as_ref(),
         _ => e,
     };
     if let ExprKind::Number(NumberLiteral::Integer { size: Some(s), .. }) = &inner.kind {
@@ -922,7 +913,9 @@ fn sized_literal_size(e: &Expression) -> Option<u32> {
 fn expr_is_xz_number(e: &Expression) -> bool {
     if let ExprKind::Number(NumberLiteral::Integer { base, value, .. }) = &e.kind {
         if !matches!(base, NumberBase::Decimal) {
-            return value.chars().any(|c| matches!(c, 'x' | 'X' | 'z' | 'Z' | '?'));
+            return value
+                .chars()
+                .any(|c| matches!(c, 'x' | 'X' | 'z' | 'Z' | '?'));
         }
     }
     false
@@ -958,7 +951,13 @@ fn check_enum_values(et: &EnumType, elab: &ElaboratedModule, errs: &mut Vec<Stri
         _ => return,
     }
     let width = base
-        .map(|b| xezim_core::elaborate::resolve_type_width(b, Some(&elab.parameters), Some(&elab.typedefs)))
+        .map(|b| {
+            xezim_core::elaborate::resolve_type_width(
+                b,
+                Some(&elab.parameters),
+                Some(&elab.typedefs),
+            )
+        })
         .unwrap_or(32);
     if width == 0 || width > 64 {
         return;
@@ -969,7 +968,11 @@ fn check_enum_values(et: &EnumType, elab: &ElaboratedModule, errs: &mut Vec<Stri
     } else {
         (0, (1i128 << width) - 1)
     };
-    let mask: u128 = if width >= 128 { u128::MAX } else { (1u128 << width) - 1 };
+    let mask: u128 = if width >= 128 {
+        u128::MAX
+    } else {
+        (1u128 << width) - 1
+    };
     let params = Some(&elab.parameters);
     let mut next: i128 = 0;
     let mut seen: std::collections::HashMap<u128, String> = std::collections::HashMap::new();
@@ -1131,9 +1134,15 @@ fn check_class(c: &ClassDeclaration, errs: &mut Vec<String>) {
 
 /// True if statement `s` is a bare `super.new(...)` call.
 fn stmt_is_super_new(s: &Statement) -> bool {
-    let StatementKind::Expr(e) = &s.kind else { return false };
-    let ExprKind::Call { func, .. } = &e.kind else { return false };
-    let ExprKind::MemberAccess { expr, member } = &func.kind else { return false };
+    let StatementKind::Expr(e) = &s.kind else {
+        return false;
+    };
+    let ExprKind::Call { func, .. } = &e.kind else {
+        return false;
+    };
+    let ExprKind::MemberAccess { expr, member } = &func.kind else {
+        return false;
+    };
     if member.name != "new" {
         return false;
     }
@@ -1288,10 +1297,36 @@ fn collect_idents(e: &Expression, out: &mut Vec<String>) {
 fn is_builtin_type(n: &str) -> bool {
     matches!(
         n,
-        "bit" | "logic" | "reg" | "byte" | "shortint" | "int" | "longint" | "integer"
-            | "time" | "real" | "shortreal" | "realtime" | "string" | "chandle" | "event"
-            | "void" | "wire" | "tri" | "wand" | "wor" | "uwire" | "signed" | "unsigned"
-            | "genvar" | "type" | "enum" | "struct" | "union" | "process" | "supply0"
+        "bit"
+            | "logic"
+            | "reg"
+            | "byte"
+            | "shortint"
+            | "int"
+            | "longint"
+            | "integer"
+            | "time"
+            | "real"
+            | "shortreal"
+            | "realtime"
+            | "string"
+            | "chandle"
+            | "event"
+            | "void"
+            | "wire"
+            | "tri"
+            | "wand"
+            | "wor"
+            | "uwire"
+            | "signed"
+            | "unsigned"
+            | "genvar"
+            | "type"
+            | "enum"
+            | "struct"
+            | "union"
+            | "process"
+            | "supply0"
             | "supply1"
     )
 }
@@ -1307,13 +1342,20 @@ use xezim_core::ast::types::SimpleType;
 fn is_real_or_string(dt: &DataType) -> bool {
     matches!(
         dt,
-        DataType::Real { .. } | DataType::Simple { kind: SimpleType::String, .. }
+        DataType::Real { .. }
+            | DataType::Simple {
+                kind: SimpleType::String,
+                ..
+            }
     )
 }
 
 /// One `==?`/`!=?` operand is illegal when it is a real/string literal or a
 /// declared real/string variable.
-fn wildcard_operand_illegal(e: &Expression, nonintegral: &std::collections::HashSet<String>) -> bool {
+fn wildcard_operand_illegal(
+    e: &Expression,
+    nonintegral: &std::collections::HashSet<String>,
+) -> bool {
     match &e.kind {
         ExprKind::Number(NumberLiteral::Real(_)) => true,
         ExprKind::StringLiteral(_) => true,
@@ -1473,7 +1515,10 @@ fn check_unpacked_dims(
                     }
                 }
             }
-            UnpackedDimension::Queue { max_size: Some(bound), .. } => {
+            UnpackedDimension::Queue {
+                max_size: Some(bound),
+                ..
+            } => {
                 if expr_is_xz_number(bound) {
                     errs.push(format!(
                         "queue '{}' bound must be a defined value (LRM 1800-2017 §7.10)",
@@ -1689,58 +1734,57 @@ fn check_implicit_ports(
             continue;
         };
         for instance in &inst.instances {
-        // Ports explicitly listed by name (`.p(...)` or the no-connect `.p()`)
-        // are NOT filled by `.*` and impose no implicit-net requirement.
-        let explicit: HashSet<String> = instance
-            .connections
-            .iter()
-            .filter_map(|c| match c {
-                xezim_core::ast::decl::PortConnection::Named { name, .. } => {
-                    Some(name.name.clone())
-                }
-                _ => None,
-            })
-            .collect();
-        for conn in &instance.connections {
-            match conn {
-                // Only a parenthesis-free `.name` (implicit: true) requires a
-                // same-named net; `.name()` is an explicit no-connect.
-                xezim_core::ast::decl::PortConnection::Named {
-                    name,
-                    expr: None,
-                    implicit: true,
-                } => {
-                    if !scope.contains(&name.name) {
-                        errs.push(format!(
-                            "implicit port connection '.{}' has no matching signal in the \
-                             enclosing scope (LRM 1800-2017 §23.3.2.2)",
-                            name.name
-                        ));
+            // Ports explicitly listed by name (`.p(...)` or the no-connect `.p()`)
+            // are NOT filled by `.*` and impose no implicit-net requirement.
+            let explicit: HashSet<String> = instance
+                .connections
+                .iter()
+                .filter_map(|c| match c {
+                    xezim_core::ast::decl::PortConnection::Named { name, .. } => {
+                        Some(name.name.clone())
                     }
-                }
-                xezim_core::ast::decl::PortConnection::Wildcard => {
-                    if let Some(tports) = port_map.get(&inst.module_name.name) {
-                        let mut missing: Vec<&String> = tports
-                            .iter()
-                            .filter(|p| !scope.contains(*p) && !explicit.contains(*p))
-                            .collect();
-                        missing.sort();
-                        for p in missing {
+                    _ => None,
+                })
+                .collect();
+            for conn in &instance.connections {
+                match conn {
+                    // Only a parenthesis-free `.name` (implicit: true) requires a
+                    // same-named net; `.name()` is an explicit no-connect.
+                    xezim_core::ast::decl::PortConnection::Named {
+                        name,
+                        expr: None,
+                        implicit: true,
+                    } => {
+                        if !scope.contains(&name.name) {
                             errs.push(format!(
-                                "wildcard port connection (.*) found no matching signal for \
-                                 port '{}' (LRM 1800-2017 §23.3.2.4)",
-                                p
+                                "implicit port connection '.{}' has no matching signal in the \
+                             enclosing scope (LRM 1800-2017 §23.3.2.2)",
+                                name.name
                             ));
                         }
                     }
+                    xezim_core::ast::decl::PortConnection::Wildcard => {
+                        if let Some(tports) = port_map.get(&inst.module_name.name) {
+                            let mut missing: Vec<&String> = tports
+                                .iter()
+                                .filter(|p| !scope.contains(*p) && !explicit.contains(*p))
+                                .collect();
+                            missing.sort();
+                            for p in missing {
+                                errs.push(format!(
+                                    "wildcard port connection (.*) found no matching signal for \
+                                 port '{}' (LRM 1800-2017 §23.3.2.4)",
+                                    p
+                                ));
+                            }
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
-        }
         }
     }
 }
-
 
 /// §9.2.1: a plain `always` whose body contains NO timing control anywhere
 /// (`#delay`, `@event`, `wait`, or an intra-assignment delay) can never yield —
@@ -1752,10 +1796,7 @@ fn check_implicit_ports(
 /// Over-reject guards: any user TASK call is assumed potentially timed (the
 /// delay may live in the task body), and `always_comb`/`always_latch`/
 /// `always_ff` are governed by their own §9.2.2 rules, not this one.
-fn check_always_has_timing_control(
-    a: &crate::ast::decl::AlwaysConstruct,
-    errs: &mut Vec<String>,
-) {
+fn check_always_has_timing_control(a: &crate::ast::decl::AlwaysConstruct, errs: &mut Vec<String>) {
     use crate::ast::decl::AlwaysKind;
     if a.kind != AlwaysKind::Always {
         return;

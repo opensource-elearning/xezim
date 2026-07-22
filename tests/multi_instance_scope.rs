@@ -37,9 +37,22 @@ fn multiply_instantiated_randomize_and_m_are_per_instance() {
     assert!(a <= 6, "p0.idx={} violates constraint", a);
     assert!(b <= 6, "p1.idx={} violates constraint", b);
     // %m must report each instance's scope, not just the top.
-    let joined: String = sim.output.iter().map(|o| o.message.as_str()).collect::<Vec<_>>().join("\n");
-    assert!(joined.contains("TB.p0"), "%m did not report TB.p0 scope:\n{}", joined);
-    assert!(joined.contains("TB.p1"), "%m did not report TB.p1 scope:\n{}", joined);
+    let joined: String = sim
+        .output
+        .iter()
+        .map(|o| o.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        joined.contains("TB.p0"),
+        "%m did not report TB.p0 scope:\n{}",
+        joined
+    );
+    assert!(
+        joined.contains("TB.p1"),
+        "%m did not report TB.p1 scope:\n{}",
+        joined
+    );
 }
 
 /// `%m` inside a *package* function must report the package-qualified

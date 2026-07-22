@@ -78,16 +78,28 @@ fn putc_replaces_a_character_in_place() {
 #[test]
 fn putc_leaves_the_string_alone_on_a_bad_index_or_null_char() {
     let sim = simulate(SRC, 100).expect("simulate failed");
-    assert_eq!(text(&sim, "s_oob"), "abc", "index past the end must be ignored");
+    assert_eq!(
+        text(&sim, "s_oob"),
+        "abc",
+        "index past the end must be ignored"
+    );
     assert_eq!(text(&sim, "s_neg"), "abc", "negative index must be ignored");
-    assert_eq!(text(&sim, "s_null"), "abc", "a null character must be ignored");
+    assert_eq!(
+        text(&sim, "s_null"),
+        "abc",
+        "a null character must be ignored"
+    );
 }
 
 #[test]
 fn the_toa_family_writes_the_receiver() {
     let sim = simulate(SRC, 100).expect("simulate failed");
     assert_eq!(text(&sim, "s_itoa"), "255", "itoa was a no-op");
-    assert_eq!(text(&sim, "s_itoa_neg"), "-5", "itoa must render a signed decimal");
+    assert_eq!(
+        text(&sim, "s_itoa_neg"),
+        "-5",
+        "itoa must render a signed decimal"
+    );
     assert_eq!(text(&sim, "s_hex"), "ff");
     assert_eq!(text(&sim, "s_oct"), "10");
     assert_eq!(text(&sim, "s_bin"), "101");
@@ -101,7 +113,11 @@ fn atoreal_parses_the_longest_valid_prefix() {
     let sim = simulate(SRC, 100).expect("simulate failed");
     assert_eq!(real(&sim, "r_ok"), 3.5, "atoreal returned 0.0");
     assert_eq!(real(&sim, "r_none"), 0.0, "no valid prefix -> 0.0");
-    assert_eq!(real(&sim, "r_part"), 12.5, "stop at the first invalid character");
+    assert_eq!(
+        real(&sim, "r_part"),
+        12.5,
+        "stop at the first invalid character"
+    );
     assert_eq!(real(&sim, "r_exp"), -150.0, "exponent form");
     assert_eq!(real(&sim, "r_int"), 7.0);
 }

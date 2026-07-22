@@ -72,17 +72,37 @@ fn unpacked_struct_array_members_keep_per_element_types() {
     assert_eq!(u(&sim, "a1_i") & 0xFFFF_FFFF, 22);
 
     // `real` members keep is_real (previously read back as raw bits).
-    assert!((f(&sim, "a0_r") - 1.5).abs() < 1e-9, "a[0].r = {}", f(&sim, "a0_r"));
-    assert!((f(&sim, "a1_r") - 2.5).abs() < 1e-9, "a[1].r = {}", f(&sim, "a1_r"));
+    assert!(
+        (f(&sim, "a0_r") - 1.5).abs() < 1e-9,
+        "a[0].r = {}",
+        f(&sim, "a0_r")
+    );
+    assert!(
+        (f(&sim, "a1_r") - 2.5).abs() < 1e-9,
+        "a[1].r = {}",
+        f(&sim, "a1_r")
+    );
 
     // A member sitting beside a packed-struct / string member must not alias.
     assert_eq!(u(&sim, "n0_st") & 0xFFFF_FFFF, 11, "arr[0].status aliased");
     assert_eq!(u(&sim, "n1_st") & 0xFFFF_FFFF, 22, "arr[1].status aliased");
 
     // Nested PACKED struct member inside an unpacked element: arr[0].tag.vlan.
-    assert_eq!(u(&sim, "vlan0") & 0xF, 0x3, "arr[0].tag.vlan not sliced from its own signal");
+    assert_eq!(
+        u(&sim, "vlan0") & 0xF,
+        0x3,
+        "arr[0].tag.vlan not sliced from its own signal"
+    );
 
     // Array-of-structs nested inside a struct: c.nodes[i].status.
-    assert_eq!(u(&sim, "c0_st") & 0xFFFF_FFFF, 11, "c.nodes[0].status aliased");
-    assert_eq!(u(&sim, "c1_st") & 0xFFFF_FFFF, 22, "c.nodes[1].status aliased");
+    assert_eq!(
+        u(&sim, "c0_st") & 0xFFFF_FFFF,
+        11,
+        "c.nodes[0].status aliased"
+    );
+    assert_eq!(
+        u(&sim, "c1_st") & 0xFFFF_FFFF,
+        22,
+        "c.nodes[1].status aliased"
+    );
 }

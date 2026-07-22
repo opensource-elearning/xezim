@@ -77,7 +77,10 @@ fn chain_of_two_is_two_executions() {
         "Counter c; Counter r; c = new(); r = c.inc().inc(); $display(\"COUNT %0d\", c.count);",
         "two",
     );
-    assert!(out.contains("COUNT 2"), "chain of two mis-evaluated:\n{out}");
+    assert!(
+        out.contains("COUNT 2"),
+        "chain of two mis-evaluated:\n{out}"
+    );
 }
 
 #[test]
@@ -87,7 +90,10 @@ fn chain_of_three_is_three_executions() {
         "Counter c; Counter r; c = new(); r = c.inc().inc().inc(); $display(\"COUNT %0d\", c.count);",
         "three",
     );
-    assert!(out.contains("COUNT 3"), "chain of three mis-evaluated:\n{out}");
+    assert!(
+        out.contains("COUNT 3"),
+        "chain of three mis-evaluated:\n{out}"
+    );
 }
 
 #[test]
@@ -97,7 +103,10 @@ fn chain_of_four_is_four_executions() {
         "Counter c; Counter r; c = new(); r = c.inc().inc().inc().inc(); $display(\"COUNT %0d\", c.count);",
         "four",
     );
-    assert!(out.contains("COUNT 4"), "chain of four mis-evaluated:\n{out}");
+    assert!(
+        out.contains("COUNT 4"),
+        "chain of four mis-evaluated:\n{out}"
+    );
 }
 
 #[test]

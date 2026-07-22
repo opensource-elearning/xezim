@@ -54,9 +54,10 @@ endmodule
 fn free_task_parenless_blocks_caller() {
     let sim = simulate(FREE_TASK_PARENLESS, 200).expect("simulate failed");
     let msgs = messages(&sim);
-    let line = msgs.iter().find(|m| m.starts_with("AFTER")).unwrap_or_else(|| {
-        panic!("continuation never ran; output: {:?}", msgs)
-    });
+    let line = msgs
+        .iter()
+        .find(|m| m.starts_with("AFTER"))
+        .unwrap_or_else(|| panic!("continuation never ran; output: {:?}", msgs));
     assert!(
         line.contains("t=10"),
         "expected caller blocked until t=10, got: {}\noutput: {:?}",
@@ -82,9 +83,10 @@ endmodule
 fn free_task_parens_blocks_caller() {
     let sim = simulate(FREE_TASK_PARENS, 200).expect("simulate failed");
     let msgs = messages(&sim);
-    let line = msgs.iter().find(|m| m.starts_with("AFTER")).unwrap_or_else(|| {
-        panic!("continuation never ran; output: {:?}", msgs)
-    });
+    let line = msgs
+        .iter()
+        .find(|m| m.starts_with("AFTER"))
+        .unwrap_or_else(|| panic!("continuation never ran; output: {:?}", msgs));
     assert!(
         line.contains("t=10"),
         "expected caller blocked until t=10, got: {}\noutput: {:?}",
@@ -117,11 +119,15 @@ endmodule
 fn method_dot_parenless_blocks_caller() {
     let sim = simulate(METHOD_DOT_PARENLESS, 200).expect("simulate failed");
     let msgs = messages(&sim);
-    let after = msgs.iter().find(|m| m.starts_with("AFTER")).unwrap_or_else(|| {
-        panic!("continuation never ran; output: {:?}", msgs)
-    });
+    let after = msgs
+        .iter()
+        .find(|m| m.starts_with("AFTER"))
+        .unwrap_or_else(|| panic!("continuation never ran; output: {:?}", msgs));
     // The body must run (ENTER/DONE) and the caller must block until t=10.
-    assert!(msgs.iter().any(|m| m.starts_with("ENTER t=0")), "method body never entered");
+    assert!(
+        msgs.iter().any(|m| m.starts_with("ENTER t=0")),
+        "method body never entered"
+    );
     assert!(
         after.contains("t=10"),
         "expected caller blocked until t=10, got: {}\noutput: {:?}",
@@ -150,9 +156,10 @@ endmodule
 fn method_dot_parens_blocks_caller() {
     let sim = simulate(METHOD_DOT_PARENS, 200).expect("simulate failed");
     let msgs = messages(&sim);
-    let line = msgs.iter().find(|m| m.starts_with("AFTER")).unwrap_or_else(|| {
-        panic!("continuation never ran; output: {:?}", msgs)
-    });
+    let line = msgs
+        .iter()
+        .find(|m| m.starts_with("AFTER"))
+        .unwrap_or_else(|| panic!("continuation never ran; output: {:?}", msgs));
     assert!(
         line.contains("t=10"),
         "expected caller blocked until t=10, got: {}\noutput: {:?}",
@@ -188,9 +195,10 @@ endmodule
 fn this_method_parenless_blocks_caller() {
     let sim = simulate(THIS_METHOD_PARENLESS, 200).expect("simulate failed");
     let msgs = messages(&sim);
-    let line = msgs.iter().find(|m| m.starts_with("AFTER")).unwrap_or_else(|| {
-        panic!("continuation never ran; output: {:?}", msgs)
-    });
+    let line = msgs
+        .iter()
+        .find(|m| m.starts_with("AFTER"))
+        .unwrap_or_else(|| panic!("continuation never ran; output: {:?}", msgs));
     assert!(
         line.contains("t=5") && line.contains("gate=1"),
         "expected caller blocked until t=5 with gate=1, got: {}\noutput: {:?}",
@@ -219,7 +227,10 @@ endmodule
 fn nonblocking_task_parenless_runs_synchronously() {
     let sim = simulate(NONBLOCKING_PARENLESS, 200).expect("simulate failed");
     let msgs = messages(&sim);
-    assert!(msgs.iter().any(|m| m == "HELLO"), "non-blocking body never ran");
+    assert!(
+        msgs.iter().any(|m| m == "HELLO"),
+        "non-blocking body never ran"
+    );
     assert!(
         msgs.iter().any(|m| m == "AFTER greet"),
         "continuation never ran; output: {:?}",

@@ -95,21 +95,45 @@ fn a_side_effect_in_other_operand_positions_runs_once() {
 #[test]
 fn a_side_effect_in_an_if_condition_runs_once() {
     let sim = simulate(SRC, 100).expect("simulate failed");
-    assert_eq!(u(&sim, "c_if_true"), 1, "`if (f())` taken, evaluated f() twice");
-    assert_eq!(u(&sim, "c_if_false"), 1, "`if (f())` not taken, evaluated f() twice");
-    assert_eq!(u(&sim, "c_nested"), 1, "`if (f()) begin #1; end` (blocking branch)");
+    assert_eq!(
+        u(&sim, "c_if_true"),
+        1,
+        "`if (f())` taken, evaluated f() twice"
+    );
+    assert_eq!(
+        u(&sim, "c_if_false"),
+        1,
+        "`if (f())` not taken, evaluated f() twice"
+    );
+    assert_eq!(
+        u(&sim, "c_nested"),
+        1,
+        "`if (f()) begin #1; end` (blocking branch)"
+    );
 }
 
 #[test]
 fn the_if_still_selects_the_right_branch() {
     let sim = simulate(SRC, 100).expect("simulate failed");
-    assert_eq!(u(&sim, "if_taken"), 1, "a true condition must take the then-branch");
-    assert_eq!(u(&sim, "else_taken"), 1, "a false condition must take the else-branch");
+    assert_eq!(
+        u(&sim, "if_taken"),
+        1,
+        "a true condition must take the then-branch"
+    );
+    assert_eq!(
+        u(&sim, "else_taken"),
+        1,
+        "a false condition must take the else-branch"
+    );
 }
 
 #[test]
 fn a_while_condition_runs_once_per_test() {
     let sim = simulate(SRC, 100).expect("simulate failed");
     // v = 2 -> bump(2) true, v=1; bump(1) true, v=0; bump(0) false. Three tests.
-    assert_eq!(u(&sim, "c_while"), 3, "a while condition ran the wrong number of times");
+    assert_eq!(
+        u(&sim, "c_while"),
+        3,
+        "a while condition ran the wrong number of times"
+    );
 }

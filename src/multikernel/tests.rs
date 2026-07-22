@@ -285,9 +285,8 @@ fn pdes_exec_block_flop_toggles_across_5_ticks() {
         endmodule
     "#;
     let sources = vec![sv.to_string()];
-    let (_defs, elab) =
-        parse_and_elaborate_multi(&sources, Some("top"), &[], &[], &[])
-            .expect("parse+elaborate failed");
+    let (_defs, elab) = parse_and_elaborate_multi(&sources, Some("top"), &[], &[], &[])
+        .expect("parse+elaborate failed");
     let mut sim = Simulator::new(elab, 0);
     sim.compile();
 
@@ -389,7 +388,11 @@ fn pdes_exec_block_local_drives_per_lp_table() {
     // Expectations:
     //   - per_lp.values[0] is the new q value (~0 = 1)
     //   - cross_lp is empty (q is LP-local)
-    assert!(cross_lp.is_empty(), "expected no cross-LP NBAs, got {:?}", cross_lp);
+    assert!(
+        cross_lp.is_empty(),
+        "expected no cross-LP NBAs, got {:?}",
+        cross_lp
+    );
     assert_eq!(
         per_lp.values[0].to_u64().unwrap_or(99),
         1,

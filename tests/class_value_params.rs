@@ -110,18 +110,42 @@ fn u(sim: &xezim::compiler::Simulator, n: &str) -> u64 {
 #[test]
 fn positional_value_params_override_defaults() {
     let sim = simulate(POSITIONAL, 100).expect("simulate failed");
-    assert_eq!(u(&sim, "a"), 16, "W must take the positional override, not its default");
+    assert_eq!(
+        u(&sim, "a"),
+        16,
+        "W must take the positional override, not its default"
+    );
     assert_eq!(u(&sim, "b"), 8, "$bits(T) must see the bound type (byte)");
-    assert_eq!(u(&sim, "d"), 11, "unspecified value params keep their defaults (8+3)");
-    assert_eq!(u(&sim, "f"), 16, "$bits(T) must see the bound type (shortint)");
-    assert_eq!(u(&sim, "e"), 127, "a T-typed property must use the bound type");
+    assert_eq!(
+        u(&sim, "d"),
+        11,
+        "unspecified value params keep their defaults (8+3)"
+    );
+    assert_eq!(
+        u(&sim, "f"),
+        16,
+        "$bits(T) must see the bound type (shortint)"
+    );
+    assert_eq!(
+        u(&sim, "e"),
+        127,
+        "a T-typed property must use the bound type"
+    );
 }
 
 #[test]
 fn named_value_params_bind_by_kind() {
     let sim = simulate(NAMED, 100).expect("simulate failed");
-    assert_eq!(u(&sim, "c"), 37, ".W(32) and .D(5) must land on W and D (32+5)");
-    assert_eq!(u(&sim, "w"), 6467, ".W(64) must land on W with D default (64*100 + 64+3)");
+    assert_eq!(
+        u(&sim, "c"),
+        37,
+        ".W(32) and .D(5) must land on W and D (32+5)"
+    );
+    assert_eq!(
+        u(&sim, "w"),
+        6467,
+        ".W(64) must land on W with D default (64*100 + 64+3)"
+    );
 }
 
 #[test]
@@ -130,5 +154,9 @@ fn distinct_specializations_hold_distinct_bindings() {
     assert_eq!(u(&sim, "c1"), 709, "Cfg#(7,9) reads its own N/M");
     assert_eq!(u(&sim, "c2"), 502, "Cfg#(5) reads N=5 with M default");
     assert_eq!(u(&sim, "c3"), 102, "unspecialized Cfg reads all defaults");
-    assert_eq!(u(&sim, "m1"), 211, "value params around an interleaved type param bind by slot");
+    assert_eq!(
+        u(&sim, "m1"),
+        211,
+        "value params around an interleaved type param bind by slot"
+    );
 }

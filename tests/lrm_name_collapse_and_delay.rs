@@ -89,7 +89,11 @@ fn a_struct_member_write_does_not_clobber_a_same_named_signal() {
     let sim = simulate(COLLIDE, 100).expect("simulate failed");
     assert_eq!(u(&sim, "seen_pa"), 5);
     assert_eq!(u(&sim, "seen_pb"), 7);
-    assert_eq!(u(&sim, "seen_a"), 9, "p.a = 5 overwrote the module signal `a`");
+    assert_eq!(
+        u(&sim, "seen_a"),
+        9,
+        "p.a = 5 overwrote the module signal `a`"
+    );
     assert_eq!(u(&sim, "arr0"), 9);
     assert_eq!(u(&sim, "arr1"), 8);
 }

@@ -114,7 +114,12 @@ endmodule
     let waiter = msgs
         .iter()
         .find(|m| m.starts_with("VAR_WAITER_DONE"))
-        .unwrap_or_else(|| panic!("variable-threshold waiter never released; output: {:?}", msgs));
+        .unwrap_or_else(|| {
+            panic!(
+                "variable-threshold waiter never released; output: {:?}",
+                msgs
+            )
+        });
     // raise at t=30 (total>0 true, then <=0 false), drop at t=70 (<=0 true).
     assert!(
         waiter.contains("at 70"),

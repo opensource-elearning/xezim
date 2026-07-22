@@ -150,5 +150,9 @@ fn xenowarn_suppresses_implicit_net_warnings() {
         "-xenowarn did not suppress the warning:\n{}",
         stderr
     );
-    assert!(stdout.contains("N=1"), "behavior changed under -xenowarn:\n{}", stdout);
+    assert!(
+        stdout.contains("N=1"),
+        "behavior changed under -xenowarn:\n{}",
+        stdout
+    );
 }

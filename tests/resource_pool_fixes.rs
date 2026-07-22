@@ -65,7 +65,10 @@ module top;
 endmodule
 "#;
     let out = run(src, "typedefq");
-    assert!(out.contains("RESULT PASS"), "expected push_back on typedef'd member\n{out}");
+    assert!(
+        out.contains("RESULT PASS"),
+        "expected push_back on typedef'd member\n{out}"
+    );
 }
 
 #[test]
@@ -100,7 +103,10 @@ module top;
 endmodule
 "#;
     let out = run(src, "assocofq");
-    assert!(out.contains("RESULT PASS"), "expected foreach over assoc-of-queues\n{out}");
+    assert!(
+        out.contains("RESULT PASS"),
+        "expected foreach over assoc-of-queues\n{out}"
+    );
 }
 
 #[test]
@@ -125,5 +131,8 @@ fn break_in_foreach_does_not_exit_function() {
 endmodule
 "#;
     let out = run(src, "breakprop");
-    assert!(out.contains("RESULT PASS"), "expected break not to exit function\n{out}");
+    assert!(
+        out.contains("RESULT PASS"),
+        "expected break not to exit function\n{out}"
+    );
 }

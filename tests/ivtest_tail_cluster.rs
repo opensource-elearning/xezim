@@ -27,7 +27,8 @@ fn passes(src: &str) -> bool {
 
 #[test]
 fn func_init_var1() {
-    assert!(passes(r#"
+    assert!(passes(
+        r#"
 module test();
 function integer accumulate1(input integer value);
   static int acc = 1;
@@ -57,12 +58,14 @@ initial begin
   if (failed) $display("FAILED"); else $display("PASSED");
 end
 endmodule
-"#));
+"#
+    ));
 }
 
 #[test]
 fn func_init_var2_named_block_static() {
-    assert!(passes(r#"
+    assert!(passes(
+        r#"
 module static test();
 function integer accumulate1(input integer value);
 begin:blk
@@ -96,12 +99,14 @@ initial begin
   if (failed) $display("FAILED"); else $display("PASSED");
 end
 endmodule
-"#));
+"#
+    ));
 }
 
 #[test]
 fn func_init_var3_automatic_module() {
-    assert!(passes(r#"
+    assert!(passes(
+        r#"
 module automatic test();
 function static integer accumulate1(input integer value);
   static int acc = 1;
@@ -131,12 +136,14 @@ initial begin
   if (failed) $display("FAILED"); else $display("PASSED");
 end
 endmodule
-"#));
+"#
+    ));
 }
 
 #[test]
 fn task_init_var1() {
-    assert!(passes(r#"
+    assert!(passes(
+        r#"
 module test();
 task accumulate1(input integer value, output integer result);
   static int acc = 1;
@@ -158,12 +165,14 @@ initial begin
   if (failed) $display("FAILED"); else $display("PASSED");
 end
 endmodule
-"#));
+"#
+    ));
 }
 
 #[test]
 fn task_init_var2_named_block_static() {
-    assert!(passes(r#"
+    assert!(passes(
+        r#"
 module static test();
 task accumulate1(input integer value, output integer result);
 begin:blk
@@ -189,12 +198,14 @@ initial begin
   if (failed) $display("FAILED"); else $display("PASSED");
 end
 endmodule
-"#));
+"#
+    ));
 }
 
 #[test]
 fn task_init_var3_automatic_module() {
-    assert!(passes(r#"
+    assert!(passes(
+        r#"
 module automatic test();
 task static accumulate1(input integer value, output integer result);
   static int acc = 1;
@@ -216,5 +227,6 @@ initial begin
   if (failed) $display("FAILED"); else $display("PASSED");
 end
 endmodule
-"#));
+"#
+    ));
 }

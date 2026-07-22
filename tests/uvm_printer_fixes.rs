@@ -61,7 +61,11 @@ module top;
 endmodule
 "#;
     let out = run_xezim(src, "static_len");
-    assert!(out.contains("RESULT 10"), "expected RESULT 10, got:\n{}", out);
+    assert!(
+        out.contains("RESULT 10"),
+        "expected RESULT 10, got:\n{}",
+        out
+    );
 }
 
 #[test]
@@ -116,7 +120,11 @@ endmodule
 "#;
     let out = run_xezim(src, "fwrite_str");
     // Before the fix, $write printed a garbage decimal number.
-    assert!(out.contains("Hello World END"), "expected 'Hello World END', got:\n{}", out);
+    assert!(
+        out.contains("Hello World END"),
+        "expected 'Hello World END', got:\n{}",
+        out
+    );
     assert!(out.contains("DONE"), "got:\n{}", out);
 }
 

@@ -159,5 +159,9 @@ endmodule
             .unwrap_or_else(|| panic!("signal {name} is X/Z")) as i64
     };
     assert_eq!(read("u_dut.ctrl"), 123, "upward write by module name");
-    assert_eq!(read("u_dut.u_sub.sctrl"), 55, "upward write by instance name");
+    assert_eq!(
+        read("u_dut.u_sub.sctrl"),
+        55,
+        "upward write by instance name"
+    );
 }

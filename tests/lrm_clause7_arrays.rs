@@ -119,8 +119,16 @@ fn locator_methods_return_a_queue() {
 #[test]
 fn locator_methods_do_not_modify_the_source() {
     let sim = simulate(LOCATORS, 100).expect("simulate failed");
-    assert_eq!(u(&sim, "q_size_after"), 4, "a locator shrank the source queue");
-    assert_eq!(u(&sim, "sum_after"), 7, "a locator corrupted the source queue");
+    assert_eq!(
+        u(&sim, "q_size_after"),
+        4,
+        "a locator shrank the source queue"
+    );
+    assert_eq!(
+        u(&sim, "sum_after"),
+        7,
+        "a locator corrupted the source queue"
+    );
 }
 
 #[test]

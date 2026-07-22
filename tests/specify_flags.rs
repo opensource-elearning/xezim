@@ -61,7 +61,11 @@ fn run(tag: &str, args: &[&str]) -> String {
 fn specify_path_delay_applies_by_default() {
     let out = run("default", &[]);
     assert!(out.contains("MID y=0"), "path delay must defer y:\n{}", out);
-    assert!(out.contains("END y=1"), "y must eventually arrive:\n{}", out);
+    assert!(
+        out.contains("END y=1"),
+        "y must eventually arrive:\n{}",
+        out
+    );
 }
 
 /// `+nospecify` (and Xcelium's `-nospecify`): zero-delay — y flips immediately.
@@ -90,7 +94,12 @@ fn notimingcheck_is_a_quiet_noop() {
             flag,
             out
         );
-        assert!(out.contains("MID y=0"), "{} must not change timing:\n{}", flag, out);
+        assert!(
+            out.contains("MID y=0"),
+            "{} must not change timing:\n{}",
+            flag,
+            out
+        );
     }
 }
 
@@ -134,23 +143,33 @@ fn min_typ_max_triplet_selection() {
         )
     };
     let typ = run(&[]);
-    assert!(typ.contains("T4 y=0") && typ.contains("T8 y=1"), "typ default (5ns):\n{}", typ);
+    assert!(
+        typ.contains("T4 y=0") && typ.contains("T8 y=1"),
+        "typ default (5ns):\n{}",
+        typ
+    );
     let min = run(&["+mindelays"]);
     assert!(min.contains("T4 y=1"), "+mindelays (2ns):\n{}", min);
     let max = run(&["+maxdelays"]);
-    assert!(max.contains("T8 y=0") && max.contains("T12 y=1"), "+maxdelays (9ns):\n{}", max);
+    assert!(
+        max.contains("T8 y=0") && max.contains("T12 y=1"),
+        "+maxdelays (9ns):\n{}",
+        max
+    );
 }
 
 /// The should-fail lint must see inside generate constructs — every rule was
 /// bypassed by wrapping illegal code in `generate begin ... end`.
 #[test]
 fn lint_checks_apply_inside_generate() {
-    let bad = "module t; reg fb = 0;\n generate begin : g always fb = ~fb; end endgenerate\nendmodule\n";
+    let bad =
+        "module t; reg fb = 0;\n generate begin : g always fb = ~fb; end endgenerate\nendmodule\n";
     assert!(
         xezim::simulate(bad, 1000).is_err(),
         "illegal always inside generate must be rejected"
     );
-    let good = "module t; reg c = 0;\n generate begin : g always #10 c = ~c; end endgenerate\nendmodule\n";
+    let good =
+        "module t; reg c = 0;\n generate begin : g always #10 c = ~c; end endgenerate\nendmodule\n";
     assert!(
         xezim::simulate(good, 100).is_ok(),
         "legal always inside generate must stay accepted"
@@ -166,7 +185,9 @@ fn delay_mode_zero_and_unit() {
     fn xbin() -> PathBuf {
         let mut p = std::env::current_exe().unwrap();
         p.pop();
-        if p.ends_with("deps") { p.pop(); }
+        if p.ends_with("deps") {
+            p.pop();
+        }
         p.join("xezim")
     }
     let dir = std::env::temp_dir().join(format!("xezim_delaymode_{}", std::process::id()));
@@ -183,12 +204,22 @@ fn delay_mode_zero_and_unit() {
     .unwrap();
     let run = |args: &[&str]| -> String {
         let o = Command::new(xbin()).args(args).arg(&sv).output().unwrap();
-        format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr))
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        )
     };
     // default: specify 8ns → edge at t9, so y=0 at t3.
     assert!(run(&[]).contains("T3 y=0"), "default specify delay");
     // zero: edge at t1 → y=1 at t3.
-    assert!(run(&["+delay_mode_zero"]).contains("T3 y=1"), "+delay_mode_zero");
+    assert!(
+        run(&["+delay_mode_zero"]).contains("T3 y=1"),
+        "+delay_mode_zero"
+    );
     // unit: 8→1, edge at t2 → y=1 at t3.
-    assert!(run(&["+delay_mode_unit"]).contains("T3 y=1"), "+delay_mode_unit");
+    assert!(
+        run(&["+delay_mode_unit"]).contains("T3 y=1"),
+        "+delay_mode_unit"
+    );
 }

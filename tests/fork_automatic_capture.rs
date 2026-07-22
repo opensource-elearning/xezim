@@ -89,7 +89,11 @@ fn fork_join_none_captures_each_iterations_automatic_local() {
     assert_eq!(u(&sim, "count"), 3, "not every forked child ran");
     // mask == 3'b111 means the children saw the DISTINCT values 0, 1, 2 —
     // a collapsed capture yields 3'b100 (all saw 2).
-    assert_eq!(u(&sim, "mask"), 0b111, "children collapsed onto one capture");
+    assert_eq!(
+        u(&sim, "mask"),
+        0b111,
+        "children collapsed onto one capture"
+    );
     // Children still run at their scheduled time, not at spawn time.
     assert_eq!(u(&sim, "fire_time"), 1, "child did not run at its #1 delay");
 }
@@ -98,12 +102,20 @@ fn fork_join_none_captures_each_iterations_automatic_local() {
 fn fork_block_head_declaration_captures_per_spawn() {
     let sim = simulate(CAPTURE_VIA_FORK_DECL, 100).expect("simulate failed");
     assert_eq!(u(&sim, "count"), 3, "not every forked child ran");
-    assert_eq!(u(&sim, "mask"), 0b111, "children collapsed onto one capture");
+    assert_eq!(
+        u(&sim, "mask"),
+        0b111,
+        "children collapsed onto one capture"
+    );
 }
 
 #[test]
 fn fork_join_none_captures_foreach_index() {
     let sim = simulate(CAPTURE_FOREACH, 100).expect("simulate failed");
     assert_eq!(u(&sim, "count"), 3, "not every forked child ran");
-    assert_eq!(u(&sim, "sum"), 60, "children collapsed onto one foreach index");
+    assert_eq!(
+        u(&sim, "sum"),
+        60,
+        "children collapsed onto one foreach index"
+    );
 }

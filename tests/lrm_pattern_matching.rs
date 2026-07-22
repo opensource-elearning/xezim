@@ -111,7 +111,19 @@ fn case_matches_still_binds() {
 #[test]
 fn structure_patterns_match_and_bind_members() {
     let sim = simulate(SRC, 100).expect("simulate failed");
-    assert_eq!(i(&sim, "struct_bind"), 7, "a member-binding struct pattern never matched");
-    assert_eq!(i(&sim, "struct_const"), 4, "a constant member must be compared");
-    assert_eq!(i(&sim, "struct_nomatch"), 0, "a wrong constant must not match");
+    assert_eq!(
+        i(&sim, "struct_bind"),
+        7,
+        "a member-binding struct pattern never matched"
+    );
+    assert_eq!(
+        i(&sim, "struct_const"),
+        4,
+        "a constant member must be compared"
+    );
+    assert_eq!(
+        i(&sim, "struct_nomatch"),
+        0,
+        "a wrong constant must not match"
+    );
 }

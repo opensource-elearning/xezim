@@ -8,7 +8,11 @@
 use xezim::simulate;
 
 fn output_of(sim: &xezim::compiler::Simulator) -> String {
-    sim.output.iter().map(|o| o.message.as_str()).collect::<Vec<_>>().join("\n")
+    sim.output
+        .iter()
+        .map(|o| o.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[test]
@@ -27,7 +31,15 @@ endmodule
 "#;
     let sim = simulate(SRC, 100).expect("simulate failed");
     let out = output_of(&sim);
-    assert!(out.contains("P1 3 0 3 4"), "dim1 of [3:0][7:0] is [3:0], size 4:\n{}", out);
+    assert!(
+        out.contains("P1 3 0 3 4"),
+        "dim1 of [3:0][7:0] is [3:0], size 4:\n{}",
+        out
+    );
     assert!(out.contains("P2 7 0 8"), "dim2 is [7:0], size 8:\n{}", out);
-    assert!(out.contains("A 2 4 8"), "mixed unpacked+packed dim sizes:\n{}", out);
+    assert!(
+        out.contains("A 2 4 8"),
+        "mixed unpacked+packed dim sizes:\n{}",
+        out
+    );
 }

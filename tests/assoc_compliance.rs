@@ -101,7 +101,11 @@ fn a_packed_struct_declared_in_a_task_aliases_its_members() {
     // 8'hAA with valid=1 -> 9'h155
     assert_eq!(u(&sim, "mod_v"), 0x155, "module scope regressed");
     assert_eq!(u(&sim, "init_v"), 0x176, "initial-block local regressed");
-    assert_eq!(u(&sim, "task_v"), 0x199, "a task-local packed struct read back X");
+    assert_eq!(
+        u(&sim, "task_v"),
+        0x199,
+        "a task-local packed struct read back X"
+    );
 }
 
 #[test]
@@ -115,7 +119,11 @@ fn a_packed_struct_works_as_an_associative_key() {
 #[test]
 fn associative_arrays_bind_to_function_arguments() {
     let sim = simulate(ASSOC_ARG, 100).expect("simulate failed");
-    assert_eq!(u(&sim, "fn_ref"), 2, "a function never bound an assoc formal");
+    assert_eq!(
+        u(&sim, "fn_ref"),
+        2,
+        "a function never bound an assoc formal"
+    );
     assert_eq!(u(&sim, "fn_val"), 2);
     assert_eq!(u(&sim, "tk_ref"), 2);
     assert_eq!(u(&sim, "after"), 2, "the caller's array was disturbed");
@@ -124,7 +132,15 @@ fn associative_arrays_bind_to_function_arguments() {
 #[test]
 fn an_unknown_associative_index_is_ignored() {
     let sim = simulate(XZ_INDEX, 100).expect("simulate failed");
-    assert_eq!(u(&sim, "good_v"), 11, "an x/z index clobbered a real element");
-    assert_eq!(u(&sim, "bad_v"), 0, "reading with an x/z index must yield the default");
+    assert_eq!(
+        u(&sim, "good_v"),
+        11,
+        "an x/z index clobbered a real element"
+    );
+    assert_eq!(
+        u(&sim, "bad_v"),
+        0,
+        "reading with an x/z index must yield the default"
+    );
     assert_eq!(u(&sim, "n"), 1, "an x/z index created an element");
 }

@@ -48,7 +48,10 @@ fn bit_class_property_is_unsigned() {
 endmodule
 "#;
     let out = run(src, "unsigned");
-    assert!(out.contains("RESULT PASS"), "expected bit field unsigned\n{out}");
+    assert!(
+        out.contains("RESULT PASS"),
+        "expected bit field unsigned\n{out}"
+    );
 }
 
 #[test]
@@ -75,5 +78,8 @@ fn cross_process_wait_on_bit_member() {
 endmodule
 "#;
     let out = run(src, "xwait");
-    assert!(out.contains("RESULT PASS"), "expected cross-process bit wait to wake\n{out}");
+    assert!(
+        out.contains("RESULT PASS"),
+        "expected cross-process bit wait to wake\n{out}"
+    );
 }

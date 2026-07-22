@@ -32,7 +32,11 @@ endmodule
     let out = output_of(&simulate(SRC, 100).expect("sim"));
     assert!(out.contains("EQ 1"), "'1 must widen in ===:\n{}", out);
     assert!(out.contains("WIDE 1"), "'1 must fill 82 bits:\n{}", out);
-    assert!(out.contains("ADD ffff"), "'1 must fill the add context:\n{}", out);
+    assert!(
+        out.contains("ADD ffff"),
+        "'1 must fill the add context:\n{}",
+        out
+    );
 }
 
 #[test]
@@ -49,7 +53,11 @@ module top;
 endmodule
 "#;
     let out = output_of(&simulate(SRC, 100).expect("sim"));
-    assert!(out.contains("W 0001"), "P must be 1-bit self-determined:\n{}", out);
+    assert!(
+        out.contains("W 0001"),
+        "P must be 1-bit self-determined:\n{}",
+        out
+    );
     assert!(out.contains("NEQ 0"), "w !== 4'h1 must be false:\n{}", out);
 }
 
@@ -72,5 +80,9 @@ module top;
 endmodule
 "#;
     let out = output_of(&simulate(SRC, 100).expect("sim"));
-    assert!(out.contains("Z 1 V 1"), "tran z/value propagation:\n{}", out);
+    assert!(
+        out.contains("Z 1 V 1"),
+        "tran z/value propagation:\n{}",
+        out
+    );
 }

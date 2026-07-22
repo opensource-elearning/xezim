@@ -10,7 +10,11 @@ use xezim::simulate;
 fn out(src: &str) -> String {
     // Large max-time: the timescale case delays 5us (= 5e6 ps ticks).
     let sim = simulate(src, 10_000_000).expect("simulate failed");
-    sim.output.iter().map(|o| o.message.clone()).collect::<Vec<_>>().join("\n")
+    sim.output
+        .iter()
+        .map(|o| o.message.clone())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[test]
@@ -20,8 +24,16 @@ module top; mid m(); initial #5 m.go(); endmodule
 module mid; leaf l(); task go; $display("N1 mid"); l.deep(); endtask endmodule
 module leaf; task deep; $display("N2 leaf"); endtask endmodule
 "#);
-    assert!(o.contains("N1 mid"), "outer cross-module task must run; got: {}", o);
-    assert!(o.contains("N2 leaf"), "nested cross-module task must resolve + run; got: {}", o);
+    assert!(
+        o.contains("N1 mid"),
+        "outer cross-module task must run; got: {}",
+        o
+    );
+    assert!(
+        o.contains("N2 leaf"),
+        "nested cross-module task must resolve + run; got: {}",
+        o
+    );
 }
 
 /// The nested callee's `$realtime` uses its OWN module timescale (leaf = 1ps).
@@ -36,6 +48,9 @@ module mid; leaf l(); task go; l.deep(); endtask endmodule
 module leaf; task deep; $display("RT=%0g", $realtime); endtask endmodule
 "#);
     // t = 5us = 5_000_000 ps; leaf reports in its own 1ps unit.
-    assert!(o.contains("RT=5e+06"),
-        "nested callee must report in its own 1ps unit (5e+06); got: {}", o);
+    assert!(
+        o.contains("RT=5e+06"),
+        "nested callee must report in its own 1ps unit (5e+06); got: {}",
+        o
+    );
 }

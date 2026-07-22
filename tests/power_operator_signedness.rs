@@ -7,8 +7,11 @@ use xezim::simulate;
 
 fn line(src: &str, tag: &str) -> String {
     let sim = simulate(src, 100).expect("sim");
-    sim.output.iter().find(|o| o.message.starts_with(tag))
-        .map(|o| o.message.clone()).unwrap_or_default()
+    sim.output
+        .iter()
+        .find(|o| o.message.starts_with(tag))
+        .map(|o| o.message.clone())
+        .unwrap_or_default()
 }
 
 #[test]
@@ -21,8 +24,8 @@ fn negative_power_is_signed() {
         $finish; end endmodule";
     assert_eq!(line(src, "A "), "A -8", "(-2)**3 must be signed -8");
     assert_eq!(line(src, "B "), "B -1", "(-1)**5 must be signed -1");
-    assert_eq!(line(src, "C "), "C 9",  "(-3)**2 = 9");
-    assert_eq!(line(src, "D "), "D 8",  "2**3 = 8 (unsigned operands)");
+    assert_eq!(line(src, "C "), "C 9", "(-3)**2 = 9");
+    assert_eq!(line(src, "D "), "D 8", "2**3 = 8 (unsigned operands)");
 }
 
 #[test]

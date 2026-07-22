@@ -22,7 +22,11 @@ use xezim::simulate;
 
 fn out(src: &str) -> String {
     let sim = simulate(src, 10_000).expect("simulate failed");
-    sim.output.iter().map(|o| o.message.clone()).collect::<Vec<_>>().join("\n")
+    sim.output
+        .iter()
+        .map(|o| o.message.clone())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[test]
@@ -41,8 +45,16 @@ package p;
 endpackage
 module m; initial begin p::f1(); p::f2(); end endmodule
 "#);
-    assert!(o.contains("Q='{65, 66}"), "stale string-queue marking: {}", o);
-    assert!(o.contains("S=6 BIT=1 CAT=25"), "stale scalar string marking: {}", o);
+    assert!(
+        o.contains("Q='{65, 66}"),
+        "stale string-queue marking: {}",
+        o
+    );
+    assert!(
+        o.contains("S=6 BIT=1 CAT=25"),
+        "stale scalar string marking: {}",
+        o
+    );
 }
 
 #[test]
@@ -63,7 +75,11 @@ module m; initial begin
 end endmodule
 "#);
     assert!(o.contains("IN=3"), "ref property-queue writeback: {}", o);
-    assert!(o.contains("POST=3 '{1, 5, 7}"), "property queue end state: {}", o);
+    assert!(
+        o.contains("POST=3 '{1, 5, 7}"),
+        "property queue end state: {}",
+        o
+    );
 }
 
 #[test]
@@ -77,7 +93,11 @@ module m; initial begin
   $display("N=%0d P=%p E=%0d,%0d", o.q.size(), o.q, o.q[0], o.q[1]);
 end endmodule
 "#);
-    assert!(o.contains("N=2"), "o.q.push_back landed on a phantom: {}", o);
+    assert!(
+        o.contains("N=2"),
+        "o.q.push_back landed on a phantom: {}",
+        o
+    );
     assert!(o.contains("P='{5, 9}"), "%p on a property queue: {}", o);
     assert!(o.contains("E=5,9"), "property queue element reads: {}", o);
 }
@@ -110,6 +130,10 @@ module m;
   end
 endmodule
 "#);
-    assert!(o.contains("S0=0"), "fresh queue must be size 0, not 64: {}", o);
+    assert!(
+        o.contains("S0=0"),
+        "fresh queue must be size 0, not 64: {}",
+        o
+    );
     assert!(o.contains("S1=1"), "size after push: {}", o);
 }

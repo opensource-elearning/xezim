@@ -5,7 +5,11 @@
 use xezim::simulate;
 
 fn output_of(sim: &xezim::compiler::Simulator) -> String {
-    sim.output.iter().map(|o| o.message.as_str()).collect::<Vec<_>>().join("\n")
+    sim.output
+        .iter()
+        .map(|o| o.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[test]
@@ -25,7 +29,9 @@ module top;
 endmodule
 "#;
     let out = output_of(&simulate(SRC, 100).expect("sim"));
-    for want in ["N0 RED", "N2 BLUE", "N3 RED", "N4 GREEN", "P2 RED", "NA GREEN"] {
+    for want in [
+        "N0 RED", "N2 BLUE", "N3 RED", "N4 GREEN", "P2 RED", "NA GREEN",
+    ] {
         assert!(out.contains(want), "missing `{}`:\n{}", want, out);
     }
 }

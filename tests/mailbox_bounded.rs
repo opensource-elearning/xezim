@@ -8,7 +8,11 @@ use xezim::simulate;
 
 fn out(src: &str) -> String {
     let sim = simulate(src, 1000).expect("simulate failed");
-    sim.output.iter().map(|o| o.message.clone()).collect::<Vec<_>>().join("\n")
+    sim.output
+        .iter()
+        .map(|o| o.message.clone())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// try_put rejects when full; num() tracks the bound.
@@ -25,9 +29,21 @@ module t;
   end
 endmodule
 "#);
-    assert!(o.contains("A=1") && o.contains("B=1"), "first two try_puts succeed; got: {}", o);
-    assert!(o.contains("C=0"), "try_put on a full bounded mailbox must return 0; got: {}", o);
-    assert!(o.contains("N=2"), "num() must not exceed the bound; got: {}", o);
+    assert!(
+        o.contains("A=1") && o.contains("B=1"),
+        "first two try_puts succeed; got: {}",
+        o
+    );
+    assert!(
+        o.contains("C=0"),
+        "try_put on a full bounded mailbox must return 0; got: {}",
+        o
+    );
+    assert!(
+        o.contains("N=2"),
+        "num() must not exceed the bound; got: {}",
+        o
+    );
 }
 
 /// A blocking put on a full box suspends until a get frees a slot (top level).
@@ -46,8 +62,16 @@ module t;
   initial begin #5 mb.get(x); end
 endmodule
 "#);
-    assert!(o.contains("UNBLOCKED=5"), "put must block until a slot frees at t=5; got: {}", o);
-    assert!(o.contains("FINAL_NUM=2"), "box stays at its bound after the blocked put lands; got: {}", o);
+    assert!(
+        o.contains("UNBLOCKED=5"),
+        "put must block until a slot frees at t=5; got: {}",
+        o
+    );
+    assert!(
+        o.contains("FINAL_NUM=2"),
+        "box stays at its bound after the blocked put lands; got: {}",
+        o
+    );
 }
 
 /// The same, but the blocking put is nested inside a fork branch (must still
@@ -67,7 +91,11 @@ module t;
   end
 endmodule
 "#);
-    assert!(o.contains("FUNBLOCKED=5"), "put in a fork branch must block until t=5; got: {}", o);
+    assert!(
+        o.contains("FUNBLOCKED=5"),
+        "put in a fork branch must block until t=5; got: {}",
+        o
+    );
 }
 
 /// An unbounded mailbox never fails try_put and never blocks put.
@@ -84,6 +112,14 @@ module t;
   end
 endmodule
 "#);
-    assert!(o.contains("R=1"), "unbounded try_put never fails; got: {}", o);
-    assert!(o.contains("M=3"), "unbounded mailbox grows freely; got: {}", o);
+    assert!(
+        o.contains("R=1"),
+        "unbounded try_put never fails; got: {}",
+        o
+    );
+    assert!(
+        o.contains("M=3"),
+        "unbounded mailbox grows freely; got: {}",
+        o
+    );
 }

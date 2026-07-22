@@ -15,8 +15,7 @@
 use xezim::simulate;
 
 fn run_chapter(name: &str, src: &str, expected_fails: usize) {
-    let sim = simulate(src, 100_000)
-        .unwrap_or_else(|e| panic!("{}: simulate failed: {}", name, e));
+    let sim = simulate(src, 100_000).unwrap_or_else(|e| panic!("{}: simulate failed: {}", name, e));
     let msgs: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
     let done = msgs.iter().any(|m| m.contains("CHECKS DONE"));
     assert!(

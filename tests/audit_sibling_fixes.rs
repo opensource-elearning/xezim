@@ -120,7 +120,11 @@ fn queue_of_fixed_arrays_spreads_rows_into_element_slots() {
 #[test]
 fn interface_queue_is_reachable_hierarchically() {
     let sim = simulate(SRC, 1000).expect("simulate failed");
-    assert_eq!(u(&sim, "ifq_size"), 2, "tif.q.push_back must grow the queue");
+    assert_eq!(
+        u(&sim, "ifq_size"),
+        2,
+        "tif.q.push_back must grow the queue"
+    );
     assert_eq!(u(&sim, "ifq0"), 7);
 }
 
@@ -136,7 +140,11 @@ fn genvar_reaches_final_blocks_inside_generate() {
 fn two_state_elements_and_foreach_work_inside_submodules() {
     let sim = simulate(SRC, 1000).expect("simulate failed");
     // 4 elements zero-init'd then ++ once each.
-    assert_eq!(u(&sim, "u_s.sum"), 4, "bit[7:0] mem[4] must count 0->1 each");
+    assert_eq!(
+        u(&sim, "u_s.sum"),
+        4,
+        "bit[7:0] mem[4] must count 0->1 each"
+    );
 }
 
 #[test]

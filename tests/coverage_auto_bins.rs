@@ -6,7 +6,11 @@ use xezim::simulate;
 
 fn cov(src: &str) -> String {
     let sim = simulate(src, 1000).expect("simulate failed");
-    sim.output.iter().map(|o| o.message.clone()).collect::<Vec<_>>().join("\n")
+    sim.output
+        .iter()
+        .map(|o| o.message.clone())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[test]
@@ -23,7 +27,11 @@ module t;
   end
 endmodule
 "#);
-    assert!(o.contains("COV=37.50"), "3 of 8 auto bins = 37.5%; got: {}", o);
+    assert!(
+        o.contains("COV=37.50"),
+        "3 of 8 auto bins = 37.5%; got: {}",
+        o
+    );
 }
 
 #[test]
@@ -41,7 +49,11 @@ module t;
   end
 endmodule
 "#);
-    assert!(o.contains("COV=37.50"), "cross must count 2 of 16 bins; got: {}", o);
+    assert!(
+        o.contains("COV=37.50"),
+        "cross must count 2 of 16 bins; got: {}",
+        o
+    );
 }
 
 /// §19.7 option.at_least = N: a bin is covered only when hit >= N times.
@@ -63,7 +75,11 @@ module t;
   end
 endmodule
 "#);
-    assert!(o.contains("COV=50.00"), "at_least=2: only b1 covered -> 50%; got: {}", o);
+    assert!(
+        o.contains("COV=50.00"),
+        "at_least=2: only b1 covered -> 50%; got: {}",
+        o
+    );
 }
 
 /// §19.7 option.weight: coverpoints are weighted in the covergroup mean.
@@ -80,5 +96,9 @@ module t;
   initial begin a=0; b=0; c.sample(); $display("COV=%0.2f", c.get_coverage()); $finish; end
 endmodule
 "#);
-    assert!(o.contains("COV=75.00"), "weighted (3*100+1*0)/4 = 75; got: {}", o);
+    assert!(
+        o.contains("COV=75.00"),
+        "weighted (3*100+1*0)/4 = 75; got: {}",
+        o
+    );
 }

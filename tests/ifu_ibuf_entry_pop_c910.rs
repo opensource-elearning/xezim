@@ -204,12 +204,12 @@ fn ibuf_entry_write_and_pop_mux_routes_correctly() {
     let sim = simulate(SRC, 500).expect("simulate failed");
 
     // Direct register reads.
-    let e2  = lookup(&sim, "cap_e2")  & 0xFFFF;
-    let e5  = lookup(&sim, "cap_e5")  & 0xFFFF;
+    let e2 = lookup(&sim, "cap_e2") & 0xFFFF;
+    let e5 = lookup(&sim, "cap_e5") & 0xFFFF;
     let e17 = lookup(&sim, "cap_e17") & 0xFFFF;
     let e31 = lookup(&sim, "cap_e31") & 0xFFFF;
-    assert_eq!(e2,  0xd70b, "entry_2 should be 0xd70b, got 0x{:04x}", e2);
-    assert_eq!(e5,  0x4758, "entry_5 should be 0x4758, got 0x{:04x}", e5);
+    assert_eq!(e2, 0xd70b, "entry_2 should be 0xd70b, got 0x{:04x}", e2);
+    assert_eq!(e5, 0x4758, "entry_5 should be 0x4758, got 0x{:04x}", e5);
     assert_eq!(e17, 0x5847, "entry_17 should be 0x5847, got 0x{:04x}", e17);
     assert_eq!(e31, 0xe39d, "entry_31 should be 0xe39d, got 0x{:04x}", e31);
 
@@ -218,8 +218,8 @@ fn ibuf_entry_write_and_pop_mux_routes_correctly() {
     let p1 = lookup(&sim, "cap1") & 0xFFFF;
     let p2 = lookup(&sim, "cap2") & 0xFFFF;
     let p3 = lookup(&sim, "cap3") & 0xFFFF;
-    assert_eq!(p0, 0xd70b, "pop_data for entry 2 mismatch: 0x{:04x}",  p0);
-    assert_eq!(p1, 0x4758, "pop_data for entry 5 mismatch: 0x{:04x}",  p1);
+    assert_eq!(p0, 0xd70b, "pop_data for entry 2 mismatch: 0x{:04x}", p0);
+    assert_eq!(p1, 0x4758, "pop_data for entry 5 mismatch: 0x{:04x}", p1);
     assert_eq!(p2, 0x5847, "pop_data for entry 17 mismatch: 0x{:04x}", p2);
     assert_eq!(p3, 0xe39d, "pop_data for entry 31 mismatch: 0x{:04x}", p3);
 }

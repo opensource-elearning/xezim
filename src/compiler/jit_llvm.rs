@@ -74,9 +74,7 @@ mod enabled {
     use inkwell::execution_engine::ExecutionEngine;
     use inkwell::module::Module;
     use inkwell::types::{BasicType, BasicTypeEnum, IntType};
-    use inkwell::values::{
-        BasicValueEnum, FunctionValue, IntValue, PointerValue,
-    };
+    use inkwell::values::{BasicValueEnum, FunctionValue, IntValue, PointerValue};
     use inkwell::{AddressSpace, IntPredicate, OptimizationLevel};
     use std::collections::HashSet;
 
@@ -215,9 +213,7 @@ mod enabled {
                 .into_pointer_value();
             let mut reg_slots: Vec<PointerValue> = Vec::with_capacity(num_regs as usize);
             for r in 0..num_regs as usize {
-                let slot = builder
-                    .build_alloca(i64_t, &format!("r{}", r))
-                    .ok()?;
+                let slot = builder.build_alloca(i64_t, &format!("r{}", r)).ok()?;
                 reg_slots.push(slot);
             }
             builder.build_unconditional_branch(body_bb).ok()?;
@@ -244,10 +240,7 @@ mod enabled {
                             .build_in_bounds_gep(i8_t, xz_base, &[off], "xz_p")
                             .ok()?
                     };
-                    let byte = builder
-                        .build_load(i8_t, p, "xz_b")
-                        .ok()?
-                        .into_int_value();
+                    let byte = builder.build_load(i8_t, p, "xz_b").ok()?.into_int_value();
                     acc = builder.build_or(acc, byte, "xz_acc").ok()?;
                 }
                 let zero = i8_t.const_int(0, false);
@@ -312,14 +305,7 @@ mod enabled {
                         live = false;
                     }
                     other => {
-                        if !emit_insn(
-                            self.ctx,
-                            &builder,
-                            &module,
-                            sim_param,
-                            &reg_slots,
-                            other,
-                        ) {
+                        if !emit_insn(self.ctx, &builder, &module, sim_param, &reg_slots, other) {
                             return None;
                         }
                     }
@@ -410,18 +396,30 @@ mod enabled {
 
     fn register_globals<'ctx>(engine: &ExecutionEngine<'ctx>, module: &Module<'ctx>) {
         use super::super::jit::{
-            xezim_jit_blocking_assign_range_dyn, xezim_jit_load_array_elem,
-            xezim_jit_load_signal, xezim_jit_schedule_nba, xezim_jit_schedule_nba_bit_dyn,
+            xezim_jit_blocking_assign_range_dyn, xezim_jit_load_array_elem, xezim_jit_load_signal,
+            xezim_jit_schedule_nba, xezim_jit_schedule_nba_bit_dyn,
             xezim_jit_schedule_nba_range_dyn, xezim_jit_store_signal,
         };
         for (name, addr) in [
             ("xezim_jit_load_signal", xezim_jit_load_signal as usize),
-            ("xezim_jit_load_array_elem", xezim_jit_load_array_elem as usize),
+            (
+                "xezim_jit_load_array_elem",
+                xezim_jit_load_array_elem as usize,
+            ),
             ("xezim_jit_store_signal", xezim_jit_store_signal as usize),
             ("xezim_jit_schedule_nba", xezim_jit_schedule_nba as usize),
-            ("xezim_jit_schedule_nba_bit_dyn", xezim_jit_schedule_nba_bit_dyn as usize),
-            ("xezim_jit_schedule_nba_range_dyn", xezim_jit_schedule_nba_range_dyn as usize),
-            ("xezim_jit_blocking_assign_range_dyn", xezim_jit_blocking_assign_range_dyn as usize),
+            (
+                "xezim_jit_schedule_nba_bit_dyn",
+                xezim_jit_schedule_nba_bit_dyn as usize,
+            ),
+            (
+                "xezim_jit_schedule_nba_range_dyn",
+                xezim_jit_schedule_nba_range_dyn as usize,
+            ),
+            (
+                "xezim_jit_blocking_assign_range_dyn",
+                xezim_jit_blocking_assign_range_dyn as usize,
+            ),
         ] {
             if let Some(f) = module.get_function(name) {
                 engine.add_global_mapping(&f, addr);
@@ -496,11 +494,12 @@ mod enabled {
         let i32_t = ctx.i32_type();
 
         let load_reg = |r: u16| -> Option<IntValue> {
-            b.build_load(i64_t, regs[r as usize], "v").ok().map(|v| v.into_int_value())
+            b.build_load(i64_t, regs[r as usize], "v")
+                .ok()
+                .map(|v| v.into_int_value())
         };
-        let store_reg = |r: u16, v: IntValue| -> bool {
-            b.build_store(regs[r as usize], v).is_ok()
-        };
+        let store_reg =
+            |r: u16, v: IntValue| -> bool { b.build_store(regs[r as usize], v).is_ok() };
 
         use Insn::*;
         match insn {
@@ -539,37 +538,73 @@ mod enabled {
             Mul(d, l, r) => emit_binop_int(b, regs, *d, *l, *r, |a, b1, n| {
                 b.build_int_mul(a, b1, n).ok()
             }),
-            BitAnd(d, l, r) => emit_binop_int(b, regs, *d, *l, *r, |a, b1, n| b.build_and(a, b1, n).ok()),
-            BitOr(d, l, r) => emit_binop_int(b, regs, *d, *l, *r, |a, b1, n| b.build_or(a, b1, n).ok()),
-            BitXor(d, l, r) => emit_binop_int(b, regs, *d, *l, *r, |a, b1, n| b.build_xor(a, b1, n).ok()),
+            BitAnd(d, l, r) => {
+                emit_binop_int(b, regs, *d, *l, *r, |a, b1, n| b.build_and(a, b1, n).ok())
+            }
+            BitOr(d, l, r) => {
+                emit_binop_int(b, regs, *d, *l, *r, |a, b1, n| b.build_or(a, b1, n).ok())
+            }
+            BitXor(d, l, r) => {
+                emit_binop_int(b, regs, *d, *l, *r, |a, b1, n| b.build_xor(a, b1, n).ok())
+            }
             BitXnor(d, l, r) => {
-                let lv = match load_reg(*l) { Some(v) => v, None => return false };
-                let rv = match load_reg(*r) { Some(v) => v, None => return false };
-                let xor = match b.build_xor(lv, rv, "xnor_xor") { Ok(v) => v, Err(_) => return false };
-                let not = match b.build_not(xor, "xnor_not") { Ok(v) => v, Err(_) => return false };
+                let lv = match load_reg(*l) {
+                    Some(v) => v,
+                    None => return false,
+                };
+                let rv = match load_reg(*r) {
+                    Some(v) => v,
+                    None => return false,
+                };
+                let xor = match b.build_xor(lv, rv, "xnor_xor") {
+                    Ok(v) => v,
+                    Err(_) => return false,
+                };
+                let not = match b.build_not(xor, "xnor_not") {
+                    Ok(v) => v,
+                    Err(_) => return false,
+                };
                 store_reg(*d, not)
             }
             BitNot(d, s) => {
-                let sv = match load_reg(*s) { Some(v) => v, None => return false };
-                let n = match b.build_not(sv, "not") { Ok(v) => v, Err(_) => return false };
+                let sv = match load_reg(*s) {
+                    Some(v) => v,
+                    None => return false,
+                };
+                let n = match b.build_not(sv, "not") {
+                    Ok(v) => v,
+                    Err(_) => return false,
+                };
                 store_reg(*d, n)
             }
             Negate(d, s) => {
-                let sv = match load_reg(*s) { Some(v) => v, None => return false };
-                let n = match b.build_int_neg(sv, "neg") { Ok(v) => v, Err(_) => return false };
+                let sv = match load_reg(*s) {
+                    Some(v) => v,
+                    None => return false,
+                };
+                let n = match b.build_int_neg(sv, "neg") {
+                    Ok(v) => v,
+                    Err(_) => return false,
+                };
                 store_reg(*d, n)
             }
-            LogAnd(d, l, r) => emit_logical(b, ctx, regs, *d, *l, *r, IntPredicate::NE, |a, b1, n| {
-                b.build_and(a, b1, n).ok()
-            }),
-            LogOr(d, l, r) => emit_logical(b, ctx, regs, *d, *l, *r, IntPredicate::NE, |a, b1, n| {
-                b.build_or(a, b1, n).ok()
-            }),
+            LogAnd(d, l, r) => {
+                emit_logical(b, ctx, regs, *d, *l, *r, IntPredicate::NE, |a, b1, n| {
+                    b.build_and(a, b1, n).ok()
+                })
+            }
+            LogOr(d, l, r) => {
+                emit_logical(b, ctx, regs, *d, *l, *r, IntPredicate::NE, |a, b1, n| {
+                    b.build_or(a, b1, n).ok()
+                })
+            }
             LogNot(d, s) => {
-                let sv = match load_reg(*s) { Some(v) => v, None => return false };
+                let sv = match load_reg(*s) {
+                    Some(v) => v,
+                    None => return false,
+                };
                 let zero = i64_t.const_int(0, false);
-                let cmp = match b.build_int_compare(IntPredicate::EQ, sv, zero, "lognot")
-                {
+                let cmp = match b.build_int_compare(IntPredicate::EQ, sv, zero, "lognot") {
                     Ok(v) => v,
                     Err(_) => return false,
                 };
@@ -596,7 +631,10 @@ mod enabled {
                 b.build_right_shift(a, b1, true, n).ok()
             }),
             ReduceOr(d, s) => {
-                let sv = match load_reg(*s) { Some(v) => v, None => return false };
+                let sv = match load_reg(*s) {
+                    Some(v) => v,
+                    None => return false,
+                };
                 let zero = i64_t.const_int(0, false);
                 let cmp = match b.build_int_compare(IntPredicate::NE, sv, zero, "redor") {
                     Ok(v) => v,
@@ -610,7 +648,10 @@ mod enabled {
             }
             ReduceXor(d, s) => {
                 // ctpop(x) & 1
-                let sv = match load_reg(*s) { Some(v) => v, None => return false };
+                let sv = match load_reg(*s) {
+                    Some(v) => v,
+                    None => return false,
+                };
                 let intrinsic_name = "llvm.ctpop.i64";
                 let ctpop = match module.get_function(intrinsic_name) {
                     Some(f) => f,
@@ -637,7 +678,10 @@ mod enabled {
             SetSigned(_) => true, // No-op in 2-state JIT (matches cranelift).
             Resize(reg, width) => {
                 let w = *width;
-                let sv = match load_reg(*reg) { Some(v) => v, None => return false };
+                let sv = match load_reg(*reg) {
+                    Some(v) => v,
+                    None => return false,
+                };
                 let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
                 let mask_v = i64_t.const_int(mask, false);
                 let masked = match b.build_and(sv, mask_v, "resize") {
@@ -647,84 +691,128 @@ mod enabled {
                 store_reg(*reg, masked)
             }
             BitSelect(dest, base, idx) => {
-                let bv = match load_reg(*base) { Some(v) => v, None => return false };
-                let iv = match load_reg(*idx) { Some(v) => v, None => return false };
+                let bv = match load_reg(*base) {
+                    Some(v) => v,
+                    None => return false,
+                };
+                let iv = match load_reg(*idx) {
+                    Some(v) => v,
+                    None => return false,
+                };
                 let shifted = match b.build_right_shift(bv, iv, false, "bs_shr") {
-                    Ok(v) => v, Err(_) => return false
+                    Ok(v) => v,
+                    Err(_) => return false,
                 };
                 let one = i64_t.const_int(1, false);
                 let one_bit = match b.build_and(shifted, one, "bs_and") {
-                    Ok(v) => v, Err(_) => return false
+                    Ok(v) => v,
+                    Err(_) => return false,
                 };
                 store_reg(*dest, one_bit)
             }
             BitSelectConst(dest, base, idx) => {
-                let bv = match load_reg(*base) { Some(v) => v, None => return false };
+                let bv = match load_reg(*base) {
+                    Some(v) => v,
+                    None => return false,
+                };
                 let off = i64_t.const_int(*idx as u64, false);
                 let shifted = match b.build_right_shift(bv, off, false, "bsc_shr") {
-                    Ok(v) => v, Err(_) => return false
+                    Ok(v) => v,
+                    Err(_) => return false,
                 };
                 let one = i64_t.const_int(1, false);
                 let one_bit = match b.build_and(shifted, one, "bsc_and") {
-                    Ok(v) => v, Err(_) => return false
+                    Ok(v) => v,
+                    Err(_) => return false,
                 };
                 store_reg(*dest, one_bit)
             }
             RangeSelect(dest, base, hi_r, lo_r) => {
                 // (base >> lo) & ((1 << (hi - lo + 1)) - 1)
-                let bv = match load_reg(*base) { Some(v) => v, None => return false };
-                let hi = match load_reg(*hi_r) { Some(v) => v, None => return false };
-                let lo = match load_reg(*lo_r) { Some(v) => v, None => return false };
+                let bv = match load_reg(*base) {
+                    Some(v) => v,
+                    None => return false,
+                };
+                let hi = match load_reg(*hi_r) {
+                    Some(v) => v,
+                    None => return false,
+                };
+                let lo = match load_reg(*lo_r) {
+                    Some(v) => v,
+                    None => return false,
+                };
                 let shifted = match b.build_right_shift(bv, lo, false, "rs_shr") {
-                    Ok(v) => v, Err(_) => return false
+                    Ok(v) => v,
+                    Err(_) => return false,
                 };
                 let one = i64_t.const_int(1, false);
                 let diff = match b.build_int_sub(hi, lo, "rs_diff") {
-                    Ok(v) => v, Err(_) => return false
+                    Ok(v) => v,
+                    Err(_) => return false,
                 };
                 let width = match b.build_int_add(diff, one, "rs_w") {
-                    Ok(v) => v, Err(_) => return false
+                    Ok(v) => v,
+                    Err(_) => return false,
                 };
                 // mask = (1 << width) - 1, but width may be 64 → undefined shift.
                 // Use cmov: mask = width >= 64 ? u64::MAX : (1<<width)-1
                 let sixty_four = i64_t.const_int(64, false);
-                let big = match b.build_int_compare(IntPredicate::UGE, width, sixty_four, "rs_big") {
-                    Ok(v) => v, Err(_) => return false
+                let big = match b.build_int_compare(IntPredicate::UGE, width, sixty_four, "rs_big")
+                {
+                    Ok(v) => v,
+                    Err(_) => return false,
                 };
                 let shifted_one = match b.build_left_shift(one, width, "rs_sl") {
-                    Ok(v) => v, Err(_) => return false
+                    Ok(v) => v,
+                    Err(_) => return false,
                 };
                 let small_mask = match b.build_int_sub(shifted_one, one, "rs_mask_small") {
-                    Ok(v) => v, Err(_) => return false
+                    Ok(v) => v,
+                    Err(_) => return false,
                 };
                 let max_mask = i64_t.const_int(u64::MAX, false);
                 let mask = match b.build_select(big, max_mask, small_mask, "rs_mask") {
-                    Ok(v) => v.into_int_value(), Err(_) => return false
+                    Ok(v) => v.into_int_value(),
+                    Err(_) => return false,
                 };
                 let masked = match b.build_and(shifted, mask, "rs_and") {
-                    Ok(v) => v, Err(_) => return false
+                    Ok(v) => v,
+                    Err(_) => return false,
                 };
                 store_reg(*dest, masked)
             }
             RangeSelectConst(dest, base, hi, lo) => {
-                let bv = match load_reg(*base) { Some(v) => v, None => return false };
+                let bv = match load_reg(*base) {
+                    Some(v) => v,
+                    None => return false,
+                };
                 let off = i64_t.const_int(*lo as u64, false);
                 let shifted = match b.build_right_shift(bv, off, false, "rsc_shr") {
-                    Ok(v) => v, Err(_) => return false
+                    Ok(v) => v,
+                    Err(_) => return false,
                 };
                 let width = (*hi - *lo + 1) as u64;
-                let mask = if width >= 64 { u64::MAX } else { (1u64 << width) - 1 };
+                let mask = if width >= 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << width) - 1
+                };
                 let mask_v = i64_t.const_int(mask, false);
                 let masked = match b.build_and(shifted, mask_v, "rsc_and") {
-                    Ok(v) => v, Err(_) => return false
+                    Ok(v) => v,
+                    Err(_) => return false,
                 };
                 store_reg(*dest, masked)
             }
             BlockingAssign(sig_id, val_reg, width) => {
                 let f = match module.get_function("xezim_jit_store_signal") {
-                    Some(f) => f, None => return false
+                    Some(f) => f,
+                    None => return false,
                 };
-                let v = match load_reg(*val_reg) { Some(v) => v, None => return false };
+                let v = match load_reg(*val_reg) {
+                    Some(v) => v,
+                    None => return false,
+                };
                 let id_v = i32_t.const_int(*sig_id as u64, false);
                 let w = i32_t.const_int(*width as u64, false);
                 b.build_call(f, &[sim.into(), id_v.into(), v.into(), w.into()], "")
@@ -732,11 +820,21 @@ mod enabled {
             }
             BlockingAssignRangeDyn(sig_id, hi_r, lo_r, val_reg) => {
                 let f = match module.get_function("xezim_jit_blocking_assign_range_dyn") {
-                    Some(f) => f, None => return false
+                    Some(f) => f,
+                    None => return false,
                 };
-                let v = match load_reg(*val_reg) { Some(v) => v, None => return false };
-                let hi = match load_reg(*hi_r) { Some(v) => v, None => return false };
-                let lo = match load_reg(*lo_r) { Some(v) => v, None => return false };
+                let v = match load_reg(*val_reg) {
+                    Some(v) => v,
+                    None => return false,
+                };
+                let hi = match load_reg(*hi_r) {
+                    Some(v) => v,
+                    None => return false,
+                };
+                let lo = match load_reg(*lo_r) {
+                    Some(v) => v,
+                    None => return false,
+                };
                 let id_v = i32_t.const_int(*sig_id as u64, false);
                 b.build_call(
                     f,
@@ -747,9 +845,13 @@ mod enabled {
             }
             NbaAssign(sig_id, val_reg, width) => {
                 let f = match module.get_function("xezim_jit_schedule_nba") {
-                    Some(f) => f, None => return false
+                    Some(f) => f,
+                    None => return false,
                 };
-                let v = match load_reg(*val_reg) { Some(v) => v, None => return false };
+                let v = match load_reg(*val_reg) {
+                    Some(v) => v,
+                    None => return false,
+                };
                 let id_v = i32_t.const_int(*sig_id as u64, false);
                 let w = i32_t.const_int(*width as u64, false);
                 b.build_call(f, &[sim.into(), id_v.into(), v.into(), w.into()], "")
@@ -757,9 +859,13 @@ mod enabled {
             }
             NbaAssignRange(sig_id, hi, lo, val_reg) => {
                 let f = match module.get_function("xezim_jit_schedule_nba_range_dyn") {
-                    Some(f) => f, None => return false
+                    Some(f) => f,
+                    None => return false,
                 };
-                let v = match load_reg(*val_reg) { Some(v) => v, None => return false };
+                let v = match load_reg(*val_reg) {
+                    Some(v) => v,
+                    None => return false,
+                };
                 let id_v = i32_t.const_int(*sig_id as u64, false);
                 let hi_v = i64_t.const_int(*hi as u64, false);
                 let lo_v = i64_t.const_int(*lo as u64, false);
@@ -772,11 +878,21 @@ mod enabled {
             }
             NbaAssignRangeDyn(sig_id, hi_r, lo_r, val_reg) => {
                 let f = match module.get_function("xezim_jit_schedule_nba_range_dyn") {
-                    Some(f) => f, None => return false
+                    Some(f) => f,
+                    None => return false,
                 };
-                let v = match load_reg(*val_reg) { Some(v) => v, None => return false };
-                let hi = match load_reg(*hi_r) { Some(v) => v, None => return false };
-                let lo = match load_reg(*lo_r) { Some(v) => v, None => return false };
+                let v = match load_reg(*val_reg) {
+                    Some(v) => v,
+                    None => return false,
+                };
+                let hi = match load_reg(*hi_r) {
+                    Some(v) => v,
+                    None => return false,
+                };
+                let lo = match load_reg(*lo_r) {
+                    Some(v) => v,
+                    None => return false,
+                };
                 let id_v = i32_t.const_int(*sig_id as u64, false);
                 b.build_call(
                     f,
@@ -787,17 +903,20 @@ mod enabled {
             }
             NbaAssignBitDyn(sig_id, idx_r, val_r) => {
                 let f = match module.get_function("xezim_jit_schedule_nba_bit_dyn") {
-                    Some(f) => f, None => return false
+                    Some(f) => f,
+                    None => return false,
                 };
-                let idx = match load_reg(*idx_r) { Some(v) => v, None => return false };
-                let v = match load_reg(*val_r) { Some(v) => v, None => return false };
+                let idx = match load_reg(*idx_r) {
+                    Some(v) => v,
+                    None => return false,
+                };
+                let v = match load_reg(*val_r) {
+                    Some(v) => v,
+                    None => return false,
+                };
                 let id_v = i32_t.const_int(*sig_id as u64, false);
-                b.build_call(
-                    f,
-                    &[sim.into(), id_v.into(), idx.into(), v.into()],
-                    "",
-                )
-                .is_ok()
+                b.build_call(f, &[sim.into(), id_v.into(), idx.into(), v.into()], "")
+                    .is_ok()
             }
             LoadArrayElem(_, _, _) => {
                 // Less common; emit a fallback for now. Block won't JIT
@@ -819,11 +938,19 @@ mod enabled {
     where
         F: FnOnce(IntValue<'a>, IntValue<'a>, &str) -> Option<IntValue<'a>>,
     {
-        let lv = match b.build_load(b.get_insert_block().unwrap().get_context().i64_type(), regs[l as usize], "lv") {
+        let lv = match b.build_load(
+            b.get_insert_block().unwrap().get_context().i64_type(),
+            regs[l as usize],
+            "lv",
+        ) {
             Ok(v) => v.into_int_value(),
             Err(_) => return false,
         };
-        let rv = match b.build_load(b.get_insert_block().unwrap().get_context().i64_type(), regs[r as usize], "rv") {
+        let rv = match b.build_load(
+            b.get_insert_block().unwrap().get_context().i64_type(),
+            regs[r as usize],
+            "rv",
+        ) {
             Ok(v) => v.into_int_value(),
             Err(_) => return false,
         };

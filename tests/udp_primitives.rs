@@ -96,16 +96,21 @@ module tb;
   end
 endmodule
 "#;
-    assert_trace("mux", src, &[], &[
-        "t=0 sel=0 a=0 b=0 q=0",
-        "t=1 sel=0 a=1 b=0 q=1",
-        "t=2 sel=0 a=1 b=1 q=1",
-        "t=3 sel=1 a=1 b=1 q=1",
-        "t=4 sel=1 a=0 b=1 q=1",
-        "t=5 sel=1 a=0 b=0 q=0",
-        "t=6 sel=x a=1 b=1 q=1",
-        "t=7 sel=x a=0 b=0 q=0",
-    ]);
+    assert_trace(
+        "mux",
+        src,
+        &[],
+        &[
+            "t=0 sel=0 a=0 b=0 q=0",
+            "t=1 sel=0 a=1 b=0 q=1",
+            "t=2 sel=0 a=1 b=1 q=1",
+            "t=3 sel=1 a=1 b=1 q=1",
+            "t=4 sel=1 a=0 b=1 q=1",
+            "t=5 sel=1 a=0 b=0 q=0",
+            "t=6 sel=x a=1 b=1 q=1",
+            "t=7 sel=x a=0 b=0 q=0",
+        ],
+    );
 }
 
 // 1b. Combinational and/xor.
@@ -126,14 +131,19 @@ module tb;
  end
 endmodule
 "#;
-    assert_trace("andxor", src, &[], &[
-        "t=0 a=0 b=0 and=0 xor=0",
-        "t=1 a=1 b=0 and=0 xor=1",
-        "t=2 a=1 b=1 and=1 xor=0",
-        "t=3 a=0 b=1 and=0 xor=1",
-        "t=4 a=x b=1 and=x xor=x",
-        "t=5 a=x b=0 and=0 xor=x",
-    ]);
+    assert_trace(
+        "andxor",
+        src,
+        &[],
+        &[
+            "t=0 a=0 b=0 and=0 xor=0",
+            "t=1 a=1 b=0 and=0 xor=1",
+            "t=2 a=1 b=1 and=1 xor=0",
+            "t=3 a=0 b=1 and=0 xor=1",
+            "t=4 a=x b=1 and=x xor=x",
+            "t=5 a=x b=0 and=0 xor=x",
+        ],
+    );
 }
 
 // 2. Edge DFF (§29.5).
@@ -157,17 +167,22 @@ module tb;
   end
 endmodule
 "#;
-    assert_trace("dff", src, &[], &[
-        "t=0 clk=0 d=0 q=x",
-        "t=1 clk=0 d=1 q=x",
-        "t=2 clk=1 d=1 q=1",
-        "t=3 clk=0 d=1 q=1",
-        "t=4 clk=0 d=0 q=1",
-        "t=5 clk=1 d=0 q=0",
-        "t=6 clk=0 d=0 q=0",
-        "t=7 clk=0 d=1 q=0",
-        "t=8 clk=1 d=1 q=1",
-    ]);
+    assert_trace(
+        "dff",
+        src,
+        &[],
+        &[
+            "t=0 clk=0 d=0 q=x",
+            "t=1 clk=0 d=1 q=x",
+            "t=2 clk=1 d=1 q=1",
+            "t=3 clk=0 d=1 q=1",
+            "t=4 clk=0 d=0 q=1",
+            "t=5 clk=1 d=0 q=0",
+            "t=6 clk=0 d=0 q=0",
+            "t=7 clk=0 d=1 q=0",
+            "t=8 clk=1 d=1 q=1",
+        ],
+    );
 }
 
 // 3. Level-sensitive latch (§29.4, `-` hold).
@@ -191,16 +206,21 @@ module tb;
   end
 endmodule
 "#;
-    assert_trace("latch", src, &[], &[
-        "t=0 en=0 d=0 q=x",
-        "t=1 en=0 d=1 q=x",
-        "t=2 en=1 d=1 q=1",
-        "t=3 en=1 d=0 q=0",
-        "t=4 en=1 d=1 q=1",
-        "t=5 en=0 d=1 q=1",
-        "t=6 en=0 d=0 q=1",
-        "t=7 en=1 d=0 q=0",
-    ]);
+    assert_trace(
+        "latch",
+        src,
+        &[],
+        &[
+            "t=0 en=0 d=0 q=x",
+            "t=1 en=0 d=1 q=x",
+            "t=2 en=1 d=1 q=1",
+            "t=3 en=1 d=0 q=0",
+            "t=4 en=1 d=1 q=1",
+            "t=5 en=0 d=1 q=1",
+            "t=6 en=0 d=0 q=1",
+            "t=7 en=1 d=0 q=0",
+        ],
+    );
 }
 
 // 4. Edge DFF + async level reset (dominance via row order).
@@ -229,19 +249,24 @@ module tb;
   end
 endmodule
 "#;
-    assert_trace("adff", src, &[], &[
-        "t=0 clk=0 d=0 rst=1 q=0",
-        "t=1 clk=0 d=0 rst=0 q=0",
-        "t=2 clk=0 d=1 rst=0 q=0",
-        "t=3 clk=1 d=1 rst=0 q=1",
-        "t=4 clk=0 d=1 rst=0 q=1",
-        "t=5 clk=0 d=1 rst=1 q=0",
-        "t=6 clk=1 d=1 rst=1 q=0",
-        "t=7 clk=1 d=1 rst=0 q=0",
-        "t=8 clk=0 d=1 rst=0 q=0",
-        "t=9 clk=0 d=0 rst=0 q=0",
-        "t=10 clk=1 d=0 rst=0 q=0",
-    ]);
+    assert_trace(
+        "adff",
+        src,
+        &[],
+        &[
+            "t=0 clk=0 d=0 rst=1 q=0",
+            "t=1 clk=0 d=0 rst=0 q=0",
+            "t=2 clk=0 d=1 rst=0 q=0",
+            "t=3 clk=1 d=1 rst=0 q=1",
+            "t=4 clk=0 d=1 rst=0 q=1",
+            "t=5 clk=0 d=1 rst=1 q=0",
+            "t=6 clk=1 d=1 rst=1 q=0",
+            "t=7 clk=1 d=1 rst=0 q=0",
+            "t=8 clk=0 d=1 rst=0 q=0",
+            "t=9 clk=0 d=0 rst=0 q=0",
+            "t=10 clk=1 d=0 rst=0 q=0",
+        ],
+    );
 }
 
 // 5. `initial` start state (§29.6): the t=0 clk x->0 edge is unmatched, so
@@ -266,12 +291,17 @@ module tb;
   end
 endmodule
 "#;
-    assert_trace("initst", src, &[], &[
-        "t=0 clk=0 q=x",
-        "t=1 clk=1 q=0",
-        "t=2 clk=0 q=0",
-        "t=3 clk=1 q=0",
-    ]);
+    assert_trace(
+        "initst",
+        src,
+        &[],
+        &[
+            "t=0 clk=0 q=x",
+            "t=1 clk=1 q=0",
+            "t=2 clk=0 q=0",
+            "t=3 clk=1 q=0",
+        ],
+    );
 }
 
 // 6. UDP-based cell adopted from a `-v` library file (vendor stdcell).
@@ -280,7 +310,9 @@ fn library_v_file_udp() {
     let dir = std::env::temp_dir().join("xezim_udp_tests");
     std::fs::create_dir_all(&dir).expect("mkdir");
     let vfile = dir.join("vendor_lib.v");
-    std::fs::write(&vfile, r#"
+    std::fs::write(
+        &vfile,
+        r#"
 primitive udp_dff(q, clk, d);
   output q; reg q; input clk, d;
   table
@@ -293,7 +325,9 @@ module DFFX1(Q, CK, D);
   output Q; input CK, D;
   udp_dff u(Q, CK, D);
 endmodule
-"#).expect("write vfile");
+"#,
+    )
+    .expect("write vfile");
 
     let src = r#"
 module tb;
@@ -306,15 +340,20 @@ module tb;
 endmodule
 "#;
     let vpath = vfile.to_str().unwrap();
-    assert_trace("libtop", src, &["-v", vpath], &[
-        "t=0 ck=0 d=0 q=x",
-        "t=1 ck=0 d=1 q=x",
-        "t=2 ck=1 d=1 q=1",
-        "t=3 ck=0 d=1 q=1",
-        "t=4 ck=0 d=0 q=1",
-        "t=5 ck=1 d=0 q=0",
-        "t=6 ck=0 d=0 q=0",
-    ]);
+    assert_trace(
+        "libtop",
+        src,
+        &["-v", vpath],
+        &[
+            "t=0 ck=0 d=0 q=x",
+            "t=1 ck=0 d=1 q=x",
+            "t=2 ck=1 d=1 q=1",
+            "t=3 ck=0 d=1 q=1",
+            "t=4 ck=0 d=0 q=1",
+            "t=5 ck=1 d=0 q=0",
+            "t=6 ck=0 d=0 q=0",
+        ],
+    );
 }
 
 #[test]
@@ -323,15 +362,18 @@ fn primitive_verbose_is_scoped_to_explicit_v_files() {
     let lib_dir = dir.join("lib");
     std::fs::create_dir_all(&lib_dir).expect("mkdir");
     let vfile = lib_dir.join("vendor.v");
-    std::fs::write(&vfile, r#"primitive udp_buf(q, a);
+    std::fs::write(
+        &vfile,
+        r#"primitive udp_buf(q, a);
   output q; input a;
   table 0 : 0; 1 : 1; endtable
 endprimitive
 module BUFX1(output q, input a); udp_buf u(q, a); endmodule
-"#).expect("write library");
+"#,
+    )
+    .expect("write library");
     let top = dir.join("top.sv");
-    std::fs::write(&top, "module top; wire q; BUFX1 u(q, 1'b1); endmodule\n")
-        .expect("write top");
+    std::fs::write(&top, "module top; wire q; BUFX1 u(q, 1'b1); endmodule\n").expect("write top");
 
     let run = |args: &[&str]| {
         let out = Command::new(xezim_bin())
@@ -340,9 +382,11 @@ module BUFX1(output q, input a); udp_buf u(q, a); endmodule
             .args(args)
             .output()
             .expect("run xezim");
-        format!("{}{}",
+        format!(
+            "{}{}",
             String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr))
+            String::from_utf8_lossy(&out.stderr)
+        )
     };
 
     let verbose = run(&[
@@ -359,13 +403,19 @@ module BUFX1(output q, input a); udp_buf u(q, a); endmodule
         "[primitive-verbose] adopting UDP 'udp_buf'",
         "[primitive-verbose] -v resolution summary",
     ] {
-        assert!(verbose.contains(expected), "missing {:?}:\n{}", expected, verbose);
+        assert!(
+            verbose.contains(expected),
+            "missing {:?}:\n{}",
+            expected,
+            verbose
+        );
     }
 
     std::fs::write(
         dir.join("verbose.f"),
         "--primitive-verbose\n-v lib/vendor.v\ntop.sv\n",
-    ).expect("write verbose filelist");
+    )
+    .expect("write verbose filelist");
     let via_filelist = run(&["--compile", "-f", "verbose.f"]);
     assert!(
         via_filelist.contains("[primitive-verbose] parsed UDP 'udp_buf'"),
@@ -374,7 +424,11 @@ module BUFX1(output q, input a); udp_buf u(q, a); endmodule
     );
 
     let quiet = run(&["--compile", "-v", "lib/vendor.v", "top.sv"]);
-    assert!(!quiet.contains("[primitive-verbose]"), "diagnostics must be opt-in:\n{}", quiet);
+    assert!(
+        !quiet.contains("[primitive-verbose]"),
+        "diagnostics must be opt-in:\n{}",
+        quiet
+    );
 
     let y_only = run(&["--compile", "--primitive-verbose", "-y", "lib", "top.sv"]);
     assert!(
@@ -387,7 +441,8 @@ module BUFX1(output q, input a); udp_buf u(q, a); endmodule
     std::fs::write(
         &bad_v,
         "primitive broken(q, a); output q; input a; THIS_IS_ILLEGAL !!! endprimitive\n",
-    ).expect("write malformed primitive");
+    )
+    .expect("write malformed primitive");
     let parse_issue = run(&[
         "--compile",
         "--primitive-verbose",
@@ -426,15 +481,20 @@ module tb;
  end
 endmodule
 "#;
-    assert_trace("short", src, &[], &[
-        "t=0 c=0 d=0 q1=x q2=x",
-        "t=1 c=1 d=0 q1=1 q2=0",
-        "t=2 c=1 d=1 q1=1 q2=0",
-        "t=3 c=0 d=1 q1=0 q2=1",
-        "t=4 c=1 d=1 q1=1 q2=1",
-        "t=5 c=1 d=0 q1=1 q2=1",
-        "t=6 c=0 d=0 q1=0 q2=0",
-    ]);
+    assert_trace(
+        "short",
+        src,
+        &[],
+        &[
+            "t=0 c=0 d=0 q1=x q2=x",
+            "t=1 c=1 d=0 q1=1 q2=0",
+            "t=2 c=1 d=1 q1=1 q2=0",
+            "t=3 c=0 d=1 q1=0 q2=1",
+            "t=4 c=1 d=1 q1=1 q2=1",
+            "t=5 c=1 d=0 q1=1 q2=1",
+            "t=6 c=0 d=0 q1=0 q2=0",
+        ],
+    );
 }
 
 // 8. Instance `#delay` (§29.7): the buffered output is x until the first
@@ -454,14 +514,19 @@ module tb;
  end
 endmodule
 "#;
-    assert_trace("delay", src, &[], &[
-        "t=0 a=0 o=x",
-        "t=3 a=0 o=0",
-        "t=5 a=1 o=0",
-        "t=8 a=1 o=1",
-        "t=10 a=0 o=1",
-        "t=13 a=0 o=0",
-    ]);
+    assert_trace(
+        "delay",
+        src,
+        &[],
+        &[
+            "t=0 a=0 o=x",
+            "t=3 a=0 o=0",
+            "t=5 a=1 o=0",
+            "t=8 a=1 o=1",
+            "t=10 a=0 o=1",
+            "t=13 a=0 o=0",
+        ],
+    );
 }
 
 // Fail-loud: an unparseable table row must warn and leave the output undriven
@@ -471,7 +536,9 @@ fn malformed_table_fails_loud() {
     let dir = std::env::temp_dir().join("xezim_udp_tests");
     std::fs::create_dir_all(&dir).expect("mkdir");
     let sv = dir.join("bad.v");
-    std::fs::write(&sv, r#"
+    std::fs::write(
+        &sv,
+        r#"
 primitive udp_bad(q,a,b); output q; input a,b;
  table
    0 1 : 1 ;
@@ -481,11 +548,15 @@ endprimitive
 module tb; reg a,b; wire q; udp_bad u(q,a,b);
  initial begin a=0; b=1; #1 $display("done q=%b",q); $finish; end
 endmodule
-"#).expect("write");
+"#,
+    )
+    .expect("write");
     let out = Command::new(xezim_bin())
         .env("XEZIM_NO_CACHE", "1")
-        .arg("--simulate").arg(&sv)
-        .output().expect("run xezim");
+        .arg("--simulate")
+        .arg(&sv)
+        .output()
+        .expect("run xezim");
     let stderr = String::from_utf8_lossy(&out.stderr);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -522,7 +593,12 @@ module t; reg clk,din; wire q0,q1,q2,q3;
 endmodule
 "#;
     let sim = xezim::simulate(src, 100).expect("simulate");
-    let o: String = sim.output.iter().map(|m| m.message.clone()).collect::<Vec<_>>().join("\n");
+    let o: String = sim
+        .output
+        .iter()
+        .map(|m| m.message.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(o.contains("C1 xxx1"), "stage 1:\n{}", o);
     assert!(o.contains("C2 xx10"), "stage 2:\n{}", o);
     assert!(o.contains("C3 x100"), "stage 3:\n{}", o);

@@ -63,7 +63,11 @@ endmodule
     let sim = simulate(src, 20).expect("simulate failed");
     // Correct (reference simulator): count==3, saw_break==1. Buggy behaviour
     // was count==4 — the break was dropped and the loop re-armed.
-    assert_eq!(lookup(&sim, "count"), 3, "forever must stop at the break iteration");
+    assert_eq!(
+        lookup(&sim, "count"),
+        3,
+        "forever must stop at the break iteration"
+    );
     assert_eq!(lookup(&sim, "saw_break"), 1, "the break arm ran");
 }
 
@@ -133,5 +137,9 @@ endmodule
     // Five pulses → n reaches 5 and the forever breaks; without the break it
     // would keep waiting past the last pulse (no effect on n here, but the
     // break must not be dropped on the wait-resume path).
-    assert_eq!(lookup(&sim, "n"), 5, "wait-driven forever honoured its break at n==5");
+    assert_eq!(
+        lookup(&sim, "n"),
+        5,
+        "wait-driven forever honoured its break at n==5"
+    );
 }

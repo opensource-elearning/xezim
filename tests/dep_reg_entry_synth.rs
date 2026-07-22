@@ -199,14 +199,23 @@ endmodule
 fn dep_reg_entry_wb_wakes_rdy() {
     let sim = simulate(DEP_REG_SHAPE, 1000).expect("simulate failed");
     let rdy = lookup_one_of(&sim, &["tb.rdy", "rdy"]);
-    let wb  = lookup_one_of(&sim, &["tb.wb", "wb"]);
+    let wb = lookup_one_of(&sim, &["tb.wb", "wb"]);
     let rdy_for_issue = lookup_one_of(&sim, &["tb.x_read_rdy_for_issue", "x_read_rdy_for_issue"]);
 
     let rdy_v = rdy.to_u64().expect("rdy") & 1;
-    let wb_v  = wb.to_u64().expect("wb") & 1;
+    let wb_v = wb.to_u64().expect("wb") & 1;
     let rdy_for_issue_v = rdy_for_issue.to_u64().expect("rdy_for_issue") & 1;
 
-    assert_eq!(wb_v, 1, "wb flop should hold 1 after allocation with x_create_wb=1");
-    assert_eq!(rdy_v, 1, "rdy flop should be 1 after wb→wake_up→rdy_update path");
-    assert_eq!(rdy_for_issue_v, 1, "x_read_rdy_for_issue must be 1 (rdy=1 OR forwards)");
+    assert_eq!(
+        wb_v, 1,
+        "wb flop should hold 1 after allocation with x_create_wb=1"
+    );
+    assert_eq!(
+        rdy_v, 1,
+        "rdy flop should be 1 after wb→wake_up→rdy_update path"
+    );
+    assert_eq!(
+        rdy_for_issue_v, 1,
+        "x_read_rdy_for_issue must be 1 (rdy=1 OR forwards)"
+    );
 }

@@ -41,7 +41,10 @@ fn range_select_const_param_arith_width() {
     // src = 0x00FFFFFF. bits [20:12] of src = bits 12..20 = ones since 0x00FFFFFF & 0x1FF000 != 0
     // bit 20 = 0, bit 19..12 = (0x00FFFFFF >> 12) & 0xFF = 0xFF, so bits [20:12] = 0_1111_1111 = 0xFF
     let expected = ((0x00FFFFFF_u32 >> 12) & 0x1FF) as u64;
-    assert_eq!(v, expected, "y should be src[20:12] = 0x{expected:03X}, got 0x{v:03X}");
+    assert_eq!(
+        v, expected,
+        "y should be src[20:12] = 0x{expected:03X}, got 0x{v:03X}"
+    );
 }
 
 /// Mimic c910 pattern: extract a wb-bit at the LOW end of a wide slice.

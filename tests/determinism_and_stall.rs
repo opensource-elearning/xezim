@@ -73,7 +73,10 @@ endmodule
 
     let a = seq(&run(SRC, &[]));
     let b = seq(&run(SRC, &[]));
-    assert_eq!(a, b, "an unseeded run must be reproducible, not entropy-seeded");
+    assert_eq!(
+        a, b,
+        "an unseeded run must be reproducible, not entropy-seeded"
+    );
 
     // An explicit seed reproduces its own stream ...
     let s7a = seq(&run(SRC, &["seed=7".to_string()]));
@@ -212,7 +215,11 @@ fn stall_report_names_the_rtl_behind_each_spinner() {
         .output()
         .expect("run xezim");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("simulation STALLED"), "no stall report:\n{}", stderr);
+    assert!(
+        stderr.contains("simulation STALLED"),
+        "no stall report:\n{}",
+        stderr
+    );
     assert!(
         stderr.contains(&format!("initial block at {}:3", sv_a.display())),
         "offender line must carry the construct kind and file:line:\n{}",
@@ -303,7 +310,11 @@ fn stall_report_resolves_file_line_in_multi_file_designs() {
         .output()
         .expect("run xezim");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("simulation STALLED"), "no stall report:\n{}", stderr);
+    assert!(
+        stderr.contains("simulation STALLED"),
+        "no stall report:\n{}",
+        stderr
+    );
     assert!(
         stderr.contains(&format!("always block at {}:4", f1.display())),
         "multi-file offender must resolve to its OWN file's line:\n{}",
@@ -358,7 +369,11 @@ module tb;
 endmodule
 "#;
     let sim = run(SRC, &[]);
-    assert!(sim.time >= 1, "a normal design must advance time, got {}", sim.time);
+    assert!(
+        sim.time >= 1,
+        "a normal design must advance time, got {}",
+        sim.time
+    );
     let done = sim
         .get_signal("tb.done")
         .or_else(|| sim.get_signal("done"))

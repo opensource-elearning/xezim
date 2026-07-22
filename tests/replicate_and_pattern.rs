@@ -13,11 +13,21 @@ fn collect_bits(v: &xezim_core::value::Value) -> Vec<LogicBit> {
 
 fn assert_eq_pattern(actual: &xezim_core::value::Value, expected: &str, label: &str) {
     let bits = collect_bits(actual);
-    let got: String = bits.iter().rev().map(|b| match b {
-        LogicBit::Zero => '0', LogicBit::One => '1',
-        LogicBit::X => 'x', LogicBit::Z => 'z',
-    }).collect();
-    assert_eq!(got, expected, "{}: width={}\n  expected: {}\n     got:  {}", label, actual.width, expected, got);
+    let got: String = bits
+        .iter()
+        .rev()
+        .map(|b| match b {
+            LogicBit::Zero => '0',
+            LogicBit::One => '1',
+            LogicBit::X => 'x',
+            LogicBit::Z => 'z',
+        })
+        .collect();
+    assert_eq!(
+        got, expected,
+        "{}: width={}\n  expected: {}\n     got:  {}",
+        label, actual.width, expected, got
+    );
 }
 
 const SRC_REPLICATE_227: &str = r#"
@@ -81,11 +91,17 @@ fn replicate_108_and_wide_data_with_en_high() {
     // Reverse via char-count visual: 108 bits of pattern 0xF0F repeated.
     // Easier: verify bit-by-bit
     for i in 0..108 {
-        let expected_bit = if (i % 8) < 4 { LogicBit::One } else { LogicBit::Zero };
+        let expected_bit = if (i % 8) < 4 {
+            LogicBit::One
+        } else {
+            LogicBit::Zero
+        };
         let got = out.get_bit(i);
-        assert_eq!(got, expected_bit,
+        assert_eq!(
+            got, expected_bit,
             "bit {}: expected {:?}, got {:?} (out width={}, expected pattern {})",
-            i, expected_bit, got, out.width, expected);
+            i, expected_bit, got, out.width, expected
+        );
     }
 }
 
@@ -145,20 +161,34 @@ fn multi_driver_slice_then_replicate_and() {
     // Expected: bus = {5'h1F, 8'hAA, 4'h5} = 17'h1F_AA_5
     let expected_u = (0x1Fu64 << 12) | (0xAAu64 << 4) | 0x5u64;
     for i in 0..17 {
-        let want = if (expected_u >> i) & 1 == 1 { LogicBit::One } else { LogicBit::Zero };
+        let want = if (expected_u >> i) & 1 == 1 {
+            LogicBit::One
+        } else {
+            LogicBit::Zero
+        };
         let got = bus.get_bit(i);
-        assert_eq!(got, want,
+        assert_eq!(
+            got, want,
             "bus bit {}: expected {:?}, got {:?} (full bus expected 0x{:X}, got bits)",
-            i, want, got, expected_u);
+            i, want, got, expected_u
+        );
     }
 
     let gated_v = lookup_one_of(&sim, &["tb.gated", "gated"]);
     let gated = &gated_v;
     assert_eq!(gated.width, 17);
     for i in 0..17 {
-        let want = if (expected_u >> i) & 1 == 1 { LogicBit::One } else { LogicBit::Zero };
+        let want = if (expected_u >> i) & 1 == 1 {
+            LogicBit::One
+        } else {
+            LogicBit::Zero
+        };
         let got = gated.get_bit(i);
-        assert_eq!(got, want, "gated bit {}: expected {:?}, got {:?}", i, want, got);
+        assert_eq!(
+            got, want,
+            "gated bit {}: expected {:?}, got {:?}",
+            i, want, got
+        );
     }
 }
 
@@ -172,8 +202,11 @@ fn replicate_then_bit_select_full_chain() {
     let bit59_v = lookup_one_of(&sim, &["tb.bit59", "bit59"]);
     let bit59 = &bit59_v;
     assert_eq!(bit59.width, 1);
-    assert!(matches!(bit59.get_bit(0), LogicBit::One),
-        "bit59 should be 1 when en=1 and data[59]=1, got {:?}", bit59.get_bit(0));
+    assert!(
+        matches!(bit59.get_bit(0), LogicBit::One),
+        "bit59 should be 1 when en=1 and data[59]=1, got {:?}",
+        bit59.get_bit(0)
+    );
 
     let slice_v = lookup_one_of(&sim, &["tb.slice66_58", "slice66_58"]);
     let slice = &slice_v;
@@ -197,8 +230,13 @@ fn replicate_then_bit_select_full_chain() {
         LogicBit::One,  // slice[8] = data[66] = bit 6 of 7'h50
     ];
     for i in 0..9 {
-        assert_eq!(slice.get_bit(i), expected_bits[i],
+        assert_eq!(
+            slice.get_bit(i),
+            expected_bits[i],
             "slice bit {}: expected {:?}, got {:?}",
-            i, expected_bits[i], slice.get_bit(i));
+            i,
+            expected_bits[i],
+            slice.get_bit(i)
+        );
     }
 }

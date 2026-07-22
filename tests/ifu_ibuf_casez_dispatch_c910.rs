@@ -72,7 +72,7 @@ fn lookup_wide(sim: &xezim::compiler::Simulator, name: &str) -> Vec<u32> {
     let mut out = Vec::with_capacity(32);
     for i in 0u32..32 {
         // Read 3 bits at position i*3.
-        let bit0 = v.get_bit(((i * 3)    ) as usize);
+        let bit0 = v.get_bit((i * 3) as usize);
         let bit1 = v.get_bit(((i * 3) + 1) as usize);
         let bit2 = v.get_bit(((i * 3) + 2) as usize);
         let b0 = matches!(bit0, xezim_core::value::LogicBit::One) as u32;
@@ -93,14 +93,23 @@ fn expected(idx: u32) -> u64 {
     let h4 = idx & 1;
     let _ = h4;
     let _ = h3;
-    if h0 == 0 && h1 == 0 && h2 == 0 { 0b011 }
-    else if h0 == 0 && h1 == 0 && h2 == 1 { 0b100 }
-    else if h0 == 0 && h1 == 1 && h3 == 0 { 0b100 }
-    else if h0 == 0 && h1 == 1 && h3 == 1 { 0b101 }
-    else if h0 == 1 && h2 == 0 { 0b100 }
-    else if h0 == 1 && h2 == 1 && h3 == 0 { 0b101 }
-    else if h0 == 1 && h2 == 1 && h3 == 1 { 0b110 }
-    else { 0b111 }
+    if h0 == 0 && h1 == 0 && h2 == 0 {
+        0b011
+    } else if h0 == 0 && h1 == 0 && h2 == 1 {
+        0b100
+    } else if h0 == 0 && h1 == 1 && h3 == 0 {
+        0b100
+    } else if h0 == 0 && h1 == 1 && h3 == 1 {
+        0b101
+    } else if h0 == 1 && h2 == 0 {
+        0b100
+    } else if h0 == 1 && h2 == 1 && h3 == 0 {
+        0b101
+    } else if h0 == 1 && h2 == 1 && h3 == 1 {
+        0b110
+    } else {
+        0b111
+    }
 }
 
 #[test]

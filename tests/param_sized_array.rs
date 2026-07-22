@@ -60,8 +60,16 @@ fn parameter_sized_arrays_are_fixed_not_associative() {
     let sim = simulate(SRC, 100).expect("simulate failed");
 
     // Parameter- and localparam-sized arrays get a real size.
-    assert_eq!(u(&sim, "sz_p") & 0xFFFF_FFFF, 3, "$size(ppar) wrong — a[P] not a fixed array");
-    assert_eq!(u(&sim, "sz_l") & 0xFFFF_FFFF, 2, "$size(lpar) wrong — a[L] not a fixed array");
+    assert_eq!(
+        u(&sim, "sz_p") & 0xFFFF_FFFF,
+        3,
+        "$size(ppar) wrong — a[P] not a fixed array"
+    );
+    assert_eq!(
+        u(&sim, "sz_l") & 0xFFFF_FFFF,
+        2,
+        "$size(lpar) wrong — a[L] not a fixed array"
+    );
 
     // Their elements are addressable.
     assert_eq!(u(&sim, "p2v") & 0xFFFF_FFFF, 9);
@@ -70,6 +78,10 @@ fn parameter_sized_arrays_are_fixed_not_associative() {
     // Genuine associative arrays must be untouched.
     assert_eq!(u(&sim, "ai10") & 0xFFFF_FFFF, 100, "int-keyed assoc broke");
     assert_eq!(u(&sim, "asK") & 0xFFFF_FFFF, 7, "string-keyed assoc broke");
-    assert_eq!(u(&sim, "atK") & 0xFFFF_FFFF, 55, "typedef-keyed assoc broke");
+    assert_eq!(
+        u(&sim, "atK") & 0xFFFF_FFFF,
+        55,
+        "typedef-keyed assoc broke"
+    );
     assert_eq!(u(&sim, "n_assoc") & 0xFFFF_FFFF, 1, "assoc num() broke");
 }

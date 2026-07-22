@@ -8,7 +8,11 @@ use xezim::simulate;
 
 fn out(src: &str) -> String {
     let sim = simulate(src, 1000).expect("simulate failed");
-    sim.output.iter().map(|o| o.message.clone()).collect::<Vec<_>>().join("\n")
+    sim.output
+        .iter()
+        .map(|o| o.message.clone())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[test]
@@ -24,8 +28,16 @@ module t;
   end
 endmodule
 "#);
-    assert!(o.contains("X=2000"), "x-select real must be a defined branch (2000), not bit-garbage; got: {}", o);
-    assert!(o.contains("T=1000") && o.contains("F=2000"), "known selects still correct; got: {}", o);
+    assert!(
+        o.contains("X=2000"),
+        "x-select real must be a defined branch (2000), not bit-garbage; got: {}",
+        o
+    );
+    assert!(
+        o.contains("T=1000") && o.contains("F=2000"),
+        "known selects still correct; got: {}",
+        o
+    );
 }
 
 /// An integral conditional with an X condition still does the per-bit merge.
@@ -37,5 +49,9 @@ module t;
   initial begin sel=1'bx; r = sel ? a : b; $display("R=%b", r); $finish; end
 endmodule
 "#);
-    assert!(o.contains("R=1xx0"), "integral x-select keeps per-bit merge; got: {}", o);
+    assert!(
+        o.contains("R=1xx0"),
+        "integral x-select keeps per-bit merge; got: {}",
+        o
+    );
 }

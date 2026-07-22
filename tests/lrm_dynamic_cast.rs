@@ -74,14 +74,22 @@ fn u(sim: &xezim::compiler::Simulator, n: &str) -> u64 {
 fn a_valid_class_cast_succeeds() {
     let sim = simulate(SRC, 100).expect("simulate failed");
     assert_eq!(u(&sim, "up"), 1, "an upcast must succeed");
-    assert_eq!(u(&sim, "down_valid"), 1, "a downcast to the real type must succeed");
+    assert_eq!(
+        u(&sim, "down_valid"),
+        1,
+        "a downcast to the real type must succeed"
+    );
     assert_eq!(u(&sim, "null_ok"), 1, "null assigns through");
 }
 
 #[test]
 fn an_invalid_class_cast_fails_and_leaves_the_destination_alone() {
     let sim = simulate(SRC, 100).expect("simulate failed");
-    assert_eq!(u(&sim, "down_invalid"), 0, "downcasting a pure Base must fail");
+    assert_eq!(
+        u(&sim, "down_invalid"),
+        0,
+        "downcasting a pure Base must fail"
+    );
     assert_eq!(u(&sim, "dest_changed"), 0, "a failed $cast must not assign");
     assert_eq!(u(&sim, "sibling"), 0, "a sibling-class cast must fail");
 }
@@ -90,7 +98,11 @@ fn an_invalid_class_cast_fails_and_leaves_the_destination_alone() {
 fn an_enum_cast_checks_the_value_is_a_member() {
     let sim = simulate(SRC, 100).expect("simulate failed");
     assert_eq!(u(&sim, "enum_valid"), 1);
-    assert_eq!(u(&sim, "enum_bad"), 0, "$cast to an enum accepted an out-of-range value");
+    assert_eq!(
+        u(&sim, "enum_bad"),
+        0,
+        "$cast to an enum accepted an out-of-range value"
+    );
     // The failed cast must not have clobbered the value the good one wrote.
     assert_eq!(u(&sim, "enum_after"), 2);
 }

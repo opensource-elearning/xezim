@@ -9,7 +9,11 @@
 use xezim::simulate;
 
 fn output_of(sim: &xezim::compiler::Simulator) -> String {
-    sim.output.iter().map(|o| o.message.as_str()).collect::<Vec<_>>().join("\n")
+    sim.output
+        .iter()
+        .map(|o| o.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[test]
@@ -30,8 +34,24 @@ endmodule
 "#;
     let sim = simulate(SRC, 100).expect("simulate failed");
     let out = output_of(&sim);
-    assert!(out.contains("S -106"), "signed[7:0] return must wrap to 8 bits:\n{}", out);
-    assert!(out.contains("B -106"), "byte signed return must wrap:\n{}", out);
-    assert!(out.contains("N 5"),    "[3:0] return must truncate to 4 bits:\n{}", out);
-    assert!(out.contains("I 3000"), "int return must be unaffected:\n{}", out);
+    assert!(
+        out.contains("S -106"),
+        "signed[7:0] return must wrap to 8 bits:\n{}",
+        out
+    );
+    assert!(
+        out.contains("B -106"),
+        "byte signed return must wrap:\n{}",
+        out
+    );
+    assert!(
+        out.contains("N 5"),
+        "[3:0] return must truncate to 4 bits:\n{}",
+        out
+    );
+    assert!(
+        out.contains("I 3000"),
+        "int return must be unaffected:\n{}",
+        out
+    );
 }

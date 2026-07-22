@@ -87,7 +87,10 @@ fn libext_extends_and_replaces() {
     let found = run(&dir, &["-y", "lib", "+libext+.vlib", "top3.sv"]);
     assert!(found.contains("EXT_PASS"), "got:\n{}", found);
     // .sv no longer searched when the list is replaced:
-    let miss = run(&dir, &["-y", "lib", "+libext+.vlib", "-v", "cells.v", "top.sv"]);
+    let miss = run(
+        &dir,
+        &["-y", "lib", "+libext+.vlib", "-v", "cells.v", "top.sv"],
+    );
     assert!(
         miss.contains("instantiated but not found"),
         "+libext must REPLACE the default extension list, got:\n{}",
@@ -124,11 +127,13 @@ fn incdir_does_not_enable_library_search() {
     std::fs::write(
         inc.join("bad_syntax.v"),
         "module unreferenced_bad; THIS_IS_ILLEGAL !!! endmodule\n",
-    ).unwrap();
+    )
+    .unwrap();
     std::fs::write(
         dir.join("top.sv"),
         "`include \"defs.svh\"\nmodule top; initial if (`INCLUDED_VALUE) $finish; endmodule\n",
-    ).unwrap();
+    )
+    .unwrap();
     std::fs::write(dir.join("run.f"), "+incdir+inc\ntop.sv\n").unwrap();
 
     for args in [
@@ -136,7 +141,11 @@ fn incdir_does_not_enable_library_search() {
         vec!["--compile", "-f", "run.f"],
     ] {
         let out = run(&dir, &args);
-        assert!(out.contains("Elaboration successful"), "include lookup failed:\n{}", out);
+        assert!(
+            out.contains("Elaboration successful"),
+            "include lookup failed:\n{}",
+            out
+        );
         assert!(
             !out.contains("library file") && !out.contains("parse error"),
             "+incdir must not scan unreferenced source files:\n{}",
@@ -151,11 +160,7 @@ fn missing_v_file_errors() {
     let dir = std::env::temp_dir().join("xezim_libflags_d");
     setup(&dir);
     let out = run(&dir, &["-v", "no_such_lib.v", "top.sv"]);
-    assert!(
-        out.contains("library file not found"),
-        "got:\n{}",
-        out
-    );
+    assert!(out.contains("library file not found"), "got:\n{}", out);
 }
 
 /// `--module-timescale` must apply to modules loaded from a `-v` library file,
@@ -177,9 +182,20 @@ fn module_timescale_applies_to_v_library_modules() {
     )
     .unwrap();
     // #100 in a 1ns/1ps module = 100000 ps.
-    let via_v = run(&dir, &["-v", "libc.v", "--module-timescale", "1ns/1ps", "t.sv"]);
-    assert!(via_v.contains("CT=100000"), "-v module must get --module-timescale:\n{}", via_v);
+    let via_v = run(
+        &dir,
+        &["-v", "libc.v", "--module-timescale", "1ns/1ps", "t.sv"],
+    );
+    assert!(
+        via_v.contains("CT=100000"),
+        "-v module must get --module-timescale:\n{}",
+        via_v
+    );
     // Same module as a primary source — must agree.
     let reg = run(&dir, &["--module-timescale", "1ns/1ps", "t.sv", "libc.v"]);
-    assert!(reg.contains("CT=100000"), "regular source baseline:\n{}", reg);
+    assert!(
+        reg.contains("CT=100000"),
+        "regular source baseline:\n{}",
+        reg
+    );
 }

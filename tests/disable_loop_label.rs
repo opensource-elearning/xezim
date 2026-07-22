@@ -8,8 +8,11 @@ use xezim::simulate;
 
 fn out(src: &str, tag: &str) -> String {
     let sim = simulate(src, 100).expect("sim");
-    sim.output.iter().find(|o| o.message.starts_with(tag))
-        .map(|o| o.message.clone()).unwrap_or_default()
+    sim.output
+        .iter()
+        .find(|o| o.message.starts_with(tag))
+        .map(|o| o.message.clone())
+        .unwrap_or_default()
 }
 
 #[test]
@@ -18,7 +21,11 @@ fn disable_labelled_loop_resumes_after() {
         L: for (int i=0;i<5;i++) begin if (i==3) disable L; s+=i; end\n\
         $display(\"A %0d\", s);\n\
         $finish; end endmodule";
-    assert_eq!(out(src, "A "), "A 3", "disable L exits loop, continues after (0+1+2)");
+    assert_eq!(
+        out(src, "A "),
+        "A 3",
+        "disable L exits loop, continues after (0+1+2)"
+    );
 }
 
 #[test]
@@ -28,5 +35,9 @@ fn disable_outer_from_nested_loop() {
           if (j==2) continue; if (i==2) disable outer; s+=1; end\n\
         $display(\"B %0d\", s);\n\
         $finish; end endmodule";
-    assert_eq!(out(src, "B "), "B 4", "disable outer breaks nested loops, continues after");
+    assert_eq!(
+        out(src, "B "),
+        "B 4",
+        "disable outer breaks nested loops, continues after"
+    );
 }

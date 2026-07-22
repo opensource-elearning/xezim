@@ -250,8 +250,10 @@ fn wide_arith_carry_not_dropped() {
     a65 = a65.add(&b65);
     // The 65-bit sum has bit 64 set (carry-out).
     let bit64 = a65.get_bit(64);
-    assert!(matches!(bit64, xezim_core::value::LogicBit::One),
-            "65-bit add lost the carry into bit 64");
+    assert!(
+        matches!(bit64, xezim_core::value::LogicBit::One),
+        "65-bit add lost the carry into bit 64"
+    );
     // Low 64 bits should be 0.
     let low = a65.to_u64().unwrap_or(u64::MAX);
     assert_eq!(low, 0, "low 64 bits should be 0 after FFFF...+1");

@@ -47,5 +47,9 @@ fn forever_posedge_not_double_fired() {
     .expect("simulate");
     let out: String = sim.output.iter().map(|o| o.message.clone()).collect();
     // 5 posedges in 52 time units (at t=5,15,25,35,45), one count each.
-    assert!(out.contains("N=5"), "expected exactly 5 posedge counts, got: {}", out);
+    assert!(
+        out.contains("N=5"),
+        "expected exactly 5 posedge counts, got: {}",
+        out
+    );
 }

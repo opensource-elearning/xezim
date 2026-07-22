@@ -7,7 +7,11 @@
 use xezim::simulate;
 
 fn out_of(sim: &xezim::compiler::Simulator) -> String {
-    sim.output.iter().map(|o| o.message.as_str()).collect::<Vec<_>>().join("\n")
+    sim.output
+        .iter()
+        .map(|o| o.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[test]
@@ -25,7 +29,7 @@ module top;
 endmodule
 "#;
     let out = out_of(&simulate(SRC, 100).expect("sim"));
-    assert!(out.contains("A 8"),  "non-ANSI 2-arg int:\n{}", out);
+    assert!(out.contains("A 8"), "non-ANSI 2-arg int:\n{}", out);
     assert!(out.contains("W 47"), "non-ANSI mixed-width:\n{}", out);
     assert!(out.contains("R 100.000"), "non-ANSI real return:\n{}", out);
 }
@@ -41,5 +45,9 @@ module top;
 endmodule
 "#;
     let out = out_of(&simulate(SRC, 100).expect("sim"));
-    assert!(out.contains("F 42"), "non-ANSI fn with body local:\n{}", out);
+    assert!(
+        out.contains("F 42"),
+        "non-ANSI fn with body local:\n{}",
+        out
+    );
 }

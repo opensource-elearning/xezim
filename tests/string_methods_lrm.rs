@@ -50,14 +50,32 @@ fn compare_is_case_sensitive_and_icompare_is_not() {
     assert_eq!(i(&sim, "cmp_eq"), 0, "compare() of equal strings is 0");
     assert_ne!(i(&sim, "cmp_ne"), 0, "compare() must be case-SENSITIVE");
     assert_eq!(i(&sim, "icmp_eq"), 0, "icompare() ignores case");
-    assert!(i(&sim, "cmp_lt") < 0, "compare() is negative when receiver sorts first");
-    assert!(i(&sim, "cmp_gt") > 0, "compare() is positive when receiver sorts last");
+    assert!(
+        i(&sim, "cmp_lt") < 0,
+        "compare() is negative when receiver sorts first"
+    );
+    assert!(
+        i(&sim, "cmp_gt") > 0,
+        "compare() is positive when receiver sorts last"
+    );
 }
 
 #[test]
 fn block_local_reals_keep_their_fraction() {
     let sim = simulate(SRC, 100).expect("simulate failed");
-    assert_eq!(i(&sim, "real_ok"), 1, "local real assignment must not round to int");
-    assert_eq!(i(&sim, "realtoa_ok"), 1, "realtoa() of a local real keeps the fraction");
-    assert_eq!(i(&sim, "atoreal_ok"), 1, "atoreal() into a local real keeps the fraction");
+    assert_eq!(
+        i(&sim, "real_ok"),
+        1,
+        "local real assignment must not round to int"
+    );
+    assert_eq!(
+        i(&sim, "realtoa_ok"),
+        1,
+        "realtoa() of a local real keeps the fraction"
+    );
+    assert_eq!(
+        i(&sim, "atoreal_ok"),
+        1,
+        "atoreal() into a local real keeps the fraction"
+    );
 }

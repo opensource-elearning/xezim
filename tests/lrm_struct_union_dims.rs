@@ -104,7 +104,11 @@ fn comparing_uninitialised_structs_yields_x() {
 #[test]
 fn tagged_union_member_reads_honour_the_active_tag() {
     let sim = simulate(SRC, 100).expect("simulate failed");
-    assert_eq!(u(&sim, "tag_active"), 5, "t.Valid did not read the stored value");
+    assert_eq!(
+        u(&sim, "tag_active"),
+        5,
+        "t.Valid did not read the stored value"
+    );
     // Reading a member that is not the active one is invalid -> X.
     assert_eq!(line(&sim, "INACTIVE="), "INACTIVE=1");
 }
@@ -114,7 +118,11 @@ fn dimensions_counts_every_dimension() {
     let sim = simulate(SRC, 100).expect("simulate failed");
     // Packed + unpacked. `int` contributes one packed dimension.
     assert_eq!(u(&sim, "dim_m"), 3, "int m[2][3] -> 2 unpacked + 1 packed");
-    assert_eq!(u(&sim, "dim_n"), 4, "int n[2][3][4] -> 3 unpacked + 1 packed");
+    assert_eq!(
+        u(&sim, "dim_n"),
+        4,
+        "int n[2][3][4] -> 3 unpacked + 1 packed"
+    );
     assert_eq!(u(&sim, "dim_pk"), 2, "bit [7:0] pkarr[2]");
     assert_eq!(u(&sim, "dim_one"), 2, "int one[5]");
     assert_eq!(u(&sim, "dim_scalar"), 1, "a plain int");

@@ -90,7 +90,12 @@ fn run_xezim_with_dpi_timeout(so_path: &Path, sv_file: &str, secs: u64) -> Strin
                 if let Some(mut e) = child.stderr.take() {
                     let _ = e.read_to_string(&mut text);
                 }
-                assert!(status.success(), "xezim failed for {}:\n{}", sv_path.display(), text);
+                assert!(
+                    status.success(),
+                    "xezim failed for {}:\n{}",
+                    sv_path.display(),
+                    text
+                );
                 return text;
             }
             None if std::time::Instant::now() >= deadline => {
@@ -134,13 +139,22 @@ fn run_xezim_with_vpi_timeout(so_path: &Path, sv_file: &str, secs: u64) -> Strin
                 if let Some(mut e) = child.stderr.take() {
                     let _ = e.read_to_string(&mut text);
                 }
-                assert!(status.success(), "xezim failed for {}:\n{}", sv_path.display(), text);
+                assert!(
+                    status.success(),
+                    "xezim failed for {}:\n{}",
+                    sv_path.display(),
+                    text
+                );
                 return text;
             }
             None if std::time::Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
-                panic!("xezim did not finish within {}s for {}", secs, sv_path.display());
+                panic!(
+                    "xezim did not finish within {}s for {}",
+                    secs,
+                    sv_path.display()
+                );
             }
             None => std::thread::sleep(std::time::Duration::from_millis(20)),
         }
@@ -205,7 +219,10 @@ fn dpi_open_array_test() {
 
 #[test]
 fn dpi_vpi_backdoor_compliance_test() {
-    let so = compile_dpi_lib("tests/dpi/vpi_backdoor_compliance.c", "vpi_backdoor_compliance");
+    let so = compile_dpi_lib(
+        "tests/dpi/vpi_backdoor_compliance.c",
+        "vpi_backdoor_compliance",
+    );
     let log = run_xezim_with_dpi(&so, "tests/dpi/vpi_backdoor_compliance.sv");
     // The vpi_backdoor_compliance test outputs "RESULT: PASSED" not "TEST_PASS"
     assert!(
@@ -302,7 +319,11 @@ fn vpi_systf_test() {
         log
     );
     // vpi_control(vpiFinish) must actually end the run.
-    assert!(log.contains("BEFORE_FINISH"), "$st_finish never ran:\n{}", log);
+    assert!(
+        log.contains("BEFORE_FINISH"),
+        "$st_finish never ran:\n{}",
+        log
+    );
     assert!(
         !log.contains("vpi_control(vpiFinish) did not end the run"),
         "vpi_control(vpiFinish) did not end the run:\n{}",

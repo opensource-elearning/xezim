@@ -10,7 +10,10 @@ use xezim::simulate;
 fn u64_of(sim: &xezim::compiler::Simulator, name: &str) -> u64 {
     for n in [name.to_string(), format!("tb.{name}")] {
         if let Some(v) = sim.get_signal(&n) {
-            return v.to_u64().unwrap_or_else(|| panic!("{n} has X/Z, expected defined")) & 0xFFFF_FFFF;
+            return v
+                .to_u64()
+                .unwrap_or_else(|| panic!("{n} has X/Z, expected defined"))
+                & 0xFFFF_FFFF;
         }
     }
     panic!("signal not found: {name}");
@@ -56,7 +59,11 @@ fn implication_truth_table() {
     assert_eq!(u64_of(&sim, "r_i01"), 1, "0 -> 1 should be 1");
     assert_eq!(u64_of(&sim, "r_i10"), 0, "1 -> 0 should be 0");
     assert_eq!(u64_of(&sim, "r_i11"), 1, "1 -> 1 should be 1");
-    assert_eq!(u64_of(&sim, "r_i_nonbool"), 1, "(|4'b1010) -> 4'b1010[1] should be 1");
+    assert_eq!(
+        u64_of(&sim, "r_i_nonbool"),
+        1,
+        "(|4'b1010) -> 4'b1010[1] should be 1"
+    );
 }
 
 #[test]
@@ -73,15 +80,24 @@ fn wildcard_equality() {
     let sim = simulate(SRC, 200).expect("simulate failed");
     assert_eq!(u64_of(&sim, "r_w_eq"), 1, "4'b1010 ==? 4'b1010 should be 1");
     assert_eq!(u64_of(&sim, "r_w_ne"), 1, "4'b1010 !=? 4'b1011 should be 1");
-    assert_eq!(u64_of(&sim, "r_w_wild"), 1, "4'b1011 ==? 4'b1x1x should be 1 (rhs x = wildcard)");
-    assert_eq!(u64_of(&sim, "r_w_mismatch"), 0, "4'b0011 ==? 4'b1x1x should be 0 (hard mismatch on bit 3)");
+    assert_eq!(
+        u64_of(&sim, "r_w_wild"),
+        1,
+        "4'b1011 ==? 4'b1x1x should be 1 (rhs x = wildcard)"
+    );
+    assert_eq!(
+        u64_of(&sim, "r_w_mismatch"),
+        0,
+        "4'b0011 ==? 4'b1x1x should be 0 (hard mismatch on bit 3)"
+    );
 }
 
 #[test]
 fn x_propagation_definite_one() {
     let sim = simulate(SRC, 200).expect("simulate failed");
     assert_eq!(
-        u64_of(&sim, "r_xprop_is_one"), 1,
+        u64_of(&sim, "r_xprop_is_one"),
+        1,
         "4'b1xxx && 1'b1 should be 1 (definite-1 => truthy), not X"
     );
 }

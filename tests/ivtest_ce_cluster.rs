@@ -133,14 +133,8 @@ fn matching_end_label_ok() {
 
 #[test]
 fn queue_bound_illegal() {
-    reject(
-        "sv_queue_vec-neg",
-        "module top; int q1 [$:-1]; endmodule",
-    );
-    reject(
-        "sv_queue_vec-undef",
-        "module top; int q2 [$:'X]; endmodule",
-    );
+    reject("sv_queue_vec-neg", "module top; int q1 [$:-1]; endmodule");
+    reject("sv_queue_vec-undef", "module top; int q2 [$:'X]; endmodule");
     reject(
         "sv_queue_vec-nonconst",
         "module top; int bound = 2; int q3 [$:bound]; endmodule",

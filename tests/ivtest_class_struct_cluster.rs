@@ -27,7 +27,8 @@ fn passes(src: &str) -> bool {
 // ---------------------------------------------------------------------------
 #[test]
 fn struct2_packed_struct_net_whole_assign_member_read() {
-    assert!(passes(r#"
+    assert!(passes(
+        r#"
 module main;
    struct packed { logic [7:0] high; logic [7:0] low; } word1;
    wire struct packed { logic [7:0] high; logic [7:0] low; } word2;
@@ -44,14 +45,16 @@ module main;
       $display("PASSED");
    end
 endmodule
-"#));
+"#
+    ));
 }
 
 // §7.2.1: member-target continuous assign into a packed-struct net.
 // (ivltests/struct3.v)
 #[test]
 fn struct3_packed_struct_net_member_target_assign() {
-    assert!(passes(r#"
+    assert!(passes(
+        r#"
 module main;
    struct packed { logic [7:0] high; logic [7:0] low; } word1;
    wire struct packed { logic [7:0] high; logic [7:0] low; } word2;
@@ -69,14 +72,16 @@ module main;
       $display("PASSED");
    end
 endmodule
-"#));
+"#
+    ));
 }
 
 // §7.2: reading a packed-struct net member into a part-select, and a nonblocking
 // write to a variable packed struct. (ivltests/struct8.v)
 #[test]
 fn struct8_packed_struct_net_member_partselect() {
-    assert!(passes(r#"
+    assert!(passes(
+        r#"
 module main;
    wire struct packed { logic m1; logic [7:0] m8; } foo;
    assign foo = {1'b1, 8'ha5};
@@ -91,14 +96,16 @@ module main;
       $display("PASSED");
    end
 endmodule
-"#));
+"#
+    ));
 }
 
 // §7.2: continuous assign whose RHS reads a variable packed-struct member must
 // re-fire when the whole struct is written. (ivltests/struct9.v)
 #[test]
 fn struct9_contassign_reads_struct_member() {
-    assert!(passes(r#"
+    assert!(passes(
+        r#"
 module main;
    wire [4:0] foo;
    struct packed { logic [3:0] bar4; logic [3:0] bar0; } bar;
@@ -112,7 +119,8 @@ module main;
       $display("PASSED");
    end
 endmodule
-"#));
+"#
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -122,7 +130,8 @@ endmodule
 // (ivltests/struct3b.v)
 #[test]
 fn struct3b_concat_lhs_into_struct_member_nets() {
-    assert!(passes(r#"
+    assert!(passes(
+        r#"
 module main;
    struct packed { logic [7:0] high; logic [7:0] low; } word1;
    wire struct packed { logic [7:0] high; logic [7:0] low; } word2, word3;
@@ -138,14 +147,16 @@ module main;
       $display("PASSED");
    end
 endmodule
-"#));
+"#
+    ));
 }
 
 // §7.4.2: packed ARRAY of packed struct (variable) — element and member
 // read/write with absolute bit offsets. (ivltests/struct_packed_array.v)
 #[test]
 fn struct_packed_array_var() {
-    assert!(passes(r#"
+    assert!(passes(
+        r#"
 module main;
    typedef struct packed { logic [3:0] high; logic [3:0] low; } word;
    typedef word [1:0] dword;
@@ -165,7 +176,8 @@ module main;
       $display("PASSED");
    end
 endmodule
-"#));
+"#
+    ));
 }
 
 // §7.4.2: packed ARRAY of packed struct declared as a NET, driven by member-
@@ -173,7 +185,8 @@ endmodule
 // (ivltests/struct_packed_array2.v)
 #[test]
 fn struct_packed_array2_net() {
-    assert!(passes(r#"
+    assert!(passes(
+        r#"
 module main;
    typedef struct packed { logic [3:0] high; logic [3:0] low; } word;
    typedef word [1:0] dword;
@@ -191,7 +204,8 @@ module main;
       $display("PASSED");
    end
 endmodule
-"#));
+"#
+    ));
 }
 
 // §8: class property assignment truncates/sign-extends to the declared type.
@@ -199,7 +213,8 @@ endmodule
 // ---------------------------------------------------------------------------
 #[test]
 fn sv_class2_property_byte_truncation() {
-    assert!(passes(r#"
+    assert!(passes(
+        r#"
 program main;
    class foo_t ;
       byte signed a;
@@ -222,13 +237,15 @@ program main;
       $finish;
    end
 endprogram
-"#));
+"#
+    ));
 }
 
 // §8: shortint signed/unsigned property truncation. (ivltests/sv_class3.v)
 #[test]
 fn sv_class3_property_shortint_truncation() {
-    assert!(passes(r#"
+    assert!(passes(
+        r#"
 program main;
    class foo_t ;
       shortint signed a;
@@ -251,14 +268,16 @@ program main;
       $finish;
    end
 endprogram
-"#));
+"#
+    ));
 }
 
 // §8: mixed property types (byte/int/real/string) each behave per declared type.
 // (ivltests/sv_class8.v)
 #[test]
 fn sv_class8_property_mixed_types() {
-    assert!(passes(r#"
+    assert!(passes(
+        r#"
 program main;
    class foo_t ;
       byte a;
@@ -286,14 +305,16 @@ program main;
       $finish;
    end
 endprogram
-"#));
+"#
+    ));
 }
 
 // §8: byte property truncation alongside a nested class-handle property.
 // (ivltests/sv_class10.v)
 #[test]
 fn sv_class10_property_truncation_with_nested_class() {
-    assert!(passes(r#"
+    assert!(passes(
+        r#"
 program main;
    class bar_t;
       int a;
@@ -318,14 +339,16 @@ program main;
       $finish;
    end
 endprogram
-"#));
+"#
+    ));
 }
 
 // §8.9/§8.7: static property (shared cell, readable via null handle) + a
 // property initializer overridden by the constructor. (ivltests/sv_class19.v)
 #[test]
 fn sv_class19_static_property_and_shallow_copy() {
-    assert!(passes(r#"
+    assert!(passes(
+        r#"
 program main;
    class foo_t ;
       static int int_incr = 1;
@@ -349,14 +372,16 @@ program main;
       $finish;
    end
 endprogram
-"#));
+"#
+    ));
 }
 
 // §8.7: implicit super.new — a derived constructor with no explicit super.new
 // still runs the base constructor. (ivltests/sv_class20.v)
 #[test]
 fn sv_class20_implicit_super_new() {
-    assert!(passes(r#"
+    assert!(passes(
+        r#"
 program main;
    class base_t ;
       int int_value;
@@ -375,14 +400,16 @@ program main;
       $finish;
    end
 endprogram
-"#));
+"#
+    ));
 }
 
 // §8.7: implicit super.new passes the `extends Base(args)` value arguments.
 // (ivltests/sv_class22.v)
 #[test]
 fn sv_class22_implicit_super_new_with_extends_args() {
-    assert!(passes(r#"
+    assert!(passes(
+        r#"
 program main;
    class base_t ;
       int int_value;
@@ -401,5 +428,6 @@ program main;
       $finish;
    end
 endprogram
-"#));
+"#
+    ));
 }

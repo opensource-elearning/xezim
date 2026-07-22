@@ -7,8 +7,11 @@ use xezim::simulate;
 
 fn out(src: &str, tag: &str) -> String {
     let sim = simulate(src, 100).expect("sim");
-    sim.output.iter().find(|o| o.message.starts_with(tag))
-        .map(|o| o.message.clone()).unwrap_or_default()
+    sim.output
+        .iter()
+        .find(|o| o.message.starts_with(tag))
+        .map(|o| o.message.clone())
+        .unwrap_or_default()
 }
 
 #[test]
@@ -22,6 +25,6 @@ fn find_with_named_iterator() {
       $finish; end endmodule";
     assert_eq!(out(src, "A "), "A '{5, 8}", "named iterator find");
     assert_eq!(out(src, "B "), "B '{1, 4}", "named iterator find_index");
-    assert_eq!(out(src, "C "), "C '{3}",    "named iterator find_first");
+    assert_eq!(out(src, "C "), "C '{3}", "named iterator find_first");
     assert_eq!(out(src, "D "), "D '{5, 8}", "default iterator still works");
 }

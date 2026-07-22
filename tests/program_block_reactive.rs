@@ -54,9 +54,10 @@ endprogram
 fn program_blocking_wait_task_suspends_and_resumes() {
     let sim = simulate(WAIT_TASK, 200).expect("simulate failed");
     let msgs = messages(&sim);
-    let line = msgs.iter().find(|m| m.starts_with("RESUMED")).unwrap_or_else(|| {
-        panic!("initial never resumed; output: {:?}", msgs)
-    });
+    let line = msgs
+        .iter()
+        .find(|m| m.starts_with("RESUMED"))
+        .unwrap_or_else(|| panic!("initial never resumed; output: {:?}", msgs));
     // The wait must block until q==1 at t=5; the continuation runs at t=5.
     // Pre-fix: "RESUMED t=0 q=0 reached=1" (the wait ran synchronously).
     assert!(
@@ -87,9 +88,10 @@ endprogram
 fn program_blocking_delay_task_advances_time() {
     let sim = simulate(DELAY_TASK, 200).expect("simulate failed");
     let msgs = messages(&sim);
-    let line = msgs.iter().find(|m| m.starts_with("AFTER delay")).unwrap_or_else(|| {
-        panic!("continuation never ran; output: {:?}", msgs)
-    });
+    let line = msgs
+        .iter()
+        .find(|m| m.starts_with("AFTER delay"))
+        .unwrap_or_else(|| panic!("continuation never ran; output: {:?}", msgs));
     assert!(
         line.contains("t_after=7"),
         "expected time advanced to 7 across the blocking task call, got: {}\noutput: {:?}",
@@ -120,9 +122,10 @@ endmodule
 fn module_top_blocking_wait_task_is_the_reference() {
     let sim = simulate(MOD_EQUIV, 200).expect("simulate failed");
     let msgs = messages(&sim);
-    let line = msgs.iter().find(|m| m.starts_with("MOD_RESUMED")).unwrap_or_else(|| {
-        panic!("module initial never resumed; output: {:?}", msgs)
-    });
+    let line = msgs
+        .iter()
+        .find(|m| m.starts_with("MOD_RESUMED"))
+        .unwrap_or_else(|| panic!("module initial never resumed; output: {:?}", msgs));
     // Reference behaviour: the program-top case above must match this exactly.
     assert!(
         line.contains("t=5") && line.contains("q=1") && line.contains("reached=1"),

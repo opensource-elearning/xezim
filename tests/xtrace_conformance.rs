@@ -392,13 +392,17 @@ fn header_directives_are_complete_and_ordered() {
         "§6: header directives"
     );
     // §8.3: the signal-selection policy is recorded as a comment.
-    assert!(xt.contains("# xtrace-signals "), "§8.3 policy comment: {}", xt);
+    assert!(
+        xt.contains("# xtrace-signals "),
+        "§8.3 policy comment: {}",
+        xt
+    );
     // §7: sections, in order.
-    let order: Vec<&str> = xt
-        .lines()
-        .filter(|l| l.starts_with("@section"))
-        .collect();
-    assert_eq!(order, vec!["@section dict", "@section trace", "@section end"]);
+    let order: Vec<&str> = xt.lines().filter(|l| l.starts_with("@section")).collect();
+    assert_eq!(
+        order,
+        vec!["@section dict", "@section trace", "@section end"]
+    );
     // §24: the trace opens with the Level-0 t=0 checkpoint.
     assert!(xt.contains("\nT,+0\n"), "§10.1: no T,+0");
     assert!(xt.contains("\nN,full,"), "§10.6: no N,full snapshot");
@@ -412,7 +416,10 @@ fn header_directives_are_complete_and_ordered() {
     }
     assert!(!xt.contains("X,sim_telemetry"));
     // §6.5: `minimal` is the truth. Never claim the Appendix-A AI profile.
-    assert!(!xt.contains("xezim_ai_debug"), "§6.5: profile must not over-claim");
+    assert!(
+        !xt.contains("xezim_ai_debug"),
+        "§6.5: profile must not over-claim"
+    );
 }
 
 /// §6.5/§24: `--xtrace-level 1` (the semantic layer) is NOT implemented. It must
@@ -447,7 +454,9 @@ fn xtrace_level_one_is_reserved_and_profile_is_settable() {
     assert!(xt.contains("@profile raw_delta"), "§6.5: --xtrace-profile");
     assert!(!xt.contains("X,sim_telemetry"));
     // Level 1 was asked for and refused — the payload is still Level 0.
-    assert!(!xt.lines().any(|l| l.starts_with("Q,") || l.starts_with("A,")));
+    assert!(!xt
+        .lines()
+        .any(|l| l.starts_with("Q,") || l.starts_with("A,")));
 }
 
 /// §6.8: a zstd-framed file MUST say so. The regressed writer compressed the
@@ -551,11 +560,21 @@ fn aliased_port_nets_get_unique_ids() {
     let mut uniq = ids.clone();
     uniq.sort_unstable();
     uniq.dedup();
-    assert_eq!(ids.len(), uniq.len(), "§19.2: duplicate signal_id in\n{}", xt);
+    assert_eq!(
+        ids.len(),
+        uniq.len(),
+        "§19.2: duplicate signal_id in\n{}",
+        xt
+    );
 
     let canon = sid_of(&xt, "src_bus");
     let dins = sig_lines_all(&xt, "din");
-    assert_eq!(dins.len(), 2, "din is declared in mid and in leaf: {:?}", dins);
+    assert_eq!(
+        dins.len(),
+        2,
+        "din is declared in mid and in leaf: {:?}",
+        dins
+    );
     for din in &dins {
         assert!(
             din.contains(&format!(",alias={}", canon)),
@@ -596,7 +615,11 @@ fn real_values_are_decimal() {
         "§9.3: a real is typed `real`, 64 bits — {}",
         r
     );
-    assert!(!r.contains(",s64"), "§9.3: a real is not a signed integer — {}", r);
+    assert!(
+        !r.contains(",s64"),
+        "§9.3: a real is not a signed integer — {}",
+        r
+    );
     let vals = values_of(&xt, "r");
     assert_eq!(
         vals,
@@ -803,7 +826,10 @@ fn snapshot_carries_settled_values() {
         .filter(|l| l.starts_with("N,full") || l.starts_with('P') || l.starts_with('D'))
         .collect();
     assert!(
-        trace.first().map(|l| l.starts_with("N,full")).unwrap_or(false),
+        trace
+            .first()
+            .map(|l| l.starts_with("N,full"))
+            .unwrap_or(false),
         "the first delta record must be the N,full snapshot, got {:?}",
         trace.first()
     );
@@ -877,10 +903,18 @@ fn scope_filter_keeps_the_dump_conformant() {
         .filter(|l| l.starts_with("S,"))
         .map(|l| l.split(',').nth(3).unwrap())
         .collect();
-    assert_eq!(names, vec!["din", "dout", "din", "dout"], "scoped dictionary");
+    assert_eq!(
+        names,
+        vec!["din", "dout", "din", "dout"],
+        "scoped dictionary"
+    );
     assert!(!xt.contains(",src_bus,"), "out-of-scope signals stay out");
     // The two leaf names alias the two mid names (which now stand in as the
     // canonical ids), and only those canonical ids carry deltas.
-    let canon = sig_lines_all(&xt, "din")[0].split(',').nth(1).unwrap().to_string();
+    let canon = sig_lines_all(&xt, "din")[0]
+        .split(',')
+        .nth(1)
+        .unwrap()
+        .to_string();
     assert!(sig_lines_all(&xt, "din")[1].contains(&format!(",alias={}", canon)));
 }

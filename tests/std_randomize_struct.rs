@@ -43,7 +43,11 @@ fn get(sim: &xezim::compiler::Simulator, name: &str) -> u64 {
 #[test]
 fn struct_scope_randomize_honors_constraints() {
     let sim = simulate(SRC, 1000).expect("simulate failed");
-    assert_eq!(get(&sim, "bad"), 0, "some randomize result violated its constraint");
+    assert_eq!(
+        get(&sim, "bad"),
+        0,
+        "some randomize result violated its constraint"
+    );
     // Fields must actually vary across draws (not stuck at a constant).
     assert!(
         get(&sim, "distinct_p") >= 2,

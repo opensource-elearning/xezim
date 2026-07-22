@@ -32,7 +32,10 @@ module t; initial begin C c=new();\n\
     let out = lines(src, "R ");
     assert_eq!(out.len(), 8);
     for l in &out {
-        assert_eq!(l, "R r=1 s=20", "plain .sum() must solve to the exact target");
+        assert_eq!(
+            l, "R r=1 s=20",
+            "plain .sum() must solve to the exact target"
+        );
     }
 }
 
@@ -52,7 +55,10 @@ module t; initial begin C c=new();\n\
     let out = lines(src, "R ");
     assert_eq!(out.len(), 10);
     for l in &out {
-        assert_eq!(l, "R r=1 s=100 bad=0", "sum with identity + range must hold");
+        assert_eq!(
+            l, "R r=1 s=100 bad=0",
+            "sum with identity + range must hold"
+        );
     }
 }
 

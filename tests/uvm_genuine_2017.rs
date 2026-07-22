@@ -106,7 +106,9 @@ fn objection_gated_run_phase_reaches_target_time() {
     );
     // No fatal/error surfaced during the run.
     assert!(
-        !msgs.iter().any(|m| m.to_lowercase().contains("fatal") || m.to_lowercase().contains("error")),
+        !msgs
+            .iter()
+            .any(|m| m.to_lowercase().contains("fatal") || m.to_lowercase().contains("error")),
         "expected a clean run (no fatal/error); output: {:?}",
         msgs
     );

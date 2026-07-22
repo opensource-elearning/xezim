@@ -117,7 +117,10 @@ fn sv2023_t107_class_final_specifier_compile() {
 
 #[test]
 fn sv2023_t108_method_initial_extends_final_specifiers() {
-    run_sv2023_positive("10_sv2023", "t108_method_initial_extends_final_specifiers.sv");
+    run_sv2023_positive(
+        "10_sv2023",
+        "t108_method_initial_extends_final_specifiers.sv",
+    );
 }
 
 #[test]
@@ -127,7 +130,10 @@ fn sv2023_t109_rand_real_constraint() {
 
 #[test]
 fn sv2023_t110_timeunit_timeprecision_system_functions() {
-    run_sv2023_positive("10_sv2023", "t110_timeunit_timeprecision_system_functions.sv");
+    run_sv2023_positive(
+        "10_sv2023",
+        "t110_timeunit_timeprecision_system_functions.sv",
+    );
 }
 
 #[test]

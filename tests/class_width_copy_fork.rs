@@ -192,10 +192,22 @@ fn a_class_property_keeps_its_declared_width() {
 #[test]
 fn a_wide_class_property_is_not_truncated() {
     let sim = simulate(CLASS_WIDTH, 100).expect("simulate failed");
-    assert_eq!(u(&sim, "seen_w32"), 0xDEAD_BEEF, "an int property must keep 32 bits");
-    assert_eq!(u(&sim, "rand_in_range"), 1, "obj.randomize() must respect the width");
+    assert_eq!(
+        u(&sim, "seen_w32"),
+        0xDEAD_BEEF,
+        "an int property must keep 32 bits"
+    );
+    assert_eq!(
+        u(&sim, "rand_in_range"),
+        1,
+        "obj.randomize() must respect the width"
+    );
     assert_eq!(u(&sim, "real_ok"), 1, "a real property must not be resized");
-    assert_eq!(u(&sim, "string_ok"), 1, "a string property must not be resized");
+    assert_eq!(
+        u(&sim, "string_ok"),
+        1,
+        "a string property must not be resized"
+    );
 }
 
 #[test]
@@ -203,8 +215,16 @@ fn std_randomize_respects_a_class_property_width() {
     // Randomized: run enough times that a 32-bit draw would show up.
     for _ in 0..16 {
         let sim = simulate(CLASS_RANDOMIZE, 100).expect("simulate failed");
-        assert_eq!(u(&sim, "in_range0"), 1, "std::randomize drew wider than 2 bits");
-        assert_eq!(u(&sim, "in_range1"), 1, "std::randomize drew wider than 3 bits");
+        assert_eq!(
+            u(&sim, "in_range0"),
+            1,
+            "std::randomize drew wider than 2 bits"
+        );
+        assert_eq!(
+            u(&sim, "in_range1"),
+            1,
+            "std::randomize drew wider than 3 bits"
+        );
     }
 }
 
@@ -212,15 +232,31 @@ fn std_randomize_respects_a_class_property_width() {
 fn a_shallow_copy_copies_values_into_a_distinct_object() {
     let sim = simulate(SHALLOW_COPY, 100).expect("simulate failed");
     assert_eq!(u(&sim, "h_flat"), 5, "h = new src did not copy");
-    assert_eq!(u(&sim, "a_flat"), 5, "arr[i] = new src constructed a fresh object");
-    assert_eq!(u(&sim, "src_after_write"), 5, "writing the copy corrupted the source");
+    assert_eq!(
+        u(&sim, "a_flat"),
+        5,
+        "arr[i] = new src constructed a fresh object"
+    );
+    assert_eq!(
+        u(&sim, "src_after_write"),
+        5,
+        "writing the copy corrupted the source"
+    );
 }
 
 #[test]
 fn a_shallow_copy_shares_its_nested_handles() {
     let sim = simulate(SHALLOW_COPY, 100).expect("simulate failed");
-    assert_eq!(u(&sim, "h_shares"), 1, "h = new src must share nested handles");
-    assert_eq!(u(&sim, "a_shares"), 1, "arr[i] = new src must share nested handles");
+    assert_eq!(
+        u(&sim, "h_shares"),
+        1,
+        "h = new src must share nested handles"
+    );
+    assert_eq!(
+        u(&sim, "a_shares"),
+        1,
+        "arr[i] = new src must share nested handles"
+    );
 }
 
 #[test]
@@ -233,7 +269,12 @@ fn plain_construction_into_an_array_element_still_constructs() {
 fn a_fork_scope_automatic_is_captured_per_spawn() {
     let sim = simulate(FORK_AUTOMATIC, 200).expect("simulate failed");
     for i in 0..5u64 {
-        assert_eq!(elem(&sim, "seen", i as usize), i, "process {} read the wrong local_i", i);
+        assert_eq!(
+            elem(&sim, "seen", i as usize),
+            i,
+            "process {} read the wrong local_i",
+            i
+        );
     }
 }
 
@@ -256,6 +297,14 @@ fn fork_declarations_work_in_every_shape() {
     let sim = simulate(FORK_EDGE, 200).expect("simulate failed");
     assert_eq!(u(&sim, "a_seen"), 3, "first of two fork declarations");
     assert_eq!(u(&sim, "b_seen"), 6, "second of two fork declarations");
-    assert_eq!(u(&sim, "no_loop_seen"), 42, "a fork declaration outside a loop");
-    assert_eq!(u(&sim, "join_all_done"), 7, "a fork declaration under plain `join`");
+    assert_eq!(
+        u(&sim, "no_loop_seen"),
+        42,
+        "a fork declaration outside a loop"
+    );
+    assert_eq!(
+        u(&sim, "join_all_done"),
+        7,
+        "a fork declaration under plain `join`"
+    );
 }

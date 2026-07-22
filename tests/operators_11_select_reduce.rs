@@ -47,7 +47,10 @@ module t;
 endmodule
 "#;
     // data[9] const OOR -> x; data[idx=9] var OOR -> x; xx10; 11xx
-    assert!(out1(src, "S=x,x,xx10,11xx"), "OOR select (interpreted) wrong");
+    assert!(
+        out1(src, "S=x,x,xx10,11xx"),
+        "OOR select (interpreted) wrong"
+    );
 }
 
 #[test]

@@ -85,7 +85,11 @@ fn line(sim: &xezim::compiler::Simulator, tag: &str) -> String {
 fn unpacked_union_members_share_one_storage() {
     let sim = simulate(SRC, 100).expect("simulate failed");
     assert_eq!(u32v(&sim, "u_pid"), 12345);
-    assert_eq!(u32v(&sim, "u_crc"), 12345, "u.raw_crc must alias u.packet_id");
+    assert_eq!(
+        u32v(&sim, "u_crc"),
+        12345,
+        "u.raw_crc must alias u.packet_id"
+    );
 }
 
 #[test]
@@ -101,7 +105,11 @@ fn union_nested_in_struct_and_array_aliases() {
 
     // `s.meta.raw_crc` resolves as a whole dotted path, not as `raw_crc`.
     assert_eq!(u32v(&sim, "s_pid"), 777);
-    assert_eq!(u32v(&sim, "s_crc"), 777, "s.meta.raw_crc must alias s.meta.packet_id");
+    assert_eq!(
+        u32v(&sim, "s_crc"),
+        777,
+        "s.meta.raw_crc must alias s.meta.packet_id"
+    );
 
     // Independent storage per array element, aliasing within each.
     assert_eq!(u32v(&sim, "a0_crc"), 42);
@@ -112,7 +120,10 @@ fn union_nested_in_struct_and_array_aliases() {
 fn p_format_prints_union_members_off_shared_storage() {
     let sim = simulate(SRC, 100).expect("simulate failed");
     assert_eq!(line(&sim, "U="), "U='{packet_id:12345, raw_crc:12345}");
-    assert_eq!(line(&sim, "S="), "S='{cid:1, meta:'{packet_id:777, raw_crc:777}}");
+    assert_eq!(
+        line(&sim, "S="),
+        "S='{cid:1, meta:'{packet_id:777, raw_crc:777}}"
+    );
 }
 
 /// A bit-slice must keep the member's declared signedness: an `int` union

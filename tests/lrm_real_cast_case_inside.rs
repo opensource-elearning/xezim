@@ -102,7 +102,11 @@ fn i(sim: &xezim::compiler::Simulator, n: &str) -> i64 {
 fn real_to_integer_rounds_and_keeps_the_sign() {
     let sim = simulate(REALS, 100).expect("simulate failed");
     assert_eq!(i(&sim, "neg"), -5, "a negative real saturated to 0");
-    assert_eq!(i(&sim, "pos"), 6, "a real assignment truncated instead of rounding");
+    assert_eq!(
+        i(&sim, "pos"),
+        6,
+        "a real assignment truncated instead of rounding"
+    );
     assert_eq!(i(&sim, "cast_up"), 4);
     // Ties round away from zero.
     assert_eq!(i(&sim, "half"), 3);

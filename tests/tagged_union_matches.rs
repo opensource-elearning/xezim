@@ -48,11 +48,27 @@ fn case_matches_binds_and_guards_tagged_union() {
     // The void-tag arm fired exactly once.
     assert_eq!(get(&sim, "hits_invalid"), 1, "tagged Invalid did not match");
     // The guarded arm took the 500 case, the unguarded arm took the 23 case.
-    assert_eq!(get(&sim, "hits_big"), 1, "`&&& (n > 100)` guard did not select the big arm");
-    assert_eq!(get(&sim, "hits_small"), 1, "unguarded `tagged Valid .n` arm did not match");
+    assert_eq!(
+        get(&sim, "hits_big"),
+        1,
+        "`&&& (n > 100)` guard did not select the big arm"
+    );
+    assert_eq!(
+        get(&sim, "hits_small"),
+        1,
+        "unguarded `tagged Valid .n` arm did not match"
+    );
     // No arm should have fallen through to default.
-    assert_eq!(get(&sim, "hits_default"), 0, "an item fell through to default");
+    assert_eq!(
+        get(&sim, "hits_default"),
+        0,
+        "an item fell through to default"
+    );
     // The `.n` binding carried the member payload (last write was Invalid, so
     // seen_n retains the 500 from the big arm).
-    assert_eq!(get(&sim, "seen_n") & 0xFFFF_FFFF, 500, "`.n` binding did not bind the payload");
+    assert_eq!(
+        get(&sim, "seen_n") & 0xFFFF_FFFF,
+        500,
+        "`.n` binding did not bind the payload"
+    );
 }
